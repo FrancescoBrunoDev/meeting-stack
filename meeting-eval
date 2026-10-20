@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Score a meeting transcript against a reference: WER, cpWER and DER.
+
+The reference is either the MLC-SLM eval format (tab separated
+`start<TAB>end<TAB>speaker<TAB>text`, one segment per line) or a transcript this
+repo writes (`{"turns": [{start, end, speaker, text}]}`), so a hand-corrected
+`.json` from a real meeting can be the reference.
+
+    ./meeting-eval meeting.txt meeting.json
+
+WER ignores speakers: how many words are wrong. cpWER concatenates each
+speaker's words and takes the best speaker assignment: how many words are wrong
+*and* attributed wrongly, which is what a reader of the transcript feels. DER is
+the frame-level (10 ms) share of speech with the wrong speaker, missed or
+invented. Overlap is scored as confusion, no collar, and the speaker mapping is
+greedy: the same rules for every run, not the best possible score.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import itertools
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+FRAME = 0.01  # 10 ms grid
+
+
+def words(text: str) -> list[str]:
+    return [word for word in (re.sub(r"[^\w]+", "", part).lower() for part in text.split()) if word]
+
+
+def segments(path: Path) -> list[dict]:
+    """Read a reference or a transcript into [{start, end, speaker, text}]."""
+    if path.suffix == ".json":
+        return [{"start": float(turn["start"]), "end": float(turn["end"]),
+                 "speaker": str(turn.get("name") or turn["speaker"]),
+                 "text": turn["text"]}
+                for turn in json.loads(path.read_text(encoding="utf-8"))["turns"]]
+    result = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            raise SystemExit(f"{path}:{number}: wanted start<TAB>end<TAB>speaker<TAB>text")
+        result.append({"start": float(parts[0]), "end": float(parts[1]),
+                       "speaker": parts[2].strip(), "text": "\t".join(parts[3:]).strip()})
+    return result
+
+
+def errors(reference: list[str], hypothesis: list[str]) -> int:
+    """Words to substitute, delete or insert to turn reference into hypothesis."""
+    matcher = difflib.SequenceMatcher(None, reference, hypothesis, autojunk=False)
+    return sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+               if tag != "equal")
+
+
+def wer(reference: list[dict], hypothesis: list[dict]) -> float:
+    wanted = words(" ".join(seg["text"] for seg in reference))
+    heard = words(" ".join(seg["text"] for seg in hypothesis))
+    return errors(wanted, heard) / max(1, len(wanted))
+
+
+def cp_wer(reference: list[dict], hypothesis: list[dict]) -> float:
+    """WER after the best one-to-one mapping of hypothesis speakers to reference ones."""
+    def by_speaker(items: list[dict]) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        for seg in sorted(items, key=lambda s: s["start"]):
+            grouped.setdefault(str(seg["speaker"]), []).extend(words(seg["text"]))
+        return grouped
+
+    wanted, heard = by_speaker(reference), by_speaker(hypothesis)
+    total = sum(len(text) for text in wanted.values())
+    wanted_names, names = list(wanted), list(heard)
+    if not names:
+        return 1.0
+    # 6! is 720 tries; a meeting of thirty people gets its six longest turns and
+    # the rest counted as insertions rather than paying a factorial.
+    extra = 0
+    if len(names) > 6:
+        names = sorted(names, key=lambda name: -len(heard[name]))[:len(wanted_names)]
+        extra = sum(len(text) for name, text in heard.items() if name not in names)
+    picks = min(len(names), len(wanted_names))
+    best = None
+    for order in itertools.permutations(names, picks):
+        mapping = dict(zip(wanted_names, order))
+        cost = sum(errors(wanted[name], heard.get(mapping.get(name, ""), []))
+                   for name in wanted_names)
+        cost += sum(len(text) for name, text in heard.items() if name not in mapping.values())
+        cost += extra
+        best = cost if best is None else min(best, cost)
+    return best / max(1, total)
+
+
+def frames(segments_: list[dict]) -> dict[int, str]:
+    """A 10 ms grid of the louder claim on each frame, so overlap has one label."""
+    grid: dict[int, str] = {}
+    for seg in segments_:
+        for index in range(int(seg["start"] / FRAME), int(seg["end"] / FRAME)):
+            grid.setdefault(index, str(seg["speaker"]))
+    return grid
+
+
+def der(reference: list[dict], hypothesis: list[dict]) -> float:
+    wanted, heard = frames(reference), frames(hypothesis)
+    if not wanted:
+        return 0.0
+    # Greedy mapping: the hypothesis speaker that covers the most reference
+    # frames of a speaker wins it. Enough for a meeting, and deterministic.
+    overlap = Counter((reference_name, hypothesis_name)
+                      for index, reference_name in wanted.items()
+                      if (hypothesis_name := heard.get(index)))
+    mapping: dict[str, str] = {}
+    for (reference_name, hypothesis_name), _ in overlap.most_common():
+        if reference_name not in mapping.values() and hypothesis_name not in mapping:
+            mapping[hypothesis_name] = reference_name
+    wrong = sum(1 for index, reference_name in wanted.items()
+                if (hypothesis_name := heard.get(index)) is None
+                or mapping.get(hypothesis_name) != reference_name)
+    invented = sum(1 for index in heard if index not in wanted)
+    return (wrong + invented) / len(wanted)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="WER, cpWER and DER of a transcript against a reference.")
+    parser.add_argument("reference", type=Path, help="MLC-SLM .txt or a transcript .json")
+    parser.add_argument("hypothesis", type=Path, help="the .json meeting-transcribe wrote")
+    args = parser.parse_args()
+
+    wanted, heard = segments(args.reference), segments(args.hypothesis)
+    if not wanted:
+        raise SystemExit("the reference has no segments")
+    print(json.dumps({"segments": {"reference": len(wanted), "hypothesis": len(heard)},
+                      "wer": round(wer(wanted, heard), 4),
+                      "cpwer": round(cp_wer(wanted, heard), 4),
+                      "der": round(der(wanted, heard), 4)}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,19 @@
+# pyannote.audio diarizer on the Strix Halo GPU (ROCm), same interface as ../diarizer.
+#
+#   podman build -t localhost/halogen-diarizer-pyannote-rocm diarizer-pyannote-rocm/
+#
+# torch comes from AMD's gfx1151 wheel index. The pretrained pipeline is gated
+# on Hugging Face: meeting-transcribe passes HF_TOKEN and mounts the HF cache,
+# so the models stay on disk and the container is offline after the first run.
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --index-url https://nightly.repo.amd.com/rocm/whl-next/ \
+      "rocm[libraries,devel]" "torch[device-gfx1151]" torchaudio numpy
+RUN pip install --no-cache-dir pyannote.audio==4.0.7 soundfile
+
+COPY diarize.py /diarize.py
+ENTRYPOINT ["python3", "/diarize.py"]

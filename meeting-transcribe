@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""Diarized transcript of a long meeting, from an OpenAI-compatible ASR and a diarizer.
+
+Default since 2026-10-20: the diarizer container normalizes the whole file
+(16 kHz mono, loudnorm), one ASR pass transcribes it with timestamps (Whisper
+through Lemonade, `verbose_json`), and every ASR segment takes the speaker with
+the largest overlap. Nothing is cut, so no token cap can drop a tail, and a
+diarizer edge off by half a second moves a word instead of losing audio. The
+Nemotron diarizer labels far-field German audio far better than pyannote did.
+
+The diarizer is a batch container run with `podman run --rm`, so the model is
+loaded when the job starts and gone when it ends, on demand without a proxy.
+
+    ./meeting-transcribe meeting.m4a --speakers 4
+    ./meeting-transcribe meeting.wav --language it
+
+The gufo path is still one flag away, for a box without a verbose_json endpoint:
+
+    ./meeting-transcribe meeting.wav --asr http://127.0.0.1:8097 \
+        --model qwen3-asr-1.7b --diarizer pyannote-rocm --asr-mode segments
+
+The diarizer images are built once:
+
+    podman build -t localhost/halogen-diarizer-nemotron diarizer-nemotron/
+    podman build -t localhost/halogen-diarizer diarizer/
+    podman build -t localhost/halogen-diarizer-pyannote-rocm diarizer-pyannote-rocm/
+
+Everything is stdlib, the audio decoding and resampling happen in the container.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+DEFAULT_ASR = "http://127.0.0.1:8731"  # Lemonade: OpenAI-compatible verbose_json
+DEFAULT_ASR_MODEL = "Whisper-Large-v3-Turbo"
+DEFAULT_DIARIZER = "nemotron"
+SHERPA_IMAGE = "localhost/halogen-diarizer:latest"
+PYANNOTE_IMAGE = "localhost/halogen-diarizer-pyannote-rocm:latest"
+NEMOTRON_IMAGE = "localhost/halogen-diarizer-nemotron:latest"
+# Measured, not guessed: gufo caps the transcript of every audio chunk at
+# `max_tokens` (512 maximum, 256 by default) whatever room the context has, and
+# a 150 s clip already emits 485 of the 512. At 180 s it sits exactly on the cap
+# and from there the tail is dropped silently: a 240 s clip of dense speech lost
+# 170 words. So a request holds one server chunk, cut earlier only when a turn
+# is longer than this.
+MAX_SEGMENT_S = 150.0
+MAX_TOKENS = 512
+# Cut points come from the diarizer, whose edges are off by a fraction of a
+# second: grow each turn into the silence beside it so no word loses a phone.
+TURN_PAD_S = 0.3
+# Shorter than any word, so the ASR can only invent text for such a clip.
+MIN_CLIP_S = 0.2
+ATTEMPTS = 3
+RETRY_S = 1.0
+RETRYABLE = (408, 409, 429, 500, 502, 503, 504)
+
+
+def diarizer_command(backend: str, source: Path, workdir: Path, speakers: int,
+                     threshold: float, min_speakers: int = -1,
+                     max_speakers: int = -1) -> list[str]:
+    """The podman command for one diarization run.
+
+    sherpa is CPU and networkless. pyannote-rocm needs the GPU devices, the HF
+    cache mounted read-write and its token, and reaches the Hub once to fetch
+    the gated models (after that the cache is enough).
+
+    Only pyannote estimates the speaker count, so it is the only backend that
+    takes a range: sherpa's clustering wants an exact number or a threshold.
+    """
+    command = [
+        "podman", "run", "--rm", "--security-opt", "no-new-privileges",
+        "-v", f"{source}:/in:ro", "-v", f"{workdir}:/out:rw",
+    ]
+    tail = ["/in", "--out", "/out", "--speakers", str(speakers)]
+    if backend == "sherpa":
+        return command + ["--network=none", SHERPA_IMAGE] + tail + ["--threshold", str(threshold)]
+    if backend == "pyannote-rocm":
+        if min_speakers > 0:
+            tail += ["--min-speakers", str(min_speakers)]
+        if max_speakers > 0:
+            tail += ["--max-speakers", str(max_speakers)]
+        cache = Path.home() / ".cache/huggingface"
+        command += ["--device", "/dev/kfd", "--device", "/dev/dri",
+                    "--group-add", "keep-groups", "--security-opt", "seccomp=unconfined",
+                    "--ipc=host", "-v", f"{cache}:/hf:rw",
+                    "-e", "HF_HOME=/hf", "-e", "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"]
+        token = os.environ.get("HF_TOKEN") or (
+            (cache / "token").read_text().strip() if (cache / "token").is_file() else "")
+        if token:
+            command += ["-e", f"HF_TOKEN={token}"]
+        return command + [PYANNOTE_IMAGE] + tail
+    if backend == "nemotron":
+        # Nemotron reads the whole file and normalizes it itself (ffmpeg +
+        # loudnorm), exactly like the pyannote image, so the caller still finds
+        # workdir/audio.wav. It needs the GPU devices but no HF token: the
+        # checkpoint is public, the cache is mounted only to avoid re-downloads.
+        cache = Path.home() / ".cache/huggingface"
+        command += ["--device", "/dev/kfd", "--device", "/dev/dri",
+                    "--group-add", "keep-groups", "--security-opt", "seccomp=unconfined",
+                    "--ipc=host", "-v", f"{cache}:/hf:rw",
+                    "-e", "HF_HOME=/hf", "-e", "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"]
+        return command + [NEMOTRON_IMAGE] + tail
+    raise SystemExit(f"unknown diarizer: {backend}")
+
+
+def diarize(backend: str, source: Path, workdir: Path, speakers: int, threshold: float,
+            timeout: float, min_speakers: int = -1, max_speakers: int = -1) -> list[dict]:
+    """Run the diarizer container on source; return its JSON segments.
+
+    The container writes the normalized 16 kHz mono WAV into workdir, which the
+    caller then cuts with the stdlib.
+    """
+    command = diarizer_command(backend, source, workdir, speakers, threshold,
+                               min_speakers, max_speakers)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-500:]
+        raise SystemExit(f"diarizer failed ({result.returncode}): {detail}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"diarizer printed no JSON segments: {error}\n{result.stdout[:300]}")
+
+
+def build_turns(segments: list[dict], gap: float) -> list[dict]:
+    """Merge adjacent same-speaker segments separated by at most `gap` seconds."""
+    turns: list[dict] = []
+    for segment in sorted(segments, key=lambda s: (s["start"], s["end"])):
+        if turns and turns[-1]["speaker"] == segment["speaker"] \
+                and segment["start"] - turns[-1]["end"] <= gap:
+            turns[-1]["end"] = max(turns[-1]["end"], segment["end"])
+        else:
+            turns.append({"speaker": segment["speaker"],
+                          "start": float(segment["start"]), "end": float(segment["end"])})
+    return turns
+
+
+def pad_turns(turns: list[dict], pad: float) -> list[dict]:
+    """Grow every turn into the silence around it, by at most `pad` seconds.
+
+    At most half of each gap, so two neighbouring turns can never overlap and a
+    turn never picks up the next speaker's words: only silence is added.
+    """
+    padded = []
+    for index, turn in enumerate(turns):
+        left = pad if index == 0 else min(pad, (turn["start"] - turns[index - 1]["end"]) / 2)
+        right = pad if index + 1 == len(turns) else min(
+            pad, (turns[index + 1]["start"] - turn["end"]) / 2)
+        padded.append(dict(turn,
+                           start=round(max(0.0, turn["start"] - left), 3),
+                           end=round(turn["end"] + right, 3)))
+    return padded
+
+
+def parse_names(spec: str | None) -> dict[int, str]:
+    """Parse --names "1:Anna,2:Bernd" into {1: "Anna", 2: "Bernd"}."""
+    names: dict[int, str] = {}
+    for item in (spec or "").replace(";", ",").split(","):
+        if not item.strip():
+            continue
+        number, _, name = item.partition(":")
+        if not number.strip().isdigit() or not name.strip():
+            raise SystemExit(f'--names wants "1:Anna,2:Bernd", got {item!r}')
+        names[int(number)] = name.strip()
+    return names
+
+
+def number_speakers(turns: list[dict]) -> list[dict]:
+    """Relabel speakers 1..N in order of first appearance.
+
+    sherpa-onnx returns its own cluster ids (0-based with several speakers,
+    but a lone cluster can come back as 1), so the raw id is not a speaker
+    number.
+    """
+    order: dict = {}
+    for turn in turns:
+        order.setdefault(turn["speaker"], len(order) + 1)
+    return [dict(turn, speaker=order[turn["speaker"]]) for turn in turns]
+
+
+def split_turn(turn: dict, index: int, max_s: float) -> list[dict]:
+    """Cut a turn into <= max_s chunks, each tagged with its turn index."""
+    chunks = []
+    start = turn["start"]
+    while turn["end"] - start > max_s:
+        chunks.append({"turn": index, "speaker": turn["speaker"],
+                       "start": round(start, 3), "end": round(start + max_s, 3)})
+        start += max_s
+    chunks.append({"turn": index, "speaker": turn["speaker"],
+                   "start": round(start, 3), "end": round(turn["end"], 3)})
+    return chunks
+
+
+def slice_wav(path: Path, start: float, end: float) -> bytes:
+    """Return the [start, end) seconds of a 16-bit mono WAV as a WAV bytestring."""
+    with wave.open(str(path), "rb") as wav:
+        rate = wav.getframerate()
+        total = wav.getnframes()
+        params = wav.getparams()
+        first = max(0, min(int(start * rate), total))
+        last = max(first, min(int(end * rate), total))
+        wav.setpos(first)
+        frames = wav.readframes(last - first)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as clip:
+        clip.setparams(params)
+        clip.writeframes(frames)
+    return buffer.getvalue()
+
+
+def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
+    """A multipart/form-data body with text fields and one file part."""
+    boundary = "----halogen" + uuid.uuid4().hex
+    body = bytearray()
+    for name, value in fields.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
+    body += (f"--{boundary}\r\n"
+             f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+             f"Content-Type: audio/wav\r\n\r\n").encode()
+    body += data + f"\r\n--{boundary}--\r\n".encode()
+    return bytes(body), boundary
+
+
+def _words(text: str) -> list[str]:
+    return [word for word in (re.sub(r"[^\w]+", "", part).lower() for part in text.split()) if word]
+
+
+def is_prompt_echo(text: str, prompt: str, prefix: int = 12, overlap: float = 0.85) -> bool:
+    """True when a transcription is the hotwords prompt read back, not speech.
+
+    On silence or overlapping speech the model sometimes emits the prompt
+    verbatim (or its first part). A clip whose opening words are the prompt's
+    opening words, or whose words almost all come from the prompt, is that echo.
+    """
+    text_words = _words(text)
+    prompt_words = _words(prompt)
+    if len(text_words) < prefix or len(prompt_words) < prefix:
+        return False
+    if text_words[:prefix] == prompt_words[:prefix]:
+        return True
+    prompt_set = set(prompt_words)
+    contained = sum(1 for word in text_words if word in prompt_set) / len(text_words)
+    return contained >= overlap
+
+
+def is_degenerate(text: str, floor: int = 4, share: float = 0.7) -> bool:
+    """True when a transcription is one phrase repeated to fill the clip.
+
+    On music, noise and overlap the model loops ("danke danke danke"). A real
+    "nein, nein, nein" survives: the repeat has to be most of the clip.
+
+    shortcut: only a repeated 1-3 word phrase; widen the window if a transcript
+    shows a longer loop.
+    """
+    words = _words(text)
+    if len(words) < floor:
+        return False
+    for size in (1, 2, 3):
+        counts = Counter(tuple(words[start:start + size])
+                         for start in range(len(words) - size + 1))
+        count = counts.most_common(1)[0][1]
+        if count >= floor and count * size / len(words) >= share:
+            return True
+    return False
+
+
+def rejoin(words: list[dict]) -> str:
+    """Rebuild a segment's text from its words.
+
+    The endpoint's own `text` is broken two ways: the server wraps lines at 32
+    characters and Lemonade turns that wrap into a space, so "Insel" arrives as
+    "In sel". `words[]` keeps the truth: a piece that does not start with a space
+    continues the previous one, so a plain concatenation restores the word.
+    """
+    return "".join(str(word.get("word", "")) for word in words)
+
+
+def starts_mid_word(words: list[dict]) -> bool:
+    """True when a segment opens in the middle of the previous segment's word."""
+    return bool(words) and not str(words[0].get("word", "")).startswith(" ")
+
+
+def unwrap(text: str) -> str:
+    """Normalise the ASR server's fixed-width line wrap into single spaces.
+
+    The whisper server breaks lines every 32 characters. When the break falls
+    inside a word the fix is rejoin() on words[], which knows which piece
+    continues which; here we only collapse whitespace, so a text that arrives
+    without words[] stays readable ("In\\nsel" -> "In sel") instead of gluing
+    two unrelated words together.
+    """
+    return re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
+
+
+def transcribe(url: str, clip: bytes, model: str, language: str | None,
+               prompt: str | None, timeout: float, attempts: int = ATTEMPTS,
+               max_tokens: int = MAX_TOKENS) -> str:
+    fields = {"model": model, "response_format": "json"}
+    if language:
+        fields["language"] = language
+    if prompt:
+        fields["prompt"] = prompt
+    if max_tokens > 0:
+        # Without this the endpoint keeps its own smaller cap and drops the tail.
+        fields["max_tokens"] = str(max_tokens)
+    body, boundary = multipart(fields, "segment.wav", clip)
+    # A long meeting sends hundreds of clips: one admission-queue 429 or a
+    # restarting endpoint must cost a retry, not the whole job.
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                text = str(json.loads(response.read()).get("text", "")).strip()
+            break
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read().decode(errors="replace")[:300]
+            failure = f"ASR refused a {len(clip)} byte clip: {error.code} {detail}"
+            if error.code not in RETRYABLE:
+                raise SystemExit(failure)
+        except (urllib.error.URLError, TimeoutError) as error:
+            failure = f"ASR unreachable: {error}"
+        if attempt == attempts:
+            raise SystemExit(f"{failure} (after {attempts} tries)")
+        time.sleep(RETRY_S * attempt)
+    # The model echoes the hotword prompt on silence/overlap: drop it, it is not speech.
+    if prompt and is_prompt_echo(text, prompt):
+        return ""
+    if is_degenerate(text):
+        return ""
+    return unwrap(text)
+
+
+def transcribe_full(url: str, audio: Path, model: str, language: str | None,
+                    prompt: str | None, timeout: float,
+                    attempts: int = ATTEMPTS) -> list[dict]:
+    """One ASR request for the whole file; returns segments with timestamps.
+
+    The endpoint must be OpenAI-compatible and answer verbose_json (whisper via
+    Lemonade, not gufo). No max_tokens is sent: capping the output of a whole
+    meeting is how a tail disappears silently.
+    """
+    fields = {"model": model, "response_format": "verbose_json"}
+    if language:
+        fields["language"] = language
+    if prompt:
+        fields["prompt"] = prompt
+    body, boundary = multipart(fields, audio.name, audio.read_bytes())
+    failure = "ASR unreachable"
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read())
+            segments = []
+            for seg in payload.get("segments", []):
+                words = seg.get("words") or []
+                text = rejoin(words) if words else str(seg.get("text", ""))
+                segments.append({"start": float(seg["start"]), "end": float(seg["end"]),
+                                 "text": unwrap(text), "joins": starts_mid_word(words)})
+            return segments
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read().decode(errors="replace")[:300]
+            failure = f"ASR refused the full file: {error.code} {detail}"
+            if error.code not in RETRYABLE:
+                raise SystemExit(failure)
+        except (urllib.error.URLError, TimeoutError) as error:
+            failure = f"ASR unreachable: {error}"
+        if attempt == attempts:
+            raise SystemExit(f"{failure} (after {attempts} tries)")
+        time.sleep(RETRY_S * attempt)
+    raise SystemExit(failure)
+
+
+def fuse_segments(asr_segments: list[dict], diar_segments: list[dict]) -> list[dict]:
+    """Give every ASR segment the speaker with the largest overlap with it.
+
+    The ASR owns the words and the diarizer only labels them, so a diarizer edge
+    off by half a second moves a word instead of losing audio. A segment that
+    falls in a diarizer gap (silence it did not label) inherits the previous
+    speaker, so no text is lost and no bogus speaker number appears.
+    """
+    labeled: list[dict] = []
+    for segment in asr_segments:
+        weight: dict = {}
+        for diar in diar_segments:
+            overlap = min(segment["end"], diar["end"]) - max(segment["start"], diar["start"])
+            if overlap > 0:
+                weight[diar["speaker"]] = weight.get(diar["speaker"], 0.0) + overlap
+        speaker = max(weight, key=weight.get) if weight else None
+        if speaker is None:
+            if labeled:
+                speaker = labeled[-1]["speaker"]
+            elif diar_segments:
+                speaker = min(diar_segments,
+                              key=lambda d: abs(d["start"] - segment["start"]))["speaker"]
+            else:
+                speaker = 0
+        labeled.append({"speaker": speaker, "start": segment["start"],
+                        "end": segment["end"], "text": segment["text"],
+                        "joins": segment.get("joins", False)})
+    return labeled
+
+
+def build_turns_labeled(segments: list[dict], gap: float) -> list[dict]:
+    """Merge adjacent same-speaker ASR segments, joining their text."""
+    turns: list[dict] = []
+    for segment in sorted(segments, key=lambda s: (s["start"], s["end"])):
+        if turns and turns[-1]["speaker"] == segment["speaker"] \
+                and segment["start"] - turns[-1]["end"] <= gap:
+            turns[-1]["end"] = max(turns[-1]["end"], segment["end"])
+            glue = "" if segment.get("joins") else " "
+            turns[-1]["text"] = f"{turns[-1]['text']}{glue}{segment['text']}".strip()
+        else:
+            turns.append({"speaker": segment["speaker"],
+                          "start": float(segment["start"]), "end": float(segment["end"]),
+                          "text": segment["text"]})
+    return turns
+
+
+def run_parallel(chunks: list[dict], work, parallel: int, progress=None) -> dict[int, str]:
+    """Transcribe chunks up to `parallel` at a time; return {position: text}.
+
+    The first failure cancels whatever has not started and re-raises, so a dead
+    endpoint does not keep the whole meeting going.
+    """
+    results: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+        futures = {pool.submit(work, chunk): (position, chunk)
+                   for position, chunk in enumerate(chunks, 1)}
+        done = 0
+        for future in as_completed(futures):
+            position, chunk = futures[future]
+            try:
+                text = future.result()
+            except BaseException:
+                for pending in futures:
+                    pending.cancel()
+                raise
+            results[position] = text
+            done += 1
+            if progress:
+                progress(done, chunk, text)
+    return results
+
+
+def ordered_texts(chunks: list[dict], results: dict[int, str]) -> dict[int, list[str]]:
+    """Group the per-position transcriptions by turn, in audio order."""
+    texts: dict[int, list[str]] = {}
+    for position, chunk in enumerate(chunks, 1):
+        texts.setdefault(chunk["turn"], []).append(results[position])
+    return texts
+
+
+def timestamp(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def render_markdown(source: str, turns: list[dict]) -> str:
+    lines = [f"# {Path(source).name}", ""]
+    for turn in turns:
+        who = turn.get("name") or f"Speaker {turn['speaker']}"
+        lines.append(f"**[{timestamp(turn['start'])}] {who}:** {turn['text']}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Diarized transcript via an OpenAI-compatible ASR + a diarizer container.")
+    parser.add_argument("input", type=Path, help="audio or video file, any format ffmpeg reads")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="output prefix; writes PREFIX.md and PREFIX.json (default next to input)")
+    parser.add_argument("--asr", default=DEFAULT_ASR,
+                        help=f"ASR base URL (default {DEFAULT_ASR})")
+    parser.add_argument("--model", default=DEFAULT_ASR_MODEL, help=f"ASR model (default {DEFAULT_ASR_MODEL})")
+    parser.add_argument("--diarizer", default=DEFAULT_DIARIZER,
+                        choices=("sherpa", "pyannote-rocm", "nemotron"),
+                        help=f"diarizer backend (default {DEFAULT_DIARIZER})")
+    parser.add_argument("--asr-mode", default="full", choices=("segments", "full"),
+                        help="full: one request for the whole normalized file plus segment-level "
+                             "fusion with the diarizer (the default; needs an OpenAI-compatible "
+                             "verbose_json endpoint, e.g. Lemonade on :8731 with Whisper); "
+                             "segments: one ASR request per turn clip, the gufo-safe path")
+    parser.add_argument("--speakers", type=int, default=-1,
+                        help="known speaker count; -1 lets clustering decide (default)")
+    parser.add_argument("--min-speakers", type=int, default=-1,
+                        help="fewest speakers to expect, pyannote only (default: no bound)")
+    parser.add_argument("--max-speakers", type=int, default=-1,
+                        help="most speakers to expect, pyannote only (default: no bound)")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="sherpa clustering threshold when --speakers is -1 (default 0.5)")
+    parser.add_argument("--language", default=None, help="force a language, e.g. German or de")
+    parser.add_argument("--hotwords", default=None, help="context/hotwords passed to the ASR prompt")
+    parser.add_argument("--names", default=None,
+                        help='name the speakers, e.g. "1:Anna,2:Bernd"; the names also go '
+                             "into the ASR hotwords")
+    parser.add_argument("--merge-gap", type=float, default=2.0,
+                        help="merge same-speaker segments up to this gap in seconds (default 2.0)")
+    parser.add_argument("--max-segment", type=float, default=MAX_SEGMENT_S,
+                        help=f"longest clip sent to the ASR in seconds (default {MAX_SEGMENT_S:g},\n"
+                             "one audio chunk of the ASR; longer clips lose their tail)")
+    parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS,
+                        help=f"output cap per clip/chunk (default {MAX_TOKENS}, the endpoint's "
+                             "maximum; 0 leaves the choice to the endpoint, which truncates sooner)")
+    parser.add_argument("--diarizer-timeout", type=float, default=7200,
+                        help="seconds to allow the diarizer container (default 7200)")
+    parser.add_argument("--asr-timeout", type=float, default=600,
+                        help="seconds to allow one ASR transcription (default 600)")
+    parser.add_argument("--parallel", type=int, default=4,
+                        help="transcriptions in flight at once (default 4; 1 is sequential)")
+    args = parser.parse_args()
+
+    source = args.input.resolve()
+    if not source.is_file():
+        raise SystemExit(f"No such audio file: {source}")
+    if args.diarizer != "pyannote-rocm" and (args.min_speakers > 0 or args.max_speakers > 0):
+        raise SystemExit("--min-speakers/--max-speakers need --diarizer pyannote-rocm")
+    if args.diarizer != "sherpa" and args.threshold != 0.5:
+        print("note: --threshold only applies to --diarizer sherpa", file=sys.stderr)
+    names = parse_names(args.names)
+    hotwords = ", ".join(part for part in (args.hotwords, ", ".join(names.values())) if part)
+    prefix = args.output or source.with_suffix("")
+    url = args.asr.rstrip("/") + "/v1/audio/transcriptions"
+    if args.asr_mode == "full" and args.model == "qwen3-asr-1.7b":
+        print("note: --asr-mode full needs a verbose_json endpoint; gufo's qwen3-asr-1.7b "
+              "returns text only. Use --asr-mode segments with it.", file=sys.stderr)
+
+    with tempfile.TemporaryDirectory(prefix="meeting-") as temporary:
+        workdir = Path(temporary)
+        segments = diarize(args.diarizer, source, workdir, args.speakers, args.threshold,
+                           args.diarizer_timeout, args.min_speakers, args.max_speakers)
+        if not segments:
+            raise SystemExit("diarizer found no speech")
+        print(f"diarizer: {len(segments)} segments", file=sys.stderr)
+
+        audio = workdir / "audio.wav"
+        if args.asr_mode == "full":
+            # One request for the whole normalized file: the diarizer only labels
+            # the ASR segments. Nothing is cut, so nothing can be truncated.
+            asr_segments = transcribe_full(url, audio, args.model, args.language,
+                                           hotwords, args.asr_timeout)
+            if not asr_segments:
+                raise SystemExit("ASR returned no segments")
+            print(f"asr: {len(asr_segments)} segments in one pass", file=sys.stderr)
+            labelled = number_speakers(build_turns_labeled(
+                fuse_segments(asr_segments, segments), args.merge_gap))
+            print(f"fused into {len(labelled)} turns", file=sys.stderr)
+        else:
+            turns = pad_turns(number_speakers(build_turns(segments, args.merge_gap)), TURN_PAD_S)
+            chunks = [chunk for index, turn in enumerate(turns)
+                      for chunk in split_turn(turn, index, args.max_segment)]
+            print(f"transcribing {len(chunks)} clips for {len(turns)} turns", file=sys.stderr)
+
+            def work(chunk: dict) -> str:
+                if chunk["end"] - chunk["start"] < MIN_CLIP_S:
+                    return ""
+                clip = slice_wav(audio, chunk["start"], chunk["end"])
+                return transcribe(url, clip, args.model, args.language, hotwords,
+                                  args.asr_timeout, max_tokens=args.max_tokens)
+
+            def progress(done: int, chunk: dict, text: str) -> None:
+                print(f"  [{done}/{len(chunks)}] {timestamp(chunk['start'])} "
+                      f"speaker {chunk['speaker']}: {text[:60]}", file=sys.stderr)
+
+            results = run_parallel(chunks, work, args.parallel, progress)
+            texts = ordered_texts(chunks, results)
+            labelled = [dict(turn, text=" ".join(texts.get(index, [])).strip())
+                        for index, turn in enumerate(turns)]
+
+    result = []
+    for turn in labelled:
+        if not turn["text"]:
+            continue
+        entry = dict(turn)
+        if names.get(turn["speaker"]):
+            entry["name"] = names[turn["speaker"]]
+        result.append(entry)
+    document = {"source": str(source), "model": args.model, "language": args.language,
+                "turns": result}
+    Path(f"{prefix}.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                                      encoding="utf-8")
+    Path(f"{prefix}.md").write_text(render_markdown(str(source), result), encoding="utf-8")
+    print(f"wrote {prefix}.json and {prefix}.md", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

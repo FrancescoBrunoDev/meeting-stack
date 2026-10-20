@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Async transcription job runner with a REST upload endpoint and an MCP endpoint.
+
+Meetings take minutes and Hermes' tools have a fixed deadline, so nothing here
+blocks: a caller submits audio, gets a job id, and polls (or reads the result
+later). One worker thread runs `meeting-transcribe` at a time, because the
+diarizer loads the GPU; with --asr-mode full the ASR is Whisper through Lemonade,
+already resident, so the lock is there for the diarizer.
+
+Defaults since 2026-10-20: Whisper-Large-v3-Turbo through Lemonade on 8731,
+--asr-mode full, --diarizer nemotron.
+
+    ./meeting-job --dir /mnt/cache/mcp-meeting-transcribe --token secret
+
+    # upload (n8n: HTTP Request, binary body; curl:)
+    curl --data-binary @meeting.m4a \
+         "http://halogen-host:8099/jobs?filename=meeting.m4a&speakers=4&language=it" \
+         -H "Authorization: Bearer secret"
+    # -> {"id":"1a2b...","status":"queued"}
+
+    curl -H "Authorization: Bearer secret" http://halogen-host:8099/jobs/1a2b...
+
+    # Hermes MCP over HTTP (Streamable HTTP, JSON responses) at POST /mcp
+    # tools: transcribe_meeting, meeting_status, meeting_result
+
+MCP calls are stateless JSON-RPC 2.0: initialize, tools/list, tools/call, ping.
+Large recordings should go through POST /jobs; the MCP tool takes base64 for
+small ones. Auth is a bearer token on every route but /health. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import hashlib
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from lockfile import Lock
+
+HERE = Path(__file__).resolve().parent
+PROTOCOL_SUPPORTED = ("2025-03-26", "2025-06-18")
+PROTOCOL_LATEST = "2025-06-18"
+SUFFIX = re.compile(r"\.[a-z0-9]{1,5}$")
+OPTION_FLAGS = (("speakers", "--speakers"), ("min_speakers", "--min-speakers"),
+                ("max_speakers", "--max-speakers"), ("threshold", "--threshold"),
+                ("language", "--language"), ("hotwords", "--hotwords"),
+                ("names", "--names"), ("merge_gap", "--merge-gap"),
+                ("max_segment", "--max-segment"), ("max_tokens", "--max-tokens"),
+                ("diarizer", "--diarizer"), ("model", "--model"),
+                ("asr_mode", "--asr-mode"))
+# meeting-transcribe wants ints for these; every other flag takes a float or a string.
+INT_OPTIONS = ("speakers", "min_speakers", "max_speakers", "max_tokens")
+
+
+def job_id(audio: bytes) -> str:
+    return hashlib.sha256(audio).hexdigest()[:16]
+
+
+def safe_suffix(filename: str | None) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if SUFFIX.fullmatch(suffix) else ".bin"
+
+
+class Job:
+    def __init__(self, identity: str, audio: Path, options: dict) -> None:
+        self.id = identity
+        self.audio = audio
+        self.options = options
+        self.status = "queued"
+        self.error: str | None = None
+        self.progress: str | None = None
+        self.json: dict | None = None
+        self.markdown: str | None = None
+        self.created = time.time()
+        self.started: float | None = None
+        self.finished: float | None = None
+
+    def snapshot(self) -> dict:
+        return {"id": self.id, "status": self.status, "error": self.error,
+                "options": self.options, "created": self.created,
+                "started": self.started, "finished": self.finished,
+                "progress": self.progress,
+                "json": self.json, "markdown": self.markdown}
+
+
+class Jobs:
+    """A single-worker FIFO queue of transcription jobs, kept in memory."""
+
+    def __init__(self, meeting: Path, root: Path, keep_audio: bool = False,
+                 timeout: float = 14400, asr: str = "http://127.0.0.1:8731",
+                 parallel: int = 4, diarizer: str = "nemotron",
+                 model: str = "Whisper-Large-v3-Turbo", asr_mode: str = "full",
+                 lock_path: Path = Path("/run/user/1000/halogen-gpu.lock"),
+                 lock_wait: float = 600) -> None:
+        self.meeting = Path(meeting).resolve()
+        self.asr = asr
+        self.parallel = parallel
+        self.diarizer = diarizer
+        self.model = model
+        self.asr_mode = asr_mode
+        self.lock = Lock(lock_path)
+        self.lock_wait = lock_wait
+        self.inbox = root / "inbox"
+        self.out = root / "out"
+        self.keep_audio = keep_audio
+        self.timeout = timeout
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        self.out.mkdir(parents=True, exist_ok=True)
+        self._jobs: dict[str, Job] = {}
+        self._lock = threading.Lock()
+        self._current: subprocess.Popen | None = None
+        self._current_lock = threading.Lock()
+        self._queue: queue.Queue[Job] = queue.Queue()
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def submit(self, audio: bytes, options: dict, filename: str | None = None) -> dict:
+        identity = job_id(audio)
+        with self._lock:
+            existing = self._jobs.get(identity)
+            if existing is not None and existing.status != "error":
+                return existing.snapshot()
+            path = self.inbox / (identity + safe_suffix(filename))
+            path.write_bytes(audio)
+            job = Job(identity, path, options)
+            self._jobs[identity] = job
+            self._queue.put(job)
+            return job.snapshot()
+
+    def get(self, identity: str | None) -> dict | None:
+        with self._lock:
+            job = self._jobs.get(identity or "")
+            return job.snapshot() if job else None
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            return [job.snapshot() for job in self._jobs.values()]
+
+    def queued(self) -> int:
+        return self._queue.qsize()
+
+    def _work(self) -> None:
+        while True:
+            job = self._queue.get()
+            self._run(job)
+            self._queue.task_done()
+
+    def _run(self, job: Job) -> None:
+        job.status = "running"
+        job.started = time.time()
+        # One GPU/NPU user at a time: wait for any image generation to finish.
+        if not self.lock.acquire(self.lock_wait):
+            job.status = "error"
+            job.error = f"waited {self.lock_wait:g}s for the GPU lock (an image is generating?)"
+            job.finished = time.time()
+            return
+        prefix = self.out / job.id
+        command = [str(self.meeting), str(job.audio), "--output", str(prefix),
+                   "--asr", self.asr, "--parallel", str(self.parallel),
+                   "--diarizer", self.diarizer, "--model", self.model,
+                   "--asr-mode", self.asr_mode]
+        # A per-job option appended below wins: argparse keeps the last value.
+        for key, flag in OPTION_FLAGS:
+            if job.options.get(key) is not None:
+                command += [flag, str(job.options[key])]
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                       text=True, start_new_session=True)
+            with self._current_lock:
+                self._current = process
+            tail: list[str] = []
+
+            def pump() -> None:
+                # meeting-transcribe writes its progress to stderr; keep the last
+                # line as the live status and the tail for an error message.
+                for line in process.stderr:
+                    line = line.rstrip()
+                    if line:
+                        tail.append(line)
+                        del tail[:-40]
+                        job.progress = line.strip()
+
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            try:
+                process.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                self._terminate(process)
+                process.wait()
+                raise
+            finally:
+                reader.join(timeout=5)
+            if process.returncode != 0:
+                job.status = "error"
+                job.error = "\n".join(tail).strip()[-600:]
+            else:
+                job.json = json.loads(Path(f"{prefix}.json").read_text(encoding="utf-8"))
+                job.markdown = Path(f"{prefix}.md").read_text(encoding="utf-8")
+                job.status = "done"
+        except subprocess.TimeoutExpired:
+            job.status = "error"
+            job.error = f"meeting-transcribe took more than {self.timeout:g}s"
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            job.status = "error"
+            job.error = str(error)
+        finally:
+            self.lock.release()
+            with self._current_lock:
+                self._current = None
+            job.finished = time.time()
+            # Keep the audio of a failed job so it can be resubmitted (same bytes
+            # mean the same id, and submit() requeues an errored job).
+            if not self.keep_audio and job.status == "done":
+                try:
+                    job.audio.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen) -> None:
+        """Stop the worker and everything it spawned (its diarizer container)."""
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            process.terminate()
+
+    def stop(self) -> None:
+        """Stop the running worker, if any, on service shutdown."""
+        with self._current_lock:
+            process = self._current
+        if process is not None and process.poll() is None:
+            self._terminate(process)
+
+
+class ToolError(Exception):
+    pass
+
+
+def tools() -> list[dict]:
+    return [
+        {"name": "transcribe_meeting",
+         "description": "Queue a meeting recording for diarized transcription. Use POST /jobs "
+                        "instead for large files. Returns a job id and its status.",
+         "inputSchema": {"type": "object", "properties": {
+             "audio_base64": {"type": "string", "description": "the recording, base64-encoded"},
+             "filename": {"type": "string", "description": "original name, for the format hint"},
+             "speakers": {"type": "integer", "description": "known speaker count; omit to cluster"},
+             "min_speakers": {"type": "integer", "description": "fewest speakers to expect"},
+             "max_speakers": {"type": "integer", "description": "most speakers to expect"},
+             "language": {"type": "string", "description": "force a language, e.g. de or German"},
+             "hotwords": {"type": "string", "description": "names and jargon to bias the ASR"},
+             "names": {"type": "string", "description": "speaker names, e.g. 1:Anna,2:Bernd"},
+             "threshold": {"type": "number", "description": "sherpa clustering threshold when speakers is omitted"},
+             "diarizer": {"type": "string", "enum": ["pyannote-rocm", "sherpa", "nemotron"],
+                          "description": "diarizer backend; nemotron labels far-field German audio best"},
+             "model": {"type": "string",
+                       "description": "ASR model the endpoint serves (Whisper-Large-v3-Turbo when asr_mode is full)"},
+             "asr_mode": {"type": "string", "enum": ["segments", "full"],
+                          "description": "segments: one ASR request per turn clip (gufo); full: one pass "
+                                         "over the whole file, needs a verbose_json endpoint"}},
+             "required": ["audio_base64"]}},
+        {"name": "meeting_status",
+         "description": "Status of a transcription job by id.",
+         "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}},
+                         "required": ["id"]}},
+        {"name": "meeting_result",
+         "description": "The transcript of a finished job, as markdown (default) or json.",
+         "inputSchema": {"type": "object", "properties": {
+             "id": {"type": "string"},
+             "format": {"type": "string", "enum": ["markdown", "json"]}},
+             "required": ["id"]}},
+    ]
+
+
+def call_tool(jobs: Jobs, name: str, arguments: dict) -> str:
+    if name == "transcribe_meeting":
+        encoded = arguments.get("audio_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise ToolError("audio_base64 is required")
+        try:
+            audio = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ToolError(f"audio_base64 is not valid base64: {error}")
+        options = {key: arguments[key] for key, _ in OPTION_FLAGS if arguments.get(key) is not None}
+        return json.dumps(jobs.submit(audio, options, arguments.get("filename")))
+    if name in ("meeting_status", "meeting_result"):
+        job = jobs.get(arguments.get("id"))
+        if job is None:
+            raise ToolError(f"no job with id {arguments.get('id')!r}")
+        if name == "meeting_status":
+            return json.dumps({"id": job["id"], "status": job["status"], "error": job["error"]})
+        if job["status"] != "done":
+            return f"job {job['id']} is {job['status']}" + (f": {job['error']}" if job["error"] else "")
+        return json.dumps(job["json"]) if arguments.get("format") == "json" else job["markdown"]
+    raise ToolError(f"unknown tool {name!r}")
+
+
+def mcp_response(jobs: Jobs, message: dict) -> dict | None:
+    """JSON-RPC reply for one message; None for a notification."""
+    method = message.get("method")
+    identity = message.get("id")
+    if method == "initialize":
+        requested = (message.get("params") or {}).get("protocolVersion")
+        version = requested if requested in PROTOCOL_SUPPORTED else PROTOCOL_LATEST
+        result = {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}},
+                  "serverInfo": {"name": "halogen-meeting", "version": "1.0.0"}}
+    elif method == "ping":
+        result = {}
+    elif method == "tools/list":
+        result = {"tools": tools()}
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        try:
+            text = call_tool(jobs, params.get("name"), params.get("arguments") or {})
+            result = {"content": [{"type": "text", "text": text}]}
+        except ToolError as error:
+            result = {"content": [{"type": "text", "text": str(error)}], "isError": True}
+    elif method in ("notifications/initialized", "notifications/cancelled", "notifications/progress"):
+        return None
+    else:
+        return {"jsonrpc": "2.0", "id": identity,
+                "error": {"code": -32601, "message": f"method not found: {method}"}}
+    if identity is None:
+        return None
+    return {"jsonrpc": "2.0", "id": identity, "result": result}
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server: "Server"
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def _authorized(self) -> bool:
+        token = self.server.token
+        if not token:
+            return True
+        return self.headers.get("Authorization") == f"Bearer {token}"
+
+    def _json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _text(self, status: int, text: str) -> None:
+        body = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, status: int, text: str) -> None:
+        body = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> bytes | None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > self.server.max_upload:
+            self._json(413, {"error": f"upload over {self.server.max_upload} bytes"})
+            return None
+        return self.rfile.read(length) if length else b""
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/ui"):
+            try:
+                page = (HERE / "dashboard.html").read_text(encoding="utf-8")
+            except OSError:
+                self._text(500, "dashboard.html is missing next to meeting-job\n")
+                return
+            self._html(200, page)
+            return
+        if path == "/health":
+            self._json(200, {"status": "ok", "jobs": len(self.server.jobs.list()),
+                             "queue": self.server.jobs.queued()})
+            return
+        if not self._authorized():
+            self._json(401, {"error": "missing or wrong bearer token"})
+            return
+        if path == "/jobs":
+            self._json(200, {"jobs": [self._summary(job) for job in self.server.jobs.list()]})
+        elif path.startswith("/jobs/"):
+            job = self.server.jobs.get(path.removeprefix("/jobs/"))
+            if job is None:
+                self._json(404, {"error": "no such job"})
+            else:
+                self._json(200, job)
+        elif path == "/mcp":
+            self._text(405, "the MCP endpoint accepts POST\n")
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        if not self._authorized():
+            self._json(401, {"error": "missing or wrong bearer token"})
+            return
+        body = self._body()
+        if body is None:
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/jobs":
+            if not body:
+                self._json(400, {"error": "empty body: send the audio as the request body"})
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            options = {}
+            for key, value in query.items():
+                if key == "filename":
+                    continue
+                try:
+                    options[key] = int(value[0]) if key in INT_OPTIONS else float(value[0])
+                except ValueError:
+                    options[key] = value[0]
+            job = self.server.jobs.submit(body, options, query.get("filename", [None])[0])
+            self._json(202, self._summary(job))
+        elif parsed.path == "/mcp":
+            try:
+                message = json.loads(body or b"null")
+            except json.JSONDecodeError as error:
+                self._json(400, {"jsonrpc": "2.0", "id": None,
+                                 "error": {"code": -32700, "message": f"parse error: {error}"}})
+                return
+            reply = mcp_response(self.server.jobs, message)
+            if reply is None:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._json(200, reply)
+        else:
+            self._json(404, {"error": "not found"})
+
+    @staticmethod
+    def _summary(job: dict) -> dict:
+        return {key: job[key] for key in ("id", "status", "error", "created",
+                                          "started", "finished", "options", "progress")}
+
+
+class Server(ThreadingHTTPServer):
+    def __init__(self, address, jobs: Jobs, token: str, max_upload: int) -> None:
+        self.jobs = jobs
+        self.token = token
+        self.max_upload = max_upload
+        super().__init__(address, Handler)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Async transcription jobs with a REST and MCP endpoint.")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8099)
+    parser.add_argument("--dir", type=Path, default=Path("/mnt/fanxiang/cache/mcp-meeting-transcribe"),
+                        help="root for inbox/ and out/ "
+                             "(default /mnt/fanxiang/cache/mcp-meeting-transcribe)")
+    parser.add_argument("--meeting", type=Path, default=HERE / "meeting-transcribe",
+                        help="the worker script (default meeting-transcribe next to this one)")
+    parser.add_argument("--asr", default="http://127.0.0.1:8731",
+                        help="OpenAI-compatible ASR base URL the worker transcribes through "
+                             "(default Lemonade on 127.0.0.1:8731, verbose_json)")
+    parser.add_argument("--parallel", type=int, default=4,
+                        help="transcriptions in flight at once (default 4; 1 is sequential)")
+    parser.add_argument("--diarizer", default="nemotron",
+                        choices=("sherpa", "pyannote-rocm", "nemotron"),
+                        help="diarizer backend (default nemotron)")
+    parser.add_argument("--model", default="Whisper-Large-v3-Turbo",
+                        help="ASR model the endpoint serves (default Whisper-Large-v3-Turbo)")
+    parser.add_argument("--asr-mode", default="full", choices=("segments", "full"),
+                        help="segments: one ASR request per turn clip (default); full: one pass over "
+                             "the whole file, needs a verbose_json endpoint such as Lemonade")
+    parser.add_argument("--lock", type=Path, default=Path("/run/user/1000/halogen-gpu.lock"),
+                        help="exclusive lock held while a job runs, shared with image-guard")
+    parser.add_argument("--lock-wait", type=float, default=600,
+                        help="seconds to wait for the lock before failing the job (default 600)")
+    parser.add_argument("--token", default=os.environ.get("MEETING_TOKEN", ""),
+                        help="bearer token required on every route but /health (default $MEETING_TOKEN)")
+    parser.add_argument("--max-upload", type=int, default=512 * 1024 * 1024,
+                        help="largest audio upload in bytes (default 512 MiB)")
+    parser.add_argument("--job-timeout", type=float, default=14400,
+                        help="seconds one transcription may take (default 14400)")
+    parser.add_argument("--keep-audio", action="store_true",
+                        help="keep the uploaded audio instead of deleting it after the job")
+    args = parser.parse_args()
+
+    jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
+                args.asr, args.parallel, args.diarizer, args.model, args.asr_mode,
+                args.lock, args.lock_wait)
+    server = Server((args.host, args.port), jobs, args.token, args.max_upload)
+    auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
+    print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)
+
+    def shutdown(signum, frame) -> None:
+        jobs.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

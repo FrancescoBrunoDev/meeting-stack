@@ -1,0 +1,26 @@
+# Speaker diarization, CPU only, for meeting-transcribe.
+#
+#   podman build -t localhost/halogen-diarizer diarizer/
+#
+# Two small ONNX models (about 40 MB total) are baked in; the image does not
+# need the network at run time. ffmpeg is only the decoder, so any input format
+# works and the caller gets a normalized 16 kHz mono WAV back.
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl bzip2 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir "sherpa-onnx==1.13.8" numpy
+
+RUN mkdir -p /models && cd /models \
+ && curl -fsSL -o seg.tar.bz2 \
+      https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 \
+ && tar xf seg.tar.bz2 \
+ && rm seg.tar.bz2 \
+ && curl -fsSL -o 3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx \
+      https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+
+COPY diarize.py /diarize.py
+
+ENTRYPOINT ["python3", "/diarize.py"]

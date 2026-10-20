@@ -1,0 +1,32 @@
+# Diarized meeting transcription: REST jobs + MCP, on demand per request.
+#
+# User unit (rootless podman box). Install:
+#   install -m 644 systemd/meeting-job.service ~/.config/systemd/user/
+#   install -d -m 700 ~/.config/meeting-stack
+#   printf 'MEETING_TOKEN=%s\n' "$(openssl rand -hex 24)" > ~/.config/meeting-stack/meeting-job.env
+#   chmod 600 ~/.config/meeting-stack/meeting-job.env
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now meeting-job.service
+#   loginctl enable-linger "$USER"      # start at boot, without a login
+#
+# The service only starts jobs; each job needs the ASR endpoint up and the
+# diarizer image built. Defaults (2026-10-20): Whisper-Large-v3-Turbo through
+# Lemonade on 8731, one ASR pass over the whole file (--asr-mode full), and the
+# Nemotron diarizer (diarizer-nemotron/). Switch back with --asr
+# http://127.0.0.1:8097 --model qwen3-asr-1.7b --asr-mode segments and
+# --diarizer pyannote-rocm, which needs the gufo-asr container (8097).
+[Unit]
+Description=Diarized meeting transcription (REST + MCP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/meeting-stack/meeting-job.env
+ExecStart=%h/Github/meeting-stack/meeting-job --dir %h/.cache/mcp-meeting-transcribe --port 8099 --asr http://127.0.0.1:8731 --model Whisper-Large-v3-Turbo --diarizer nemotron --asr-mode full
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
