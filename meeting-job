@@ -148,6 +148,16 @@ class Job:
         """The microphone side, only when a system track is there to pair it with."""
         return self.tracks.get("second") if "main" in self.tracks else None
 
+    @property
+    def duration(self) -> float | None:
+        """How long the recording is; older results only have the last turn's end."""
+        if not self.json:
+            return None
+        if self.json.get("duration"):
+            return round(float(self.json["duration"]), 1)
+        turns = self.json.get("turns") or []
+        return round(max(turn["end"] for turn in turns), 1) if turns else None
+
     def snapshot(self) -> dict:
         audio = self.audio
         return {"id": self.id, "status": self.status, "error": self.error,
@@ -156,6 +166,8 @@ class Job:
                 "progress": self.progress,
                 "json": self.json, "markdown": self.markdown,
                 "tracks": sorted(self.tracks),
+                # Length of the recording, not how long the job took.
+                "duration": self.duration,
                 # False once the audio is gone (deleted after a job, or --keep-audio off)
                 "audio": bool(audio and audio.is_file())}
 
@@ -616,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
     def _summary(job: dict) -> dict:
         return {key: job[key] for key in ("id", "status", "error", "created",
                                           "started", "finished", "options", "progress",
-                                          "tracks")}
+                                          "tracks", "duration")}
 
 
 class Server(ThreadingHTTPServer):

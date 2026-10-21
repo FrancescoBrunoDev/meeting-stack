@@ -10,6 +10,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -132,6 +133,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class RecordingLength(unittest.TestCase):
+    def test_the_length_comes_from_the_file_not_the_last_word(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.wav"
+            with wave.open(str(path), "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(16000)
+                out.writeframes(b"\0\0" * 16000 * 3)
+            self.assertEqual(meeting.wav_seconds(path), 3.0)
+
+    def test_something_that_is_not_audio_has_no_length(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.wav"
+            path.write_bytes(b"not a wav")
+            self.assertIsNone(meeting.wav_seconds(path))
+
+
 class TwoTracks(unittest.TestCase):
     """System track + microphone track: one conversation, two files."""
 
@@ -159,6 +178,17 @@ class TwoTracks(unittest.TestCase):
                  {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
         labelled = meeting.second_track_turns(turns, after=3, name="Room", diarized=True)
         self.assertEqual([t["speaker"] for t in labelled], [4, 5])
+
+
+class JobSummaryFields(unittest.TestCase):
+    """The list endpoint strips the transcript, so it must keep what the table shows."""
+
+    def test_the_summary_keeps_length_and_tracks(self):
+        job = meeting_job.Job("abc", {})
+        summary = meeting_job.Handler._summary(job.snapshot())
+        self.assertIn("duration", summary)
+        self.assertIn("tracks", summary)
+        self.assertNotIn("json", summary)
 
 
 class TrackPairing(unittest.TestCase):

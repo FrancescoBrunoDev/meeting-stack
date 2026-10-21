@@ -233,6 +233,15 @@ def split_turn(turn: dict, index: int, max_s: float) -> list[dict]:
     return chunks
 
 
+def wav_seconds(path: Path) -> float | None:
+    """Length of a WAV file in seconds, or None when it cannot be read."""
+    try:
+        with wave.open(str(path), "rb") as wav:
+            return round(wav.getnframes() / (wav.getframerate() or 1), 1)
+    except (wave.Error, EOFError, OSError):
+        return None
+
+
 def slice_wav(path: Path, start: float, end: float) -> bytes:
     """Return the [start, end) seconds of a 16-bit mono WAV as a WAV bytestring."""
     with wave.open(str(path), "rb") as wav:
@@ -713,9 +722,11 @@ def main() -> None:
 
     # Next to the outputs, not /tmp: the diarizer container mounts this path, and
     # a service running in a container cannot see the host's /tmp.
+    duration: float | None = None
     with tempfile.TemporaryDirectory(prefix="meeting-", dir=prefix.parent) as temporary:
         workdir = Path(temporary)
         labelled = number_speakers(track_turns(args, url, source, workdir / "main", hotwords))
+        duration = wav_seconds(workdir / "main" / "audio.wav")
         if second_source is not None:
             second = track_turns(args, url, second_source, workdir / "second", hotwords,
                                  diarize_it=args.diarize_second)
@@ -735,7 +746,9 @@ def main() -> None:
             entry["name"] = name
         result.append(entry)
     document = {"source": str(source), "model": args.model, "language": args.language,
-                "turns": result}
+                # The recording's length, so a client does not have to guess it
+                # from the last turn (which ends where the speech ends).
+                "duration": duration, "turns": result}
     if second_source is not None:
         document["second"] = str(second_source)
     Path(f"{prefix}.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",

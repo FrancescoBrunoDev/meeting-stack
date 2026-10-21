@@ -59,6 +59,7 @@ type JobSummary = {
   options: Record<string, string | number>
   progress: string | null
   tracks?: string[]
+  duration?: number | null
 }
 
 type Turn = { speaker: number; start: number; end: number; text: string; name?: string }
@@ -119,11 +120,13 @@ const options = (job: JobSummary) =>
     .map(([key, value]) => `${key}=${value}`)
     .join(" · ")
 
-function clock(seconds: number) {
+function length(seconds: number) {
   const total = Math.max(0, Math.round(seconds))
-  const m = Math.floor(total / 60)
-  const s = total % 60
-  return m ? `${m}m ${s}s` : `${s}s`
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const secondsLeft = total % 60
+  if (hours) return `${hours}h ${minutes}m`
+  return minutes ? `${minutes}m ${secondsLeft}s` : `${secondsLeft}s`
 }
 
 function timecode(seconds: number) {
@@ -134,9 +137,10 @@ function timecode(seconds: number) {
   return hours ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`
 }
 
-function duration(job: JobSummary, now: number) {
+// How long the job itself ran, which is what the Progress column shows.
+function took(job: JobSummary, now: number) {
   if (!job.started) return "—"
-  return clock((job.finished ?? now / 1000) - job.started)
+  return length((job.finished ?? now / 1000) - job.started)
 }
 
 function age(created: number, now: number) {
@@ -460,7 +464,7 @@ export default function App() {
                         <StatusBadge status={job.status} />
                       </TableCell>
                       <TableCell className="font-mono text-xs tabular-nums">
-                        {duration(job, now)}
+                        {job.duration ? length(job.duration) : "—"}
                       </TableCell>
                       <TableCell>
                         <div className="font-mono text-xs">{job.id.slice(0, 8)}</div>
@@ -477,7 +481,9 @@ export default function App() {
                           title={job.error ?? job.progress ?? undefined}
                         >
                           {job.error ??
-                            (job.status === "done" ? "—" : job.progress ?? "—")}
+                            (job.status === "done"
+                              ? `took ${took(job, now)}`
+                              : job.progress ?? "—")}
                         </div>
                       </TableCell>
                     </TableRow>
