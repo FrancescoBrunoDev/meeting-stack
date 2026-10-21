@@ -84,7 +84,15 @@ bite:
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
 - Job state is in memory: restarting the unit empties the job list, the `.md` and
-  `.json` files stay in `~/.cache/mcp-meeting-transcribe/out/`.
+  `.json` files stay in `~/.cache/mcp-meeting-transcribe/out/`. Announcements
+  (`hooks.json`, from `POST /hook`) are the exception and do survive: they are
+  the recorder's word that a recording is complete, and re-announcing after a
+  restart is not something the recorder can be asked to do.
+- `POST /hook` carries no audio; it is `POST /jobs` that does. The hook exists so
+  an announced-but-never-uploaded recording shows up as `missing_audio` in
+  `GET /hooks` instead of being guessed after `--pair-wait`. Both are idempotent
+  by recording key (`zoom-<stamp>`), which is how a retry or a recorder restart
+  sweep is absorbed.
 - `--keep-audio` is on in the unit so the dashboard can play a recording; the
   uploads stay in `~/.cache/mcp-meeting-transcribe/inbox/` forever. `GET
   /jobs/<id>/audio` serves them with ranges (206) and accepts the bearer token in

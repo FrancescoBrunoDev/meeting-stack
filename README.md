@@ -146,6 +146,25 @@ about pairing; `?pair=<key>&track=main|second` does the same explicitly, which
 is what the dashboard sends. A job with one track stays `waiting` for the other
 until `--pair-wait` seconds pass (default 900), then runs with what arrived.
 
+### Announced recordings (`POST /hook`)
+
+The audio above is still the way in — `POST /hook` does not carry audio. It is
+the recorder saying *this recording is complete, and here is where it lives*:
+
+```sh
+curl -d '{"id":"2026-10-20/12-35-09","day":"2026-10-20","recording":"12-35-09",
+          "remote_dir":"https://dav/BSB/Registrazioni/2026-10-20/12-35-09/",
+          "files":["audio/zoom-20261020-123509-system-16k.mp3"]}' http://box:8099/hook
+# -> {"ok":true,"pair":"zoom-20261020-123509","status":"missing_audio",...}
+```
+
+`GET /hooks` lists every announcement joined with the job its uploads produced.
+`status` is the job status, or `missing_audio` when the announcement has no
+upload behind it — the state that otherwise stays invisible until `--pair-wait`
+gives up. Announcements are idempotent (the same body twice is a 200 and bumps
+`count`) and stored in `hooks.json` under `--dir`, so they survive a restart
+while the job list does not.
+
 The two tracks are worth keeping apart. The system track is diarized as usual
 (`Speaker 1…N` are the remote participants); the microphone track is *one*
 speaker by construction — the room the recorder sits in — so it is not

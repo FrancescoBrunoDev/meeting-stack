@@ -20,6 +20,10 @@ Defaults since 2026-10-20: Whisper-Large-v3-Turbo through Lemonade on 8731,
 
     curl -H "Authorization: Bearer secret" http://halogen-host:8099/jobs/1a2b...
 
+    # the recorder announces a finished recording (idempotent; GET /hooks lists them)
+    curl -d '{"day":"2026-10-20","recording":"12-35-09","files":["audio/a.mp3"]}' \
+         http://halogen-host:8099/hook
+
     # Hermes MCP over HTTP (Streamable HTTP, JSON responses) at POST /mcp
     # tools: transcribe_meeting, meeting_status, meeting_result
 
@@ -120,6 +124,102 @@ def track_and_pair(filename: str | None, options: dict) -> tuple[str, str | None
 def safe_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if SUFFIX.fullmatch(suffix) else ".bin"
+
+
+RECORDING_STAMP = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})/(?P<time>\d{2}-\d{2}-\d{2})$")
+
+
+def recording_pair(day: str, recording: str) -> str | None:
+    """('<2026-10-20>', '<12-35-09>') -> 'zoom-20261020-123509'.
+
+    The recorder announces a recording with the day and time of its folder; the
+    uploads arrive named `zoom-YYYYMMDD-HHMMSS-{system,mic}-16k.mp3`, so the two
+    have to agree on one key to be the same thing.
+    """
+    match = RECORDING_STAMP.match(f"{day}/{recording}".strip())
+    if not match:
+        return None
+    return "zoom-" + match.group("day").replace("-", "") + "-" + match.group("time").replace("-", "")
+
+
+class Hooks:
+    """Recordings the recorder announced as complete (POST /hook).
+
+    The audio still arrives through POST /jobs - this only remembers the
+    announcement, so a recording that was announced and never uploaded can be
+    seen instead of being guessed after --pair-wait. On disk, because the job
+    list is in memory but a skipped announcement is not worth losing.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._items: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(data, list):
+            self._items = {item["pair"]: item for item in data
+                           if isinstance(item, dict) and item.get("pair")}
+
+    def _save(self) -> None:
+        # Atomic: the service is restarted while a hook is being written.
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(list(self._items.values()), indent=1), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def announce(self, payload: dict) -> tuple[dict | None, str | None]:
+        """Remember one announcement. (entry, error) - error is a 400 reason."""
+        if not isinstance(payload, dict):
+            return None, "body must be a JSON object"
+        day, recording = str(payload.get("day") or ""), str(payload.get("recording") or "")
+        pair = recording_pair(day, recording)
+        if pair is None:
+            return None, "expected day=YYYY-MM-DD and recording=HH-MM-SS"
+        files = [str(name) for name in (payload.get("files") or []) if str(name).strip()]
+        now = time.time()
+        with self._lock:
+            entry = self._items.get(pair)
+            if entry is None:
+                entry = {"pair": pair, "id": f"{day}/{recording}", "day": day,
+                         "recording": recording, "first_seen": now, "count": 0}
+                self._items[pair] = entry
+            entry.update({"remote_dir": str(payload.get("remote_dir") or ""),
+                          "files": files, "last_seen": now,
+                          "count": int(entry.get("count", 0)) + 1})
+            self._save()
+            return dict(entry), None
+
+    def get(self, pair: str) -> dict | None:
+        with self._lock:
+            entry = self._items.get(pair)
+            return dict(entry) if entry else None
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            return [dict(entry) for entry in self._items.values()]
+
+
+def hook_view(hooks: Hooks, jobs: Jobs, pair: str | None = None) -> list[dict]:
+    """Every announcement joined with the job its audio produced, if any."""
+    entries = [hooks.get(pair)] if pair else hooks.list()
+    views = []
+    for entry in entries:
+        if entry is None:
+            continue
+        job = jobs.get(job_id(f"pair:{entry['pair']}".encode()))
+        if job is None:
+            # Announced as ready, never uploaded: the recorder has the files,
+            # the worker does not - that is the state worth seeing.
+            state = "missing_audio"
+        else:
+            state = job["status"]
+        views.append({**entry, "job": job["id"] if job else None, "status": state})
+    return views
 
 
 class Job:
@@ -539,7 +639,16 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json(401, {"error": "missing or wrong bearer token"})
             return
-        if path == "/jobs":
+        if path == "/hooks":
+            self._json(200, {"hooks": hook_view(self.server.hooks, self.server.jobs)})
+        elif path.startswith("/hooks/"):
+            views = hook_view(self.server.hooks, self.server.jobs,
+                              path.removeprefix("/hooks/"))
+            if not views:
+                self._json(404, {"error": "no such hook"})
+            else:
+                self._json(200, views[0])
+        elif path == "/jobs":
             self._json(200, {"jobs": [self._summary(job) for job in self.server.jobs.list()]})
         elif path.startswith("/jobs/") and path.endswith("/audio"):
             self._send_audio(path[len("/jobs/"):-len("/audio")])
@@ -607,6 +716,21 @@ class Handler(BaseHTTPRequestHandler):
                     options[key] = value[0]
             job = self.server.jobs.submit(body, options, query.get("filename", [None])[0])
             self._json(202, self._summary(job))
+        elif parsed.path == "/hook":
+            # The recorder calls this once per recording, after every track is
+            # on WebDAV. Idempotent on purpose: a retry or a startup sweep sends
+            # the same body again, and that must stay a 200.
+            try:
+                payload = json.loads(body or b"{}")
+            except json.JSONDecodeError as error:
+                self._json(400, {"error": f"invalid JSON: {error}"})
+                return
+            entry, error = self.server.hooks.announce(payload)
+            if error:
+                self._json(400, {"error": error})
+                return
+            view = hook_view(self.server.hooks, self.server.jobs, entry["pair"])[0]
+            self._json(200, {"ok": True, **view})
         elif parsed.path == "/mcp":
             try:
                 message = json.loads(body or b"null")
@@ -632,8 +756,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
-    def __init__(self, address, jobs: Jobs, token: str, max_upload: int) -> None:
+    def __init__(self, address, jobs: Jobs, hooks: Hooks, token: str,
+                 max_upload: int) -> None:
         self.jobs = jobs
+        self.hooks = hooks
         self.token = token
         self.max_upload = max_upload
         super().__init__(address, Handler)
@@ -681,7 +807,8 @@ def main() -> None:
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
                 args.asr, args.parallel, args.diarizer, args.model, args.asr_mode,
                 args.lock, args.lock_wait, pair_wait=args.pair_wait)
-    server = Server((args.host, args.port), jobs, args.token, args.max_upload)
+    hooks = Hooks(args.dir.expanduser() / "hooks.json")
+    server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)
 
