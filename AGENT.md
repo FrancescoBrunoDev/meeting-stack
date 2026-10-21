@@ -7,6 +7,7 @@ an agent needs before touching anything.
 ## Layout
 
 ```
+Containerfile             the service + dashboard image (python3 + podman-remote)
 meeting-transcribe        CLI: one audio file -> PREFIX.md + PREFIX.json
 meeting-job               service: REST POST /jobs + MCP POST /mcp, one worker
 meeting-eval              score a transcript against a reference
@@ -14,6 +15,8 @@ lockfile.py               flock wrapper; the PATH is the contract, not the code
 diarizer/                 sherpa (ONNX, CPU)
 diarizer-pyannote-rocm/   pyannote.audio on the iGPU
 diarizer-nemotron/        NVIDIA Nemotron-3-Diarization via transformers (default)
+dashboard/src/            React + shadcn/ui source of the web UI
+dashboard.html            built, inlined single file — what :8099 serves
 systemd/meeting-job.service
 test_meeting.py
 ```
@@ -32,6 +35,15 @@ live in the archived `halogen-runner` repo and are out of scope.
   Never rename it in one place only — two different paths means two different
   locks and the protection silently stops working.
 
+## The dashboard
+
+`dashboard.html` at the repo root is a build artifact: edit `dashboard/src`, then
+`cd dashboard && npm run build` (writes `../dashboard.html`). `npm run dev` serves a
+hot-reloading copy on `:5173` and proxies `/jobs`, `/health` and `/mcp` to the
+service on `:8099`. The `dashboard/src/components/ui`
+files are verbatim shadcn registry components; do not hand-edit them, re-fetch
+from `https://ui.shadcn.com/r/styles/new-york-v4/<name>.json` instead.
+
 ## Rules
 
 - Do not touch the router aliases on `:8080` or any Hermes profile config.
@@ -42,6 +54,26 @@ live in the archived `halogen-runner` repo and are out of scope.
   meeting; anything else must be measured or labelled as an estimate.
 - A change to `--asr-mode full`, the fusion, or the word rebuilding needs a test
   in `test_meeting.py` and a run on a real recording before it ships.
+
+## Runtime: service in a container, diarizers on the host
+
+`meeting-job` and the dashboard run in `localhost/meeting-job`; each job's
+`podman run` goes through the host's rootless podman socket
+(`CONTAINER_HOST=unix:///run/user/1000/podman/podman.sock`). Consequences that
+bite:
+
+- Every path handed to `podman run` (`-v source:/in`, `-v workdir:/out`, the HF
+  cache) is a **host** path. The service container mounts the cache dirs at the
+  same absolute path, and `HOME` is the host's, so `Path.home()` matches. A temp
+  dir in `/tmp` breaks: the host cannot see the container's `/tmp` — the
+  diarizer workdir therefore lives under the output dir.
+- A remote podman rejects `--group-add keep-groups`; `podman_is_remote()` in
+  `meeting-transcribe` skips the flag in that case. It is only needed on the
+  host path, and `/dev/kfd` + `/dev/dri` are 0666 on this box.
+- `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
+  or every job fails with a connection error.
+- Job state is in memory: restarting the unit empties the job list, the `.md` and
+  `.json` files stay in `~/.cache/mcp-meeting-transcribe/out/`.
 
 ## Gotchas that already cost time
 

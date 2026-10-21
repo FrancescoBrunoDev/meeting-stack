@@ -71,6 +71,28 @@ RETRY_S = 1.0
 RETRYABLE = (408, 409, 429, 500, 502, 503, 504)
 
 
+_REMOTE: bool | None = None
+
+
+def podman_is_remote() -> bool:
+    """True when podman talks to a socket instead of running here.
+
+    `--group-add keep-groups` is the only way to keep /dev/kfd usable inside a
+    rootless diarizer, and a remote podman rejects it; there the device nodes are
+    world-readable (0666) anyway, so the flag is not needed.
+    """
+    global _REMOTE
+    if _REMOTE is None:
+        try:
+            result = subprocess.run(
+                ["podman", "info", "--format", "{{.Host.ServiceIsRemote}}"],
+                capture_output=True, text=True, timeout=15)
+            _REMOTE = result.stdout.strip() == "true"
+        except (OSError, subprocess.SubprocessError):
+            _REMOTE = False
+    return _REMOTE
+
+
 def diarizer_command(backend: str, source: Path, workdir: Path, speakers: int,
                      threshold: float, min_speakers: int = -1,
                      max_speakers: int = -1) -> list[str]:
@@ -97,9 +119,11 @@ def diarizer_command(backend: str, source: Path, workdir: Path, speakers: int,
             tail += ["--max-speakers", str(max_speakers)]
         cache = Path.home() / ".cache/huggingface"
         command += ["--device", "/dev/kfd", "--device", "/dev/dri",
-                    "--group-add", "keep-groups", "--security-opt", "seccomp=unconfined",
+                    "--security-opt", "seccomp=unconfined",
                     "--ipc=host", "-v", f"{cache}:/hf:rw",
                     "-e", "HF_HOME=/hf", "-e", "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"]
+        if not podman_is_remote():
+            command += ["--group-add", "keep-groups"]
         token = os.environ.get("HF_TOKEN") or (
             (cache / "token").read_text().strip() if (cache / "token").is_file() else "")
         if token:
@@ -112,9 +136,11 @@ def diarizer_command(backend: str, source: Path, workdir: Path, speakers: int,
         # checkpoint is public, the cache is mounted only to avoid re-downloads.
         cache = Path.home() / ".cache/huggingface"
         command += ["--device", "/dev/kfd", "--device", "/dev/dri",
-                    "--group-add", "keep-groups", "--security-opt", "seccomp=unconfined",
+                    "--security-opt", "seccomp=unconfined",
                     "--ipc=host", "-v", f"{cache}:/hf:rw",
                     "-e", "HF_HOME=/hf", "-e", "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"]
+        if not podman_is_remote():
+            command += ["--group-add", "keep-groups"]
         return command + [NEMOTRON_IMAGE] + tail
     raise SystemExit(f"unknown diarizer: {backend}")
 
@@ -548,7 +574,9 @@ def main() -> None:
         print("note: --asr-mode full needs a verbose_json endpoint; gufo's qwen3-asr-1.7b "
               "returns text only. Use --asr-mode segments with it.", file=sys.stderr)
 
-    with tempfile.TemporaryDirectory(prefix="meeting-") as temporary:
+    # Next to the outputs, not /tmp: the diarizer container mounts this path, and
+    # a service running in a container cannot see the host's /tmp.
+    with tempfile.TemporaryDirectory(prefix="meeting-", dir=prefix.parent) as temporary:
         workdir = Path(temporary)
         segments = diarize(args.diarizer, source, workdir, args.speakers, args.threshold,
                            args.diarizer_timeout, args.min_speakers, args.max_speakers)

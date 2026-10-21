@@ -2,7 +2,7 @@
 
 Diarized transcripts of long meetings, on the Strix Halo box.
 
-Two tools and three diarizer images:
+Two tools, a web dashboard and three diarizer images:
 
 - **`meeting-transcribe`** — one audio file in, a speaker-labelled transcript out
   (`PREFIX.md` + `PREFIX.json`).
@@ -11,6 +11,9 @@ Two tools and three diarizer images:
   `meeting_result`.
 - **`meeting-eval`** — score a transcript against a reference before changing the
   pipeline.
+- **`dashboard.html`** — the web UI `meeting-job` serves at `/` (and `/ui`):
+  upload, live job list, transcript in a dialog. Built from `dashboard/`, one
+  self-contained file, no CDN at runtime.
 
 ## How it works
 
@@ -83,7 +86,13 @@ podman build -t localhost/halogen-diarizer diarizer/            # only for --dia
 
 ## Service: REST + MCP
 
+The service and the dashboard run in one container. The diarizer containers are
+*not* nested: the service starts them through the host's podman socket, so they
+still get `/dev/kfd`, the diarizer images and the HF cache already on the host.
+
 ```sh
+podman build -t localhost/meeting-job .     # Containerfile in this repo
+systemctl --user enable --now podman.socket
 install -m 644 systemd/meeting-job.service ~/.config/systemd/user/
 install -d -m 700 ~/.config/meeting-stack
 printf 'MEETING_TOKEN=%s\n' "$(openssl rand -hex 24)" > ~/.config/meeting-stack/meeting-job.env
@@ -115,6 +124,21 @@ other GPU workload on the box that respects the same path will not overlap with
 a transcription. The path is the contract, not this code: `lockfile.py` is a 50
 line `flock` wrapper, and image generation on the same box keeps an identical
 copy.
+
+## Dashboard
+
+`GET /` serves `dashboard.html`. It is a React + Tailwind + shadcn/ui app, but
+the repo ships only the built file — `meeting-job` has no static-asset route:
+
+```sh
+cd dashboard && npm install      # once
+npm run build                    # -> ../dashboard.html (one inlined file)
+```
+
+Source lives in `dashboard/src`; the components in `dashboard/src/components/ui`
+are the unmodified shadcn registry files (new-york, neutral theme). The bearer
+token goes in the field at the bottom of the upload card and stays in
+`localStorage`.
 
 ## Flags worth knowing
 
