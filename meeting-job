@@ -59,7 +59,13 @@ OPTION_FLAGS = (("speakers", "--speakers"), ("min_speakers", "--min-speakers"),
                 ("names", "--names"), ("merge_gap", "--merge-gap"),
                 ("max_segment", "--max-segment"), ("max_tokens", "--max-tokens"),
                 ("diarizer", "--diarizer"), ("model", "--model"),
-                ("asr_mode", "--asr-mode"))
+                ("asr_mode", "--asr-mode"), ("second_name", "--second-name"),
+                ("second_offset", "--second-offset"))
+# Booleans: the flag is passed alone, so any truthy value turns it on.
+SWITCH_FLAGS = (("diarize_second", "--diarize-second"),)
+# Query parameters this server consumes itself and never forwards to the worker.
+CONSUMED_OPTIONS = ("pair", "track")
+PAIR_NAME = re.compile(r"^(?P<key>.+?)-(system|mic)(-16k)?\.[a-z0-9]{1,5}$", re.IGNORECASE)
 # meeting-transcribe wants ints for these; every other flag takes a float or a string.
 INT_OPTIONS = ("speakers", "min_speakers", "max_speakers", "max_tokens")
 
@@ -92,15 +98,36 @@ def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     return first, min(last, size - 1)
 
 
+def track_and_pair(filename: str | None, options: dict) -> tuple[str, str | None]:
+    """Which track this upload is, and which recording it belongs to.
+
+    zoom-audio-capture uploads one file per track, named
+    `zoom-YYYYMMDD-HHMMSS-{system,mic}-16k.mp3`, so the recording key and the
+    track come out of the name: the two files become one job even though the
+    recorder knows nothing about pairing. `track=` and `pair=` override that,
+    which is what a browser upload uses.
+    """
+    track = str(options.get("track") or "").lower()
+    match = PAIR_NAME.match(Path(filename or "").name)
+    pair = options.get("pair")
+    if match:
+        pair = pair or match.group("key")
+        track = track or match.group(2).lower()
+    return ("second" if track in ("second", "mic") else "main"), (
+        str(pair) if pair else None)
+
+
 def safe_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if SUFFIX.fullmatch(suffix) else ".bin"
 
 
 class Job:
-    def __init__(self, identity: str, audio: Path, options: dict) -> None:
+    def __init__(self, identity: str, options: dict) -> None:
         self.id = identity
-        self.audio = audio
+        # One recording, one or two files: "main" is diarized and transcribed,
+        # "second" is the microphone side, labelled as a single speaker.
+        self.tracks: dict[str, Path] = {}
         self.options = options
         self.status = "queued"
         self.error: str | None = None
@@ -111,14 +138,26 @@ class Job:
         self.started: float | None = None
         self.finished: float | None = None
 
+    @property
+    def audio(self) -> Path | None:
+        """The track to diarize: the system one when both arrived, else what there is."""
+        return self.tracks.get("main") or next(iter(self.tracks.values()), None)
+
+    @property
+    def second(self) -> Path | None:
+        """The microphone side, only when a system track is there to pair it with."""
+        return self.tracks.get("second") if "main" in self.tracks else None
+
     def snapshot(self) -> dict:
+        audio = self.audio
         return {"id": self.id, "status": self.status, "error": self.error,
                 "options": self.options, "created": self.created,
                 "started": self.started, "finished": self.finished,
                 "progress": self.progress,
                 "json": self.json, "markdown": self.markdown,
+                "tracks": sorted(self.tracks),
                 # False once the audio is gone (deleted after a job, or --keep-audio off)
-                "audio": self.audio.is_file()}
+                "audio": bool(audio and audio.is_file())}
 
 
 class Jobs:
@@ -129,7 +168,7 @@ class Jobs:
                  parallel: int = 4, diarizer: str = "nemotron",
                  model: str = "Whisper-Large-v3-Turbo", asr_mode: str = "full",
                  lock_path: Path = Path("/run/user/1000/halogen-gpu.lock"),
-                 lock_wait: float = 600) -> None:
+                 lock_wait: float = 600, pair_wait: float = 900) -> None:
         self.meeting = Path(meeting).resolve()
         self.asr = asr
         self.parallel = parallel
@@ -138,6 +177,7 @@ class Jobs:
         self.asr_mode = asr_mode
         self.lock = Lock(lock_path)
         self.lock_wait = lock_wait
+        self.pair_wait = pair_wait
         self.inbox = root / "inbox"
         self.out = root / "out"
         self.keep_audio = keep_audio
@@ -150,19 +190,56 @@ class Jobs:
         self._current_lock = threading.Lock()
         self._queue: queue.Queue[Job] = queue.Queue()
         threading.Thread(target=self._work, daemon=True).start()
+        threading.Thread(target=self._pair_watch, daemon=True).start()
 
     def submit(self, audio: bytes, options: dict, filename: str | None = None) -> dict:
-        identity = job_id(audio)
+        track, pair = track_and_pair(filename, options)
+        options = {key: value for key, value in options.items()
+                   if key not in CONSUMED_OPTIONS}
+        # A pair is one recording identified by its name, so both tracks land on
+        # the same job however they are ordered; a lone upload stays content-addressed.
+        identity = job_id(f"pair:{pair}".encode()) if pair else job_id(audio)
         with self._lock:
-            existing = self._jobs.get(identity)
-            if existing is not None and existing.status != "error":
-                return existing.snapshot()
-            path = self.inbox / (identity + safe_suffix(filename))
+            job = self._jobs.get(identity)
+            if job is None:
+                job = Job(identity, options)
+                self._jobs[identity] = job
+            elif track in job.tracks and job.status != "error":
+                return job.snapshot()  # the same file again: nothing to do
+            elif job.status == "running":
+                return job.snapshot()  # too late: this run already started
+            elif job.status == "done" and not all(path.is_file() for path in job.tracks.values()):
+                # The first run already finished and its audio is gone: a late
+                # track cannot redo it, so the good result stays.
+                return job.snapshot()
+            path = self.inbox / (identity + (f"-{track}" if pair else "")
+                                 + safe_suffix(filename))
             path.write_bytes(audio)
-            job = Job(identity, path, options)
-            self._jobs[identity] = job
-            self._queue.put(job)
+            job.tracks[track] = path
+            job.options = options or job.options
+            self._schedule(job, pair)
             return job.snapshot()
+
+    def _schedule(self, job: Job, pair: str | None) -> None:
+        """Queue the job, or park it until the other track of its recording arrives."""
+        if pair and "main" not in job.tracks:
+            job.status = "waiting"  # only the microphone side is here yet
+            return
+        if pair and "second" not in job.tracks and job.started is None:
+            job.status = "waiting"  # the microphone side may still be uploading
+            return
+        job.status = "queued"
+        self._queue.put(job)
+
+    def _pair_watch(self) -> None:
+        """Run a job whose other track never came: one track still beats no transcript."""
+        while True:
+            time.sleep(5)
+            with self._lock:
+                for job in self._jobs.values():
+                    if job.status == "waiting" and time.time() - job.created >= self.pair_wait:
+                        job.status = "queued"
+                        self._queue.put(job)
 
     def get(self, identity: str | None) -> dict | None:
         with self._lock:
@@ -173,7 +250,8 @@ class Jobs:
         """The uploaded audio, if the job exists and the file was kept."""
         with self._lock:
             job = self._jobs.get(identity or "")
-            return job.audio if job is not None and job.audio.is_file() else None
+            audio = job.audio if job is not None else None
+            return audio if audio is not None and audio.is_file() else None
 
     def list(self) -> list[dict]:
         with self._lock:
@@ -198,14 +276,26 @@ class Jobs:
             job.finished = time.time()
             return
         prefix = self.out / job.id
-        command = [str(self.meeting), str(job.audio), "--output", str(prefix),
+        audio = job.audio
+        if audio is None:
+            job.status = "error"
+            job.error = "no audio for this job"
+            job.finished = time.time()
+            self.lock.release()
+            return
+        command = [str(self.meeting), str(audio), "--output", str(prefix),
                    "--asr", self.asr, "--parallel", str(self.parallel),
                    "--diarizer", self.diarizer, "--model", self.model,
                    "--asr-mode", self.asr_mode]
+        if job.second is not None:
+            command += ["--second", str(job.second)]
         # A per-job option appended below wins: argparse keeps the last value.
         for key, flag in OPTION_FLAGS:
             if job.options.get(key) is not None:
                 command += [flag, str(job.options[key])]
+        for key, flag in SWITCH_FLAGS:
+            if job.options.get(key):
+                command.append(flag)
         try:
             process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                        text=True, start_new_session=True)
@@ -254,10 +344,11 @@ class Jobs:
             # Keep the audio of a failed job so it can be resubmitted (same bytes
             # mean the same id, and submit() requeues an errored job).
             if not self.keep_audio and job.status == "done":
-                try:
-                    job.audio.unlink()
-                except OSError:
-                    pass
+                for track in job.tracks.values():
+                    try:
+                        track.unlink()
+                    except OSError:
+                        pass
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> None:
@@ -524,7 +615,8 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _summary(job: dict) -> dict:
         return {key: job[key] for key in ("id", "status", "error", "created",
-                                          "started", "finished", "options", "progress")}
+                                          "started", "finished", "options", "progress",
+                                          "tracks")}
 
 
 class Server(ThreadingHTTPServer):
@@ -567,13 +659,16 @@ def main() -> None:
                         help="largest audio upload in bytes (default 512 MiB)")
     parser.add_argument("--job-timeout", type=float, default=14400,
                         help="seconds one transcription may take (default 14400)")
+    parser.add_argument("--pair-wait", type=float, default=900,
+                        help="seconds to wait for the second track of a two-track recording "
+                             "before transcribing the one that arrived (default 900)")
     parser.add_argument("--keep-audio", action="store_true",
                         help="keep the uploaded audio instead of deleting it after the job")
     args = parser.parse_args()
 
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
                 args.asr, args.parallel, args.diarizer, args.model, args.asr_mode,
-                args.lock, args.lock_wait)
+                args.lock, args.lock_wait, pair_wait=args.pair_wait)
     server = Server((args.host, args.port), jobs, args.token, args.max_upload)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)

@@ -551,6 +551,90 @@ def render_markdown(source: str, turns: list[dict]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def second_track_turns(turns: list[dict], after: int, name: str,
+                       diarized: bool = False) -> list[dict]:
+    """Label the second track so its speaker ids cannot collide with the first's.
+
+    A microphone track carries one speaker by construction -- the room the
+    recorder sits in -- so it needs no clustering at all: every turn gets the id
+    after the last remote speaker and the second track's name. With
+    --diarize-second the track is clustered as usual and the ids are shifted,
+    which keeps 1..N for remote participants and N+1.. for the room.
+    """
+    if diarized:
+        turns = [dict(turn, speaker=turn["speaker"] + after)
+                 for turn in number_speakers(turns)]
+    else:
+        turns = [dict(turn, speaker=after + 1) for turn in turns]
+    return [dict(turn, name=name) for turn in turns]
+
+
+def merge_tracks(first: list[dict], second: list[dict], offset: float = 0.0) -> list[dict]:
+    """Put both tracks on one timeline, the second shifted by `offset` seconds.
+
+    Overlapping turns are kept as they are: two people talking at once are two
+    lines here, not one garbled one, because the channels already separate them.
+    """
+    shifted = [dict(turn, start=round(turn["start"] + offset, 3),
+                    end=round(turn["end"] + offset, 3)) for turn in second]
+    return sorted(first + shifted, key=lambda turn: (turn["start"], turn["end"]))
+
+
+def track_turns(args, url: str, source: Path, workdir: Path, hotwords: str,
+                diarize_it: bool = True) -> list[dict]:
+    """Diarize (unless told not to) and transcribe one track; turns carry text.
+
+    `workdir` belongs to this track alone: the diarizer container writes the
+    normalized WAV there and the ASR reads it back, so two tracks sharing one
+    directory would transcribe the same audio twice.
+
+    A track that is not diarized is transcribed in one pass whatever --asr-mode
+    says: there are no speaker turns to cut, and cutting would be inventing them.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    if diarize_it:
+        segments = diarize(args.diarizer, source, workdir, args.speakers, args.threshold,
+                           args.diarizer_timeout, args.min_speakers, args.max_speakers)
+        if not segments:
+            raise SystemExit("diarizer found no speech")
+        print(f"diarizer: {len(segments)} segments", file=sys.stderr)
+        audio = workdir / "audio.wav"
+    else:
+        segments = []
+        audio = source  # already a compact upload copy; nothing to normalize for the ASR
+
+    if args.asr_mode == "full" or not diarize_it:
+        # One request for the whole file: the diarizer only labels the ASR
+        # segments. Nothing is cut, so nothing can be truncated.
+        asr_segments = collapse_repetitions(transcribe_full(
+            url, audio, args.model, args.language, hotwords, args.asr_timeout))
+        if not asr_segments:
+            raise SystemExit("ASR returned no segments")
+        print(f"asr: {len(asr_segments)} segments in one pass", file=sys.stderr)
+        return build_turns_labeled(fuse_segments(asr_segments, segments), args.merge_gap)
+
+    turns = pad_turns(number_speakers(build_turns(segments, args.merge_gap)), TURN_PAD_S)
+    chunks = [chunk for index, turn in enumerate(turns)
+              for chunk in split_turn(turn, index, args.max_segment)]
+    print(f"transcribing {len(chunks)} clips for {len(turns)} turns", file=sys.stderr)
+
+    def work(chunk: dict) -> str:
+        if chunk["end"] - chunk["start"] < MIN_CLIP_S:
+            return ""
+        clip = slice_wav(audio, chunk["start"], chunk["end"])
+        return transcribe(url, clip, args.model, args.language, hotwords,
+                          args.asr_timeout, max_tokens=args.max_tokens)
+
+    def progress(done: int, chunk: dict, text: str) -> None:
+        print(f"  [{done}/{len(chunks)}] {timestamp(chunk['start'])} "
+              f"speaker {chunk['speaker']}: {text[:60]}", file=sys.stderr)
+
+    results = run_parallel(chunks, work, args.parallel, progress)
+    texts = ordered_texts(chunks, results)
+    return [dict(turn, text=" ".join(texts.get(index, [])).strip())
+            for index, turn in enumerate(turns)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Diarized transcript via an OpenAI-compatible ASR + a diarizer container.")
@@ -581,6 +665,18 @@ def main() -> None:
     parser.add_argument("--names", default=None,
                         help='name the speakers, e.g. "1:Anna,2:Bernd"; the names also go '
                              "into the ASR hotwords")
+    parser.add_argument("--second", type=Path, default=None,
+                        help="second track of the same recording (the microphone side). It is "
+                             "labelled as one speaker, with --second-name; --diarize-second "
+                             "diarizes it instead, and --second-offset shifts it in time")
+    parser.add_argument("--second-name", default="Me",
+                        help="name of the second track's speaker (default Me)")
+    parser.add_argument("--diarize-second", action="store_true",
+                        help="diarize the second track too, for several people in one room "
+                             "(default: one speaker, which is what a microphone track is)")
+    parser.add_argument("--second-offset", type=float, default=0.0,
+                        help="seconds to add to the second track's timestamps when its file "
+                             "starts later than the first (default 0)")
     parser.add_argument("--merge-gap", type=float, default=2.0,
                         help="merge same-speaker segments up to this gap in seconds (default 2.0)")
     parser.add_argument("--max-segment", type=float, default=MAX_SEGMENT_S,
@@ -600,6 +696,9 @@ def main() -> None:
     source = args.input.resolve()
     if not source.is_file():
         raise SystemExit(f"No such audio file: {source}")
+    second_source = args.second.resolve() if args.second else None
+    if second_source is not None and not second_source.is_file():
+        raise SystemExit(f"No such audio file: {second_source}")
     if args.diarizer != "pyannote-rocm" and (args.min_speakers > 0 or args.max_speakers > 0):
         raise SystemExit("--min-speakers/--max-speakers need --diarizer pyannote-rocm")
     if args.diarizer != "sherpa" and args.threshold != 0.5:
@@ -616,56 +715,29 @@ def main() -> None:
     # a service running in a container cannot see the host's /tmp.
     with tempfile.TemporaryDirectory(prefix="meeting-", dir=prefix.parent) as temporary:
         workdir = Path(temporary)
-        segments = diarize(args.diarizer, source, workdir, args.speakers, args.threshold,
-                           args.diarizer_timeout, args.min_speakers, args.max_speakers)
-        if not segments:
-            raise SystemExit("diarizer found no speech")
-        print(f"diarizer: {len(segments)} segments", file=sys.stderr)
-
-        audio = workdir / "audio.wav"
-        if args.asr_mode == "full":
-            # One request for the whole normalized file: the diarizer only labels
-            # the ASR segments. Nothing is cut, so nothing can be truncated.
-            asr_segments = collapse_repetitions(transcribe_full(
-                url, audio, args.model, args.language, hotwords, args.asr_timeout))
-            if not asr_segments:
-                raise SystemExit("ASR returned no segments")
-            print(f"asr: {len(asr_segments)} segments in one pass", file=sys.stderr)
-            labelled = number_speakers(build_turns_labeled(
-                fuse_segments(asr_segments, segments), args.merge_gap))
-            print(f"fused into {len(labelled)} turns", file=sys.stderr)
-        else:
-            turns = pad_turns(number_speakers(build_turns(segments, args.merge_gap)), TURN_PAD_S)
-            chunks = [chunk for index, turn in enumerate(turns)
-                      for chunk in split_turn(turn, index, args.max_segment)]
-            print(f"transcribing {len(chunks)} clips for {len(turns)} turns", file=sys.stderr)
-
-            def work(chunk: dict) -> str:
-                if chunk["end"] - chunk["start"] < MIN_CLIP_S:
-                    return ""
-                clip = slice_wav(audio, chunk["start"], chunk["end"])
-                return transcribe(url, clip, args.model, args.language, hotwords,
-                                  args.asr_timeout, max_tokens=args.max_tokens)
-
-            def progress(done: int, chunk: dict, text: str) -> None:
-                print(f"  [{done}/{len(chunks)}] {timestamp(chunk['start'])} "
-                      f"speaker {chunk['speaker']}: {text[:60]}", file=sys.stderr)
-
-            results = run_parallel(chunks, work, args.parallel, progress)
-            texts = ordered_texts(chunks, results)
-            labelled = [dict(turn, text=" ".join(texts.get(index, [])).strip())
-                        for index, turn in enumerate(turns)]
+        labelled = number_speakers(track_turns(args, url, source, workdir / "main", hotwords))
+        if second_source is not None:
+            second = track_turns(args, url, second_source, workdir / "second", hotwords,
+                                 diarize_it=args.diarize_second)
+            second = second_track_turns(second, max((t["speaker"] for t in labelled), default=0),
+                                        args.second_name, args.diarize_second)
+            labelled = merge_tracks(labelled, second, args.second_offset)
+            print(f"second track: {len(second)} turns ({args.second_name}) added", file=sys.stderr)
+        print(f"{len(labelled)} turns in total", file=sys.stderr)
 
     result = []
     for turn in labelled:
         if not turn["text"]:
             continue
         entry = dict(turn)
-        if names.get(turn["speaker"]):
-            entry["name"] = names[turn["speaker"]]
+        name = names.get(turn["speaker"]) or turn.get("name")
+        if name:
+            entry["name"] = name
         result.append(entry)
     document = {"source": str(source), "model": args.model, "language": args.language,
                 "turns": result}
+    if second_source is not None:
+        document["second"] = str(second_source)
     Path(f"{prefix}.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
                                       encoding="utf-8")
     Path(f"{prefix}.md").write_text(render_markdown(str(source), result), encoding="utf-8")

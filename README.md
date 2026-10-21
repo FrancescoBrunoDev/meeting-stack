@@ -127,6 +127,40 @@ cannot send headers, and only that route accepts it there. The recording is kept
 when the service runs with `--keep-audio` (the systemd unit does) — the files
 pile up in `inbox/` and nothing prunes them, so delete old ones yourself.
 
+### Two tracks, one transcript
+
+`zoom-audio-capture` records a call as two files, the system output (everybody
+else) and the microphone (you). POST them both and they become **one job**:
+
+```sh
+curl --data-binary @zoom-20261020-205058-system-16k.mp3 \
+     "http://box:8099/jobs?filename=zoom-20261020-205058-system-16k.mp3" -H "Authorization: Bearer $TOKEN"
+curl --data-binary @zoom-20261020-205058-mic-16k.mp3 \
+     "http://box:8099/jobs?filename=zoom-20261020-205058-mic-16k.mp3" -H "Authorization: Bearer $TOKEN"
+# -> the same job id, twice
+```
+
+The recording key and the track come out of the file name
+(`zoom-<stamp>-{system,mic}-16k.mp3`), so the recorder needs to know nothing
+about pairing; `?pair=<key>&track=main|second` does the same explicitly, which
+is what the dashboard sends. A job with one track stays `waiting` for the other
+until `--pair-wait` seconds pass (default 900), then runs with what arrived.
+
+The two tracks are worth keeping apart. The system track is diarized as usual
+(`Speaker 1…N` are the remote participants); the microphone track is *one*
+speaker by construction — the room the recorder sits in — so it is not
+diarized at all, only transcribed, and labelled `Me` (`--second-name`,
+`--diarize-second` for several people in one room). The two timelines are then
+interleaved, and crosstalk stays two lines instead of one garbled one, because
+the channels already separated it. `--second-offset` shifts the microphone
+track if its file starts later than the system one.
+
+Running the worker by hand means the same thing:
+
+```sh
+./meeting-transcribe system.mp3 --second mic.mp3 --output out/meeting
+```
+
 MCP (`POST /mcp`, stateless JSON-RPC 2.0 — `initialize`, `tools/list`,
 `tools/call`, `ping`):
 
@@ -166,6 +200,10 @@ view, and clicking any line seeks to its timestamp.
   `--asr-mode segments` is the older per-clip path, kept for ASR endpoints that
   return text without timestamps.
 - `--merge-gap 2.0` — merge same-speaker ASR segments across gaps this long.
+- `--second FILE` — the microphone track of a two-track recording; see above.
+  `--second-name` (default `Me`), `--diarize-second`, `--second-offset`.
+- `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the
+  other track before running anyway.
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
 The legacy gufo path (`--asr http://127.0.0.1:8097 --model qwen3-asr-1.7b

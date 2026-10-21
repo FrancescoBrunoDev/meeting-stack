@@ -51,13 +51,14 @@ import { cn } from "@/lib/utils"
 
 type JobSummary = {
   id: string
-  status: "queued" | "running" | "done" | "error"
+  status: "waiting" | "queued" | "running" | "done" | "error"
   error: string | null
   created: number
   started: number | null
   finished: number | null
   options: Record<string, string | number>
   progress: string | null
+  tracks?: string[]
 }
 
 type Turn = { speaker: number; start: number; end: number; text: string; name?: string }
@@ -161,6 +162,13 @@ function StatusBadge({ status }: { status: JobSummary["status"] }) {
         error
       </Badge>
     )
+  if (status === "waiting")
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        <span className="size-1.5 rounded-full bg-current" />
+        waiting for track 2
+      </Badge>
+    )
   if (status === "running")
     return (
       <Badge variant="outline">
@@ -240,24 +248,39 @@ export default function App() {
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
-    const file = form.get("file") as File | null
-    if (!file?.size) return
-    const query = new URLSearchParams({ filename: file.name })
+    const files = (form.getAll("file") as File[]).filter((file) => file.size > 0)
+    if (!files.length) return
     const speakers = String(form.get("speakers") ?? "")
     const language = String(form.get("language") ?? "auto")
-    if (speakers) query.set("speakers", speakers)
-    if (language !== "auto") query.set("language", language)
+    // Two files are the two tracks of one call: same pair key, so the server
+    // queues a single job instead of two unrelated transcripts.
+    const pair = files.length > 1 ? `ui-${Date.now()}` : null
+    const total = files.reduce((sum, file) => sum + file.size, 0)
 
     setUploading(true)
     setUploadError(null)
-    setSent({ name: file.name, fraction: 0 })
+    let done = 0
+    let job: JobSummary | null = null
     try {
-      const job = await upload(`/jobs?${query}`, file, token, (fraction) =>
-        setSent({ name: file.name, fraction })
-      )
+      for (const file of files) {
+        const query = new URLSearchParams({ filename: file.name })
+        if (speakers) query.set("speakers", speakers)
+        if (language !== "auto") query.set("language", language)
+        if (pair) {
+          query.set("pair", pair)
+          // The recorder names its tracks; anything else is system first.
+          query.set("track", /-mic\b/i.test(file.name) ? "second" : "main")
+        }
+        const sentFile = done
+        job = await upload(`/jobs?${query}`, file, token, (fraction) =>
+          setSent({ name: file.name, fraction: (sentFile + fraction * file.size) / total })
+        )
+        done += file.size
+        setSent({ name: file.name, fraction: done / total })
+      }
       if (fileInput.current) fileInput.current.value = ""
       await refresh()
-      await openJob(job.id)
+      if (job) await openJob(job.id)
     } catch (error) {
       setUploadError((error as Error).message)
     } finally {
@@ -282,7 +305,9 @@ export default function App() {
         <CardHeader>
           <CardTitle>New transcription</CardTitle>
           <CardDescription>
-            The file is queued and transcribed in the background.
+            One recording, or both tracks of a call: the system track and the
+            microphone one become a single transcript, the microphone side
+            labelled as one speaker.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -295,6 +320,7 @@ export default function App() {
                   name="file"
                   type="file"
                   accept="audio/*,video/*"
+                  multiple
                   required
                   ref={fileInput}
                 />

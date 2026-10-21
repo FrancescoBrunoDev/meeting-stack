@@ -8,6 +8,7 @@ merging turns, and the defaults that decide which path runs.
 """
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -129,6 +130,81 @@ class Defaults(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TwoTracks(unittest.TestCase):
+    """System track + microphone track: one conversation, two files."""
+
+    def test_the_tracks_are_interleaved_by_time(self):
+        first = [{"speaker": 1, "start": 0.0, "end": 4.0, "text": "hallo"},
+                 {"speaker": 2, "start": 9.0, "end": 12.0, "text": "ja"}]
+        second = [{"speaker": 3, "start": 5.0, "end": 8.0, "text": "guten tag"}]
+        merged = meeting.merge_tracks(first, second)
+        self.assertEqual([t["text"] for t in merged], ["hallo", "guten tag", "ja"])
+
+    def test_an_offset_moves_the_second_track(self):
+        second = [{"speaker": 3, "start": 5.0, "end": 8.0, "text": "guten tag"}]
+        merged = meeting.merge_tracks([], second, offset=2.5)
+        self.assertEqual((merged[0]["start"], merged[0]["end"]), (7.5, 10.5))
+
+    def test_a_microphone_track_is_one_speaker_after_the_remote_ones(self):
+        turns = [{"speaker": 0, "start": 1.0, "end": 2.0, "text": "a"},
+                 {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
+        labelled = meeting.second_track_turns(turns, after=4, name="Me")
+        self.assertEqual([t["speaker"] for t in labelled], [5, 5])
+        self.assertEqual({t["name"] for t in labelled}, {"Me"})
+
+    def test_a_diarized_second_track_numbsers_after_the_first(self):
+        turns = [{"speaker": 0, "start": 1.0, "end": 2.0, "text": "a"},
+                 {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
+        labelled = meeting.second_track_turns(turns, after=3, name="Room", diarized=True)
+        self.assertEqual([t["speaker"] for t in labelled], [4, 5])
+
+
+class TrackPairing(unittest.TestCase):
+    """The recorder uploads one file per track; they must become one job."""
+
+    def test_the_recorders_file_names_pair_themselves(self):
+        self.assertEqual(meeting_job.track_and_pair("zoom-20261020-205058-system-16k.mp3", {}),
+                         ("main", "zoom-20261020-205058"))
+        self.assertEqual(meeting_job.track_and_pair("zoom-20261020-205058-mic-16k.mp3", {}),
+                         ("second", "zoom-20261020-205058"))
+
+    def test_a_plain_upload_is_its_own_job(self):
+        self.assertEqual(meeting_job.track_and_pair("meeting.m4a", {}), ("main", None))
+
+    def test_query_parameters_win_over_the_file_name(self):
+        self.assertEqual(meeting_job.track_and_pair("x.mp3", {"track": "mic", "pair": "abc"}),
+                         ("second", "abc"))
+
+    def setUp(self):
+        # The worker thread may still be writing when the test ends.
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        root = Path(self.dir.name)
+        self.jobs = meeting_job.Jobs(Path("/bin/true"), root, lock_path=root / "lock",
+                                     pair_wait=10000)
+
+    def test_both_tracks_land_on_one_job(self):
+        first = self.jobs.submit(b"system", {}, "zoom-1-system-16k.mp3")
+        self.assertEqual(first["status"], "waiting")
+        self.assertEqual(self.jobs.queued(), 0)
+        second = self.jobs.submit(b"mic", {}, "zoom-1-mic-16k.mp3")
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(second["tracks"], ["main", "second"])
+
+    def test_the_upload_order_does_not_matter(self):
+        first = self.jobs.submit(b"mic", {}, "zoom-2-mic-16k.mp3")
+        self.assertEqual(first["status"], "waiting")
+        second = self.jobs.submit(b"system", {}, "zoom-2-system-16k.mp3")
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(second["tracks"], ["main", "second"])
+
+    def test_the_same_track_twice_is_one_job(self):
+        first = self.jobs.submit(b"system", {}, "zoom-3-system-16k.mp3")
+        again = self.jobs.submit(b"system", {}, "zoom-3-system-16k.mp3")
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(again["tracks"], ["main"])
 
 
 class RepetitionLoop(unittest.TestCase):

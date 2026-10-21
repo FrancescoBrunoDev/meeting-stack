@@ -76,6 +76,11 @@ bite:
   `no_speech_threshold`. `collapse_repetitions()` in `meeting-transcribe` is the
   only guard; it runs on the `--asr-mode full` path only, and it drops, never
   keeps, a suspected run.
+- Two-tracks: `meeting-job` derives `pair`/`track` from the recorder's file names
+  (`zoom-<stamp>-{system,mic}-16k.mp3`), parks the job in `waiting` until both
+  tracks arrive (`--pair-wait`, default 900 s), then runs the worker once with
+  `--second`. The microphone track is deliberately **not** diarized, so do not
+  "fix" that as a missing diarization step.
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
 - Job state is in memory: restarting the unit empties the job list, the `.md` and
