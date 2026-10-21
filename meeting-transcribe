@@ -419,6 +419,44 @@ def transcribe_full(url: str, audio: Path, model: str, language: str | None,
     raise SystemExit(failure)
 
 
+REPEAT_RUN = 4          # identical ASR segments in a row before it looks like a loop
+REPEAT_SPAN_S = 8.0     # ... covering this much audio
+REPEAT_WORDS = 4        # ... of a sentence at least this long
+
+
+def bare(text: str) -> str:
+    """A comparison key: case and punctuation do not make two lines different."""
+    return re.sub(r"[^\wäöüß ]", " ", text.lower()).strip()
+
+
+def collapse_repetitions(segments: list[dict]) -> list[dict]:
+    """Drop Whisper's repetition loop.
+
+    On audio it cannot decode (music, crosstalk, a phone held to a speaker)
+    Whisper latches onto one sentence and emits it again every second for
+    minutes, with confident logprobs, so no server-side threshold catches it --
+    the endpoint ignores `condition_on_previous_text`, `vad_filter` and
+    `no_speech_threshold`. What gives the loop away is that a speaker cannot
+    repeat the same five-word sentence four times in eight seconds, while
+    repeating "ja" or "tschüss" that fast is normal. Only runs that clear all
+    three bars are dropped; everything else is left exactly as the ASR said it.
+    """
+    kept: list[dict] = []
+    index = 0
+    while index < len(segments):
+        end = index
+        key = bare(segments[index]["text"])
+        while end + 1 < len(segments) and bare(segments[end + 1]["text"]) == key:
+            end += 1
+        covered = segments[end]["end"] - segments[index]["start"]
+        looping = (end - index + 1 >= REPEAT_RUN and covered >= REPEAT_SPAN_S
+                   and len(key.split()) >= REPEAT_WORDS)
+        if not looping:
+            kept.extend(segments[index:end + 1])
+        index = end + 1
+    return kept
+
+
 def fuse_segments(asr_segments: list[dict], diar_segments: list[dict]) -> list[dict]:
     """Give every ASR segment the speaker with the largest overlap with it.
 
@@ -588,8 +626,8 @@ def main() -> None:
         if args.asr_mode == "full":
             # One request for the whole normalized file: the diarizer only labels
             # the ASR segments. Nothing is cut, so nothing can be truncated.
-            asr_segments = transcribe_full(url, audio, args.model, args.language,
-                                           hotwords, args.asr_timeout)
+            asr_segments = collapse_repetitions(transcribe_full(
+                url, audio, args.model, args.language, hotwords, args.asr_timeout))
             if not asr_segments:
                 raise SystemExit("ASR returned no segments")
             print(f"asr: {len(asr_segments)} segments in one pass", file=sys.stderr)

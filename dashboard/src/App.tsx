@@ -60,7 +60,14 @@ type JobSummary = {
   progress: string | null
 }
 
-type Job = JobSummary & { json: unknown; markdown: string | null }
+type Turn = { speaker: number; start: number; end: number; text: string; name?: string }
+type Transcript = { source: string; model: string; language: string; turns: Turn[] }
+
+type Job = JobSummary & {
+  json: Transcript | null
+  markdown: string | null
+  audio: boolean
+}
 
 const LANGUAGES = ["auto", "it", "de", "en", "fr", "es"]
 
@@ -116,6 +123,14 @@ function clock(seconds: number) {
   const m = Math.floor(total / 60)
   const s = total % 60
   return m ? `${m}m ${s}s` : `${s}s`
+}
+
+function timecode(seconds: number) {
+  const total = Math.max(0, Math.floor(seconds))
+  const hours = Math.floor(total / 3600)
+  const mm = String(Math.floor((total % 3600) / 60)).padStart(2, "0")
+  const ss = String(total % 60).padStart(2, "0")
+  return hours ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`
 }
 
 function duration(job: JobSummary, now: number) {
@@ -447,23 +462,89 @@ export default function App() {
         </CardContent>
       </Card>
 
-      <TranscriptDialog job={selected} onClose={closeJob} />
+      <TranscriptDialog job={selected} token={token} onClose={closeJob} />
     </div>
   )
 }
 
-function TranscriptDialog({ job, onClose }: { job: Job | null; onClose: () => void }) {
+function TranscriptDialog({
+  job,
+  token,
+  onClose,
+}: {
+  job: Job | null
+  token: string
+  onClose: () => void
+}) {
   const [copied, setCopied] = useState(false)
-
-  useEffect(() => setCopied(false), [job?.id])
+  const [active, setActive] = useState(-1)
+  const [seekTick, setSeekTick] = useState(0)
+  const [audioFailed, setAudioFailed] = useState(false)
+  const audio = useRef<HTMLAudioElement | null>(null)
+  const activeLine = useRef<HTMLButtonElement | null>(null)
+  const scroller = useRef<HTMLDivElement | null>(null)
+  const seeked = useRef(false)
 
   const markdown = job?.markdown ?? ""
+  const turns = useMemo(() => job?.json?.turns ?? [], [job?.json])
   const downloadUrl = useMemo(
     () => (markdown ? URL.createObjectURL(new Blob([markdown], { type: "text/markdown" })) : ""),
     [markdown]
   )
 
   useEffect(() => () => void (downloadUrl && URL.revokeObjectURL(downloadUrl)), [downloadUrl])
+  useEffect(() => {
+    setCopied(false)
+    setActive(-1)
+    setAudioFailed(false)
+  }, [job?.id])
+
+  const follow = useCallback(() => {
+    const element = audio.current
+    if (!element) return
+    const time = element.currentTime
+    // The turn being spoken, and through a silence the one just spoken: keeping
+    // it lit reads better than blinking on and off between turns.
+    let index = -1
+    for (let i = 0; i < turns.length && time >= turns[i].start; i++) index = i
+    setActive(index)
+  }, [turns])
+
+  // After the render that moves the highlight, so the ref points at the new line.
+  // Playback drags the view along only once the line leaves the upper half --
+  // otherwise it would scroll on every turn -- but a seek always scrolls, even
+  // paused, because the reader asked for that spot. A paused reader who is not
+  // seeking keeps their place.
+  useEffect(() => {
+    const line = activeLine.current
+    const box = scroller.current
+    if (active === -1 || !line || !box) return
+    if (audio.current?.paused && !seeked.current) return
+    seeked.current = false
+    const offset = line.getBoundingClientRect().top - box.getBoundingClientRect().top
+    if (offset < 0 || offset > box.clientHeight * 0.55)
+      box.scrollTo({
+        top: box.scrollTop + offset - box.clientHeight * 0.25,
+        behavior: "smooth",
+      })
+  }, [active, seekTick])
+
+  useEffect(() => {
+    const element = audio.current
+    if (!element) return
+    const onSeek = () => {
+      // A seek is a jump, even while paused: the view must follow it.
+      seeked.current = true
+      follow()
+      setSeekTick((tick) => tick + 1)
+    }
+    element.addEventListener("timeupdate", follow)
+    element.addEventListener("seeked", onSeek)
+    return () => {
+      element.removeEventListener("timeupdate", follow)
+      element.removeEventListener("seeked", onSeek)
+    }
+  }, [follow, job?.id, audioFailed])
 
   async function copy() {
     await copyText(markdown)
@@ -471,26 +552,91 @@ function TranscriptDialog({ job, onClose }: { job: Job | null; onClose: () => vo
     setTimeout(() => setCopied(false), 1500)
   }
 
+  function playFrom(turn: Turn) {
+    const element = audio.current
+    if (!element) return
+    element.currentTime = turn.start
+    void element.play().catch(() => {}) // autoplay may be refused; the seek stands
+  }
+
+  const source = job
+    ? `/jobs/${job.id}/audio${token ? `?token=${encodeURIComponent(token)}` : ""}`
+    : ""
+
   return (
     <Dialog open={job !== null} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="flex max-h-[85vh] flex-col gap-0 p-0 sm:max-w-3xl">
+      <DialogContent className="flex max-h-[88vh] flex-col gap-0 p-0 sm:max-w-3xl">
         <DialogHeader className="space-y-1 border-b p-6 pb-4">
           <DialogTitle className="flex items-center gap-2">
-            {job && job.status === "done" ? `Transcript · ${job.id.slice(0, 8)}` : `Job · ${job?.id.slice(0, 8)}`}
+            {job?.status === "done" ? `Transcript · ${job.id.slice(0, 8)}` : `Job · ${job?.id.slice(0, 8)}`}
             {job && <StatusBadge status={job.status} />}
           </DialogTitle>
           <DialogDescription className="font-mono text-xs">
             {job ? options(job) || "default options" : ""}
+            {turns.length ? ` · ${turns.length} turns` : ""}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-auto p-6">
+        {job?.status === "done" && (
+          <div className="border-b px-6 py-3">
+            {job.audio && !audioFailed ? (
+              <audio
+                key={job.id}
+                ref={audio}
+                controls
+                preload="metadata"
+                className="w-full accent-primary"
+                src={source}
+                onError={() => setAudioFailed(true)}
+              />
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                {audioFailed
+                  ? "The recording could not be loaded."
+                  : "No recording kept for this job — it ran before --keep-audio was on."}
+              </p>
+            )}
+          </div>
+        )}
+
+        <div ref={scroller} className="min-h-0 flex-1 overflow-y-auto">
           {job?.status === "done" ? (
-            <pre className="font-mono text-[13px] leading-relaxed whitespace-pre-wrap">
-              {markdown}
-            </pre>
+            turns.length ? (
+              <ol className="space-y-0.5 p-4">
+                {turns.map((turn, index) => (
+                  <li key={index}>
+                    <button
+                      type="button"
+                      ref={index === active ? activeLine : undefined}
+                      onClick={() => playFrom(turn)}
+                      className={cn(
+                        "block w-full rounded-md px-2 py-1 text-left transition-colors hover:bg-accent/60",
+                        index === active && "bg-primary text-primary-foreground"
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "mr-2 font-mono text-xs tabular-nums",
+                          index === active ? "text-primary-foreground/70" : "text-muted-foreground"
+                        )}
+                      >
+                        {timecode(turn.start)}
+                      </span>
+                      <span className="text-sm font-medium">
+                        {turn.name ?? `Speaker ${turn.speaker}`}
+                      </span>{" "}
+                      <span className="text-sm">{turn.text}</span>
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <pre className="p-6 font-mono text-[13px] leading-relaxed whitespace-pre-wrap">
+                {markdown}
+              </pre>
+            )
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-2 p-6">
               <p className="text-sm text-muted-foreground">
                 {job?.status === "error" ? "The job failed:" : "Still working on it:"}
               </p>

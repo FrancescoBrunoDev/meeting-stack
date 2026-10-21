@@ -70,10 +70,21 @@ bite:
 - A remote podman rejects `--group-add keep-groups`; `podman_is_remote()` in
   `meeting-transcribe` skips the flag in that case. It is only needed on the
   host path, and `/dev/kfd` + `/dev/dri` are 0666 on this box.
+- Whisper loops: on undecodable audio it emits the same sentence every second for
+  minutes (134 s in one real meeting) with *high* logprobs, because Lemonade's
+  endpoint ignores `condition_on_previous_text`, `vad_filter` and
+  `no_speech_threshold`. `collapse_repetitions()` in `meeting-transcribe` is the
+  only guard; it runs on the `--asr-mode full` path only, and it drops, never
+  keeps, a suspected run.
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
 - Job state is in memory: restarting the unit empties the job list, the `.md` and
   `.json` files stay in `~/.cache/mcp-meeting-transcribe/out/`.
+- `--keep-audio` is on in the unit so the dashboard can play a recording; the
+  uploads stay in `~/.cache/mcp-meeting-transcribe/inbox/` forever. `GET
+  /jobs/<id>/audio` serves them with ranges (206) and accepts the bearer token in
+  the query string, because `<audio src>` cannot send headers — only that route
+  checks the query.
 
 ## Gotchas that already cost time
 

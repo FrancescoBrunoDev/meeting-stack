@@ -7,6 +7,7 @@ rebuilding words the server split, fusing ASR segments with speaker labels,
 merging turns, and the defaults that decide which path runs.
 """
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
@@ -21,6 +22,9 @@ def load_module(name: str, path: Path):
 
 
 meeting = load_module("meeting_transcribe", HERE / "meeting-transcribe")
+
+sys.path.insert(0, str(HERE))  # meeting-job imports lockfile from next to itself
+meeting_job = load_module("meeting_job", HERE / "meeting-job")
 
 
 class WordRebuilding(unittest.TestCase):
@@ -125,3 +129,62 @@ class Defaults(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepetitionLoop(unittest.TestCase):
+    """Whisper re-emits one sentence every second on audio it cannot decode."""
+
+    @staticmethod
+    def segment(start, end, text):
+        return {"speaker": 1, "start": start, "end": end, "text": text}
+
+    def test_a_long_run_of_the_same_sentence_is_dropped(self):
+        loop = [self.segment(100 + i, 101 + i, "Ich denke, das ist doch nicht da.")
+                for i in range(20)]
+        others = [self.segment(0, 3, "Guten Morgen."), self.segment(200, 203, "Tschüss.")]
+        kept = meeting.collapse_repetitions(others[:1] + loop + others[1:])
+        self.assertEqual([s["text"] for s in kept], ["Guten Morgen.", "Tschüss."])
+
+    def test_a_short_loop_is_dropped_too(self):
+        loop = [self.segment(50 + i, 51 + i, "Ich habe noch einen Foto") for i in range(9)]
+        self.assertEqual(meeting.collapse_repetitions(loop), [])
+
+    def test_quick_repeats_of_a_short_word_are_kept(self):
+        goodbye = [self.segment(10 + i, 11 + i, "Tschüss.") for i in range(5)]
+        self.assertEqual(len(meeting.collapse_repetitions(goodbye)), 5)
+
+    def test_a_few_repeats_of_a_sentence_are_kept(self):
+        twice = [self.segment(10, 12, "Das ist auch nicht da."),
+                 self.segment(12, 14, "Das ist auch nicht da."),
+                 self.segment(14, 17, "Und dann weiter.")]
+        self.assertEqual(len(meeting.collapse_repetitions(twice)), 3)
+
+    def test_punctuation_and_case_do_not_hide_a_loop(self):
+        loop = [self.segment(2 * i, 2 * i + 1.5, f"ja, das ist ja auch nicht da{i and '.' or '!'}")
+                for i in range(6)]
+        self.assertEqual(meeting.collapse_repetitions(loop), [])
+
+
+class ByteRange(unittest.TestCase):
+    """`GET /jobs/<id>/audio` must answer 206 to a player that seeks."""
+
+    def setUp(self):
+        self.range = meeting_job.byte_range
+
+    def test_no_header_means_whole_file(self):
+        self.assertIsNone(self.range(None, 100))
+        self.assertIsNone(self.range("bytes=0-", 0))
+
+    def test_open_ended_range(self):
+        self.assertEqual(self.range("bytes=10-", 100), (10, 99))
+
+    def test_end_is_clamped_to_the_file(self):
+        self.assertEqual(self.range("bytes=90-500", 100), (90, 99))
+
+    def test_suffix_range_is_the_tail(self):
+        self.assertEqual(self.range("bytes=-20", 100), (80, 99))
+
+    def test_garbage_and_unsatisfiable_fall_back_to_the_whole_file(self):
+        self.assertIsNone(self.range("items=0-1", 100))
+        self.assertIsNone(self.range("bytes=100-", 100))
+        self.assertIsNone(self.range("bytes=a-b", 100))

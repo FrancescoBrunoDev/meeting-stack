@@ -18,7 +18,9 @@
 # The service only starts jobs; each job needs the ASR endpoint up and the
 # diarizer image built. Defaults (2026-10-20): Whisper-Large-v3-Turbo through
 # Lemonade on 8731 (host network), one ASR pass over the whole file (--asr-mode
-# full), and the Nemotron diarizer (diarizer-nemotron/). Switch back with --asr
+# full), and the Nemotron diarizer (diarizer-nemotron/). --keep-audio keeps the
+# upload so the dashboard can play the recording next to the transcript; the
+# files live in ~/.cache/mcp-meeting-transcribe/inbox/ and are never pruned. Switch back with --asr
 # http://127.0.0.1:8097 --model qwen3-asr-1.7b --asr-mode segments and
 # --diarizer pyannote-rocm, which needs the gufo-asr container (8097).
 [Unit]
@@ -41,7 +43,8 @@ ExecStart=/usr/bin/podman run --rm --name meeting-job --network=host \
   localhost/meeting-job:latest \
   --dir %h/.cache/mcp-meeting-transcribe --port 8099 \
   --asr http://127.0.0.1:8731 --model Whisper-Large-v3-Turbo \
-  --diarizer nemotron --asr-mode full
+  --diarizer nemotron --asr-mode full \
+  --keep-audio
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

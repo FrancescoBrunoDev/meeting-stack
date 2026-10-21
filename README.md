@@ -12,7 +12,9 @@ Two tools, a web dashboard and three diarizer images:
 - **`meeting-eval`** — score a transcript against a reference before changing the
   pipeline.
 - **`dashboard.html`** — the web UI `meeting-job` serves at `/` (and `/ui`):
-  upload, live job list, transcript in a dialog. Built from `dashboard/`, one
+  upload with a progress bar, live job list, and the transcript in a dialog next
+  to an audio player — the sentence being spoken is highlighted and followed
+  while it plays, and clicking a line seeks there. Built from `dashboard/`, one
   self-contained file, no CDN at runtime.
 
 ## How it works
@@ -32,6 +34,15 @@ diarizer edge that is half a second off moves a word instead of losing audio.
 That replaced an older path that cut the meeting into 150 s clips for the ASR:
 there a wrong edge cost audio, and an output-token cap dropped tails silently (a
 240 s clip of dense speech lost 170 of 575 words with `status=200`).
+
+One thing the ASR gets wrong on its own: on audio it cannot decode (music,
+crosstalk, a phone held to a speaker) Whisper latches onto one sentence and
+repeats it every second for minutes, with confident scores — a 38-minute meeting
+got 134 s of `Ich denke, das ist doch nicht da.` that way, and the endpoint
+ignores `condition_on_previous_text`, `vad_filter` and `no_speech_threshold`.
+`collapse_repetitions()` therefore drops a run of identical segments once it is
+physically impossible: four or more of them, covering eight seconds or more, of a
+sentence at least four words long. "Ja" and "tschüss" repeated quickly survive.
 
 Measured on a 38:13 German meeting (5.439 words): **1 m 38 s end to end** —
 normalization, one diarization pass, one ASR pass, fusion — 119 turns, 8 speakers,
@@ -107,7 +118,14 @@ route but `/health` then accepts anyone who can reach the port.
 curl --data-binary @meeting.m4a \
      "http://box:8099/jobs?filename=meeting.m4a&language=de" -H "Authorization: Bearer $TOKEN"
 curl -H "Authorization: Bearer $TOKEN" http://box:8099/jobs/<id>          # status + result
+curl -H "Authorization: Bearer $TOKEN" http://box:8099/jobs/<id>/audio    # the recording
 ```
+
+`GET /jobs/<id>/audio` answers byte ranges (206), so a player can seek; the
+dashboard passes the token in the query (`?token=…`) because an `<audio src>`
+cannot send headers, and only that route accepts it there. The recording is kept
+when the service runs with `--keep-audio` (the systemd unit does) — the files
+pile up in `inbox/` and nothing prunes them, so delete old ones yourself.
 
 MCP (`POST /mcp`, stateless JSON-RPC 2.0 — `initialize`, `tools/list`,
 `tools/call`, `ping`):
@@ -138,7 +156,9 @@ npm run build                    # -> ../dashboard.html (one inlined file)
 Source lives in `dashboard/src`; the components in `dashboard/src/components/ui`
 are the unmodified shadcn registry files (new-york, neutral theme). The bearer
 token goes in the field at the bottom of the upload card and stays in
-`localStorage`.
+`localStorage`. Opening a finished job shows the recording in a native player
+above the transcript; the line being spoken is highlighted and scrolled into
+view, and clicking any line seeks to its timestamp.
 
 ## Flags worth knowing
 

@@ -35,6 +35,7 @@ import base64
 import binascii
 import hashlib
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -67,6 +68,30 @@ def job_id(audio: bytes) -> str:
     return hashlib.sha256(audio).hexdigest()[:16]
 
 
+def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """Parse a single `Range: bytes=a-b` against a file of `size` bytes.
+
+    Returns the inclusive span to send, or None for "send the whole file" --
+    which is also what a malformed or unsatisfiable range gets, because every
+    browser copes with a plain 200. `bytes=-500` (a suffix range, used by some
+    players for the last frames) is handled too.
+    """
+    if not header or not header.startswith("bytes=") or size <= 0:
+        return None
+    start, _, end = header[6:].split(",")[0].strip().partition("-")
+    try:
+        if not start:
+            length = int(end)
+            return (max(0, size - length), size - 1) if length > 0 else None
+        first = int(start)
+        last = int(end) if end else size - 1
+    except ValueError:
+        return None
+    if first >= size:
+        return None
+    return first, min(last, size - 1)
+
+
 def safe_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if SUFFIX.fullmatch(suffix) else ".bin"
@@ -91,7 +116,9 @@ class Job:
                 "options": self.options, "created": self.created,
                 "started": self.started, "finished": self.finished,
                 "progress": self.progress,
-                "json": self.json, "markdown": self.markdown}
+                "json": self.json, "markdown": self.markdown,
+                # False once the audio is gone (deleted after a job, or --keep-audio off)
+                "audio": self.audio.is_file()}
 
 
 class Jobs:
@@ -141,6 +168,12 @@ class Jobs:
         with self._lock:
             job = self._jobs.get(identity or "")
             return job.snapshot() if job else None
+
+    def audio_path(self, identity: str | None) -> Path | None:
+        """The uploaded audio, if the job exists and the file was kept."""
+        with self._lock:
+            job = self._jobs.get(identity or "")
+            return job.audio if job is not None and job.audio.is_file() else None
 
     def list(self) -> list[dict]:
         with self._lock:
@@ -346,7 +379,14 @@ class Handler(BaseHTTPRequestHandler):
         token = self.server.token
         if not token:
             return True
-        return self.headers.get("Authorization") == f"Bearer {token}"
+        if self.headers.get("Authorization") == f"Bearer {token}":
+            return True
+        # <audio src> cannot send headers: the playback route takes the token in
+        # the query string instead, and only that route accepts it there.
+        path = urllib.parse.urlparse(self.path)
+        if path.path.startswith("/jobs/") and path.path.endswith("/audio"):
+            return urllib.parse.parse_qs(path.query).get("token", [""])[0] == token
+        return False
 
     def _json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode()
@@ -398,6 +438,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/jobs":
             self._json(200, {"jobs": [self._summary(job) for job in self.server.jobs.list()]})
+        elif path.startswith("/jobs/") and path.endswith("/audio"):
+            self._send_audio(path[len("/jobs/"):-len("/audio")])
         elif path.startswith("/jobs/"):
             job = self.server.jobs.get(path.removeprefix("/jobs/"))
             if job is None:
@@ -408,6 +450,36 @@ class Handler(BaseHTTPRequestHandler):
             self._text(405, "the MCP endpoint accepts POST\n")
         else:
             self._json(404, {"error": "not found"})
+
+    def _send_audio(self, identity: str) -> None:
+        """The uploaded recording, seekable: players ask for byte ranges."""
+        audio = self.server.jobs.audio_path(identity)
+        if audio is None:
+            self._json(404, {"error": "no audio kept for this job"})
+            return
+        size = audio.stat().st_size
+        span = byte_range(self.headers.get("Range"), size)
+        start, end = span or (0, size - 1)
+        self.send_response(206 if span else 200)
+        self.send_header("Content-Type",
+                         mimetypes.guess_type(audio.name)[0] or "application/octet-stream")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if span:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        try:
+            with audio.open("rb") as handle:
+                handle.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = handle.read(min(262144, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the player seeked elsewhere; the response is already abandoned
 
     def do_POST(self) -> None:
         if not self._authorized():
