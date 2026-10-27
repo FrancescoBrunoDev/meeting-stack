@@ -26,8 +26,12 @@ live in the archived `halogen-runner` repo and are out of scope.
 
 ## The machine's moving parts
 
-- ASR: Lemonade `http://127.0.0.1:8731`, OpenAI-compatible, `Whisper-Large-v3-Turbo`,
-  `response_format=verbose_json`. Resident model; do not unload it.
+- ASR: gufo `http://127.0.0.1:8097`, `qwen3-asr-1.7b`, `response_format=json`,
+  `--asr-mode segments`. Resident model (~4.8 GB RSS, ~15.9 GB of the
+  iGPU), do not unload it.
+- ASR, one-pass alternative: Lemonade `http://127.0.0.1:8731`, OpenAI-compatible,
+  `Whisper-Large-v3-Turbo`, `response_format=verbose_json`. Resident model; do not
+  unload it.
 - Diarizers: one `podman run --rm` container per job, GPU via `/dev/kfd` + `/dev/dri`.
 - Service: user unit `meeting-job.service` on port 8099 (`podman-restart` is not
   involved; the unit is plain systemd).
@@ -101,6 +105,19 @@ bite:
 
 ## Gotchas that already cost time
 
+- gufo's `verbose_json` returns an **empty** `segments` array, so `--asr-mode
+  full` dies with "ASR returned no segments". `segments` mode is the only path
+  against gufo. Its WAV loader also rejects recordings over 30 minutes, which
+  the per-turn clips never approach.
+- Send `language=de` from the recorder or the dashboard. With `language=auto`
+  Qwen3-ASR answers short, noisy turns in whatever language it thinks it heard:
+  25 of 226 turns of the 38:13 German meeting came back in Chinese or Dutch.
+  With `--language de` there were 0. A 1 s clip can still come back as a
+  translation of what it guessed (`Let me try.` -> `Lass mich mal.`).
+- Qwen3-ASR sometimes glues two words (`wahrscheinlichSie`). It is a tokenizer
+  artifact of the `json` path, where there is no `words[]` to rebuild from; the
+  `rejoin()`/`unwrap()` machinery only applies to `verbose_json`.
+
 - The whisper server wraps lines at 32 characters and Lemonade turns that wrap
   into a **space**, so words arrive split ("Insel" -> "In sel"). The `text` field
   is unusable; rebuild from `words[]` (a piece without a leading space continues
@@ -113,6 +130,38 @@ bite:
 - The service runs without a token on this box (empty `MEETING_TOKEN`), by
   decision: it listens on `0.0.0.0:8099`, so anyone on the LAN or the tailnet can
   start a job.
+
+## The gufo ASR server
+
+One container, started once, restarted by `podman-restart.service` (enabled):
+
+```sh
+cd ~/Github/gufo
+podman run -d --name gufo-asr --restart=unless-stopped --network host \
+  --device /dev/kfd --device /dev/dri \
+  -v ~/Github/gufo/install:/opt/gufo:ro -v ~/Github/gufo/models:/models:ro \
+  localhost/gufo-ci:hip /opt/gufo/bin/gufo serve asr \
+  --model /models/Qwen3-ASR-1.7B --port 8097
+curl -s localhost:8097/v1/audio/transcriptions -F file=@clip.wav \
+  -F model=qwen3-asr-1.7b -F language=de
+```
+
+Rebuild the image, the binary and the weights (all three live in the gufo
+checkout, `install/` and `models/` are gitignored):
+
+```sh
+podman build -t localhost/gufo-ci:hip -f tools/ci/Containerfile.ci-hip .
+podman run --rm -v "$PWD":/src -w /src localhost/gufo-ci:hip bash -lc \
+  'cmake --preset release && cmake --build --preset release --parallel 16 \
+   && cmake --install build/release --prefix /src/install'
+hf download Qwen/Qwen3-ASR-1.7B \
+  --revision 7278e1e70fe206f11671096ffdd38061171dd6e5 \
+  --local-dir models/Qwen3-ASR-1.7B
+podman restart gufo-asr
+```
+
+The build runs in the container (`/src`), never on the host: there is no ROCm
+HIP toolchain installed here.
 
 ## After changing the service or the unit
 

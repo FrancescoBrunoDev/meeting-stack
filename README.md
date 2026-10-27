@@ -22,42 +22,65 @@ Two tools, a web dashboard and three diarizer images:
 ```
 audio ──> diarizer container ──> audio.wav (16 kHz mono, loudnorm)
                                      │
-                                     ├──> one ASR pass over the whole file (verbose_json, with timestamps)
+                                     ├──> one ASR request per turn (--asr-mode segments)
                                      │
-                                     └──> every ASR segment takes the speaker with the largest overlap
+                                     └──> the turn already carries its speaker
                                                     │
                                                     └──> turns ──> markdown + json
 ```
 
-Nothing is cut. The ASR owns the words and the diarizer only labels them, so a
-diarizer edge that is half a second off moves a word instead of losing audio.
-That replaced an older path that cut the meeting into 150 s clips for the ASR:
-there a wrong edge cost audio, and an output-token cap dropped tails silently (a
-240 s clip of dense speech lost 170 of 575 words with `status=200`).
+The box runs the per-turn path: gufo on `:8097` serving `qwen3-asr-1.7b`, which
+answers `json` with text and nothing else — its `verbose_json` carries an empty
+`segments` array, so the one-pass path cannot use it. Each diarizer turn is cut
+out, padded into the silence beside it (`--turn-pad`-style padding of
+`TURN_PAD_S`), transcribed, and kept with its speaker. Cutting at the diarizer's
+edges costs audio when an edge is wrong, and a per-clip `max_tokens` cap can drop
+a tail silently (a 240 s clip of dense speech lost 170 of 575 words with
+`status=200`) — which is why the one-pass path exists and stays the default of
+the CLI itself.
 
-One thing the ASR gets wrong on its own: on audio it cannot decode (music,
-crosstalk, a phone held to a speaker) Whisper latches onto one sentence and
+The one-pass path (`--asr-mode full`, the CLI default) sends the whole file to
+an endpoint that answers `verbose_json` with real segment timestamps — Lemonade
+on `:8731` with `Whisper-Large-v3-Turbo`. Nothing is cut: the ASR owns the words
+and the diarizer only labels them, so a diarizer edge that is half a second off
+moves a word instead of losing audio.
+
+One thing Whisper gets wrong on its own: on audio it cannot decode (music,
+crosstalk, a phone held to a speaker) it latches onto one sentence and
 repeats it every second for minutes, with confident scores — a 38-minute meeting
 got 134 s of `Ich denke, das ist doch nicht da.` that way, and the endpoint
 ignores `condition_on_previous_text`, `vad_filter` and `no_speech_threshold`.
 `collapse_repetitions()` therefore drops a run of identical segments once it is
 physically impossible: four or more of them, covering eight seconds or more, of a
 sentence at least four words long. "Ja" and "tschüss" repeated quickly survive.
+It runs on the one-pass path only; Qwen3-ASR does not loop.
 
-Measured on a 38:13 German meeting (5.439 words): **1 m 38 s end to end** —
-normalization, one diarization pass, one ASR pass, fusion — 119 turns, 8 speakers,
-transcript covering 0 s to 2290 s of 2293 s.
+Measured on a 38:13 German meeting (5.439 words, `--diarizer nemotron`):
+
+- one-pass Whisper, Lemonade: **1 m 38 s end to end** — normalization, one
+diarization pass, one ASR pass, fusion — 119 turns, 8 speakers, transcript
+covering 0 s to 2290 s of 2293 s.
+- per-turn Qwen3-ASR, gufo with `--language de`: **4 m 02 s**, 229 turns. The
+`--language` flag is not optional here: with `auto`, 25 of 226 turns of that same
+German meeting came back in Chinese and Dutch. There is no hand-corrected
+reference on this box, so the two transcripts only give their disagreement with
+each other: **33.8% of words** (35.4% without `--language de`). That is not an
+accuracy verdict for either model.
 
 ## Requirements
 
-- an OpenAI-compatible ASR that answers `response_format=verbose_json`
-  (default: Lemonade on `http://127.0.0.1:8731` serving `Whisper-Large-v3-Turbo`)
+- an OpenAI-compatible ASR: gufo on `http://127.0.0.1:8097` serving
+  `qwen3-asr-1.7b` for the per-turn path (see [AGENT.md](AGENT.md) for the
+  container), or Lemonade on `http://127.0.0.1:8731` serving
+  `Whisper-Large-v3-Turbo` for `--asr-mode full`
 - rootless **podman** with `/dev/kfd` and `/dev/dri` for the diarizer
 - a built diarizer image (see below)
 
 ## Usage
 
 ```sh
+./meeting-transcribe meeting.m4a --asr http://127.0.0.1:8097 \
+    --model qwen3-asr-1.7b --asr-mode segments --language de
 ./meeting-transcribe meeting.m4a                      # Whisper + Nemotron, one pass
 ./meeting-transcribe meeting.wav --language de --speakers 4
 ./meeting-transcribe meeting.wav --names "1:Anna,2:Bernd"   # names also bias the ASR
@@ -225,10 +248,12 @@ view, and clicking any line seeks to its timestamp.
   other track before running anyway.
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
-The legacy gufo path (`--asr http://127.0.0.1:8097 --model qwen3-asr-1.7b
---diarizer pyannote-rocm --asr-mode segments`) is documented but **not available
-on this box any more**: the gufo container, its image and the Qwen3-ASR weights
-were removed. Recreate them only if you really need that engine.
+The service runs the gufo/Qwen3-ASR path (`--asr http://127.0.0.1:8097 --model
+qwen3-asr-1.7b --diarizer nemotron --asr-mode segments`). The endpoint is a
+`gufo serve asr` container with a 4.4 GB BF16 checkpoint; both the launch command
+and the rebuild steps are in [AGENT.md](AGENT.md). Point the unit back at
+`http://127.0.0.1:8731 --model Whisper-Large-v3-Turbo --asr-mode full` to return
+to the one-pass path.
 
 ## Tests
 

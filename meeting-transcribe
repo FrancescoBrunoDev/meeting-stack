@@ -14,10 +14,15 @@ loaded when the job starts and gone when it ends, on demand without a proxy.
     ./meeting-transcribe meeting.m4a --speakers 4
     ./meeting-transcribe meeting.wav --language it
 
-The gufo path is still one flag away, for a box without a verbose_json endpoint:
+The gufo path — what the service unit runs — is one flag set away, for an
+endpoint that returns text without timestamps:
 
     ./meeting-transcribe meeting.wav --asr http://127.0.0.1:8097 \
-        --model qwen3-asr-1.7b --diarizer pyannote-rocm --asr-mode segments
+        --model qwen3-asr-1.7b --diarizer nemotron --asr-mode segments --language de
+
+`--language` is not optional there: without it Qwen3-ASR answers short turns in
+a guessed language (`auto`), and 25 of 226 turns of a German meeting came back
+in Chinese.
 
 The diarizer images are built once:
 
