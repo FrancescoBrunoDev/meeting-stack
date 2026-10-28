@@ -190,6 +190,9 @@ class Hooks:
                 self._items[pair] = entry
             entry.update({"remote_dir": str(payload.get("remote_dir") or ""),
                           "files": files, "last_seen": now,
+                          # what the recorder was told the call was in; the
+                          # audio itself already arrived with it as a job option
+                          "language": str(payload.get("language") or ""),
                           "count": int(entry.get("count", 0)) + 1})
             self._save()
             return dict(entry), None

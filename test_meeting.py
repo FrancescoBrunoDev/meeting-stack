@@ -139,6 +139,12 @@ class AnnouncedRecordings(unittest.TestCase):
         self.assertEqual(again.get("zoom-20261020-123509")["first_seen"],
                          entry["first_seen"])
 
+    def test_the_announced_language_is_kept(self):
+        entry, _ = self.hooks.announce({"day": "2026-10-20", "recording": "12-35-09",
+                                        "language": "it"})
+        self.assertEqual(entry["language"], "it")
+        self.assertEqual(self.hooks.get("zoom-20261020-123509")["language"], "it")
+
     def test_a_retry_is_the_same_announcement(self):
         body = {"day": "2026-10-20", "recording": "12-35-09", "files": ["audio/a.mp3"]}
         first, _ = self.hooks.announce(body)
