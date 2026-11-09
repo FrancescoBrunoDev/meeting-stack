@@ -594,8 +594,19 @@ def merge_tracks(first: list[dict], second: list[dict], offset: float = 0.0) -> 
     return sorted(first + shifted, key=lambda turn: (turn["start"], turn["end"]))
 
 
+def mic_is_diarized(asr_mode: str, diarize_second: bool) -> bool:
+    """Whether the microphone track needs the diarizer for its turn boundaries.
+
+    A track that is not diarized goes to the ASR in one pass, which needs
+    verbose_json to give the words timestamps. gufo answers text only, so with
+    --asr-mode segments the microphone track is diarized anyway and
+    second_track_turns() then collapses every turn back to one speaker.
+    """
+    return diarize_second or asr_mode != "full"
+
+
 def track_turns(args, url: str, source: Path, workdir: Path, hotwords: str,
-                diarize_it: bool = True) -> list[dict]:
+                diarize_it: bool = True, lenient: bool = False) -> list[dict]:
     """Diarize (unless told not to) and transcribe one track; turns carry text.
 
     `workdir` belongs to this track alone: the diarizer container writes the
@@ -604,12 +615,16 @@ def track_turns(args, url: str, source: Path, workdir: Path, hotwords: str,
 
     A track that is not diarized is transcribed in one pass whatever --asr-mode
     says: there are no speaker turns to cut, and cutting would be inventing them.
+    `lenient` turns a diarizer that found no speech into an empty track instead
+    of failing the job; it is for a microphone track that may be silent.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     if diarize_it:
         segments = diarize(args.diarizer, source, workdir, args.speakers, args.threshold,
                            args.diarizer_timeout, args.min_speakers, args.max_speakers)
         if not segments:
+            if lenient:
+                return []
             raise SystemExit("diarizer found no speech")
         print(f"diarizer: {len(segments)} segments", file=sys.stderr)
         audio = workdir / "audio.wav"
@@ -686,8 +701,9 @@ def main() -> None:
     parser.add_argument("--second-name", default="Me",
                         help="name of the second track's speaker (default Me)")
     parser.add_argument("--diarize-second", action="store_true",
-                        help="diarize the second track too, for several people in one room "
-                             "(default: one speaker, which is what a microphone track is)")
+                        help="label several people in the second track instead of one "
+                             "speaker (default: one speaker, which is what a microphone "
+                             "track is; its turn boundaries still come from the diarizer)")
     parser.add_argument("--second-offset", type=float, default=0.0,
                         help="seconds to add to the second track's timestamps when its file "
                              "starts later than the first (default 0)")
@@ -733,8 +749,13 @@ def main() -> None:
         labelled = number_speakers(track_turns(args, url, source, workdir / "main", hotwords))
         duration = wav_seconds(workdir / "main" / "audio.wav")
         if second_source is not None:
+            # With gufo there is no verbose_json, so the microphone track takes
+            # the per-turn path: the diarizer only supplies the boundaries, and
+            # second_track_turns() keeps it one speaker unless --diarize-second.
+            needs_diarizer = mic_is_diarized(args.asr_mode, args.diarize_second)
             second = track_turns(args, url, second_source, workdir / "second", hotwords,
-                                 diarize_it=args.diarize_second)
+                                 diarize_it=needs_diarizer,
+                                 lenient=needs_diarizer and not args.diarize_second)
             second = second_track_turns(second, max((t["speaker"] for t in labelled), default=0),
                                         args.second_name, args.diarize_second)
             labelled = merge_tracks(labelled, second, args.second_offset)

@@ -83,8 +83,13 @@ bite:
 - Two-tracks: `meeting-job` derives `pair`/`track` from the recorder's file names
   (`zoom-<stamp>-{system,mic}-16k.mp3`), parks the job in `waiting` until both
   tracks arrive (`--pair-wait`, default 900 s), then runs the worker once with
-  `--second`. The microphone track is deliberately **not** diarized, so do not
-  "fix" that as a missing diarization step.
+  `--second`. The microphone track is one speaker by construction, but it is
+  not sent in one pass unless `--asr-mode full` (`mic_is_diarized()`): gufo has
+  no verbose_json, so a whole-track request there returns `segments: []` and
+  the job dies with "ASR returned no segments". With `segments` the diarizer
+  provides only the turn boundaries and `second_track_turns(..., diarized=False)`
+  collapses every turn to `Me`. Do not "fix" that as a missing diarization
+  step; a silent mic track is tolerated (`lenient`), not a failed job.
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
 - Job state is in `jobs.json` under `--dir` (atomic replace, restored at

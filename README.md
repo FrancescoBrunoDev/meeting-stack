@@ -194,12 +194,16 @@ while the job list does not.
 
 The two tracks are worth keeping apart. The system track is diarized as usual
 (`Speaker 1…N` are the remote participants); the microphone track is *one*
-speaker by construction — the room the recorder sits in — so it is not
-diarized at all, only transcribed, and labelled `Me` (`--second-name`,
-`--diarize-second` for several people in one room). The two timelines are then
-interleaved, and crosstalk stays two lines instead of one garbled one, because
-the channels already separated it. `--second-offset` shifts the microphone
-track if its file starts later than the system one.
+speaker by construction — the room the recorder sits in — so it is never
+clustered, only *labelled* `Me` (`--second-name`; `--diarize-second` when
+several people share the room). With `--asr-mode full` it is sent whole in one
+pass and never diarized. With `segments` (gufo, which returns no timestamps)
+the diarizer runs on it too, only to get the turn boundaries — without them
+there is nothing to place on the timeline — and every turn is then collapsed
+back to `Me`. The two timelines are interleaved, and crosstalk stays two lines
+instead of one garbled one, because the channels already separated it.
+`--second-offset` shifts the microphone track if its file starts later than the
+system one.
 
 Running the worker by hand means the same thing:
 

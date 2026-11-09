@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 import wave
 from pathlib import Path
@@ -237,6 +238,27 @@ class TwoTracks(unittest.TestCase):
                  {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
         labelled = meeting.second_track_turns(turns, after=3, name="Room", diarized=True)
         self.assertEqual([t["speaker"] for t in labelled], [4, 5])
+
+    def test_the_mic_track_is_diarized_when_the_asr_has_no_verbose_json(self):
+        # gufo answers text only, so the per-turn path needs the diarizer's edges.
+        self.assertTrue(meeting.mic_is_diarized("segments", False))
+        self.assertFalse(meeting.mic_is_diarized("full", False))
+        self.assertTrue(meeting.mic_is_diarized("full", True))
+
+    def test_a_silent_mic_track_is_not_a_failed_job(self):
+        args = types.SimpleNamespace(
+            diarizer="nemotron", speakers=-1, threshold=0.5, diarizer_timeout=10,
+            min_speakers=-1, max_speakers=-1, asr_mode="segments", model="m",
+            language=None, asr_timeout=10, max_segment=150.0, merge_gap=2.0)
+        original = meeting.diarize
+        meeting.diarize = lambda *a, **k: []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                turns = meeting.track_turns(args, "http://x", Path(directory) / "mic.mp3",
+                                            Path(directory) / "work", "", lenient=True)
+                self.assertEqual(turns, [])
+        finally:
+            meeting.diarize = original
 
 
 class JobSummaryFields(unittest.TestCase):
