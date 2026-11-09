@@ -9,6 +9,7 @@ import {
   Loader2,
   Moon,
   RefreshCw,
+  RotateCcw,
   Sun,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -60,6 +61,7 @@ type JobSummary = {
   progress: string | null
   tracks?: string[]
   duration?: number | null
+  audio?: boolean
 }
 
 type Turn = { speaker: number; start: number; end: number; text: string; name?: string }
@@ -247,6 +249,15 @@ export default function App() {
   function closeJob() {
     setSelectedId(null)
     setSelected(null)
+  }
+
+  async function retry(id: string) {
+    try {
+      await api(`/jobs/${id}/retry`, { method: "POST" })
+      await refresh()
+    } catch (error) {
+      setAuthError((error as Error).message)
+    }
   }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
@@ -473,17 +484,32 @@ export default function App() {
                         </div>
                       </TableCell>
                       <TableCell className="pr-6">
-                        <div
-                          className={cn(
-                            "max-w-56 truncate text-xs",
-                            job.status === "error" ? "text-destructive" : "text-muted-foreground"
+                        <div className="flex items-center justify-between gap-2">
+                          <div
+                            className={cn(
+                              "max-w-56 truncate text-xs",
+                              job.status === "error" ? "text-destructive" : "text-muted-foreground"
+                            )}
+                            title={job.error ?? job.progress ?? undefined}
+                          >
+                            {job.error ??
+                              (job.status === "done"
+                                ? `took ${took(job, now)}`
+                                : job.progress ?? "—")}
+                          </div>
+                          {job.status === "error" && job.audio && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Run this job again on the upload it kept"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                retry(job.id)
+                              }}
+                            >
+                              <RotateCcw />
+                            </Button>
                           )}
-                          title={job.error ?? job.progress ?? undefined}
-                        >
-                          {job.error ??
-                            (job.status === "done"
-                              ? `took ${took(job, now)}`
-                              : job.progress ?? "—")}
                         </div>
                       </TableCell>
                     </TableRow>

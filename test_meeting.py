@@ -240,11 +240,12 @@ class TwoTracks(unittest.TestCase):
 class JobSummaryFields(unittest.TestCase):
     """The list endpoint strips the transcript, so it must keep what the table shows."""
 
-    def test_the_summary_keeps_length_and_tracks(self):
+    def test_the_summary_keeps_length_tracks_and_whether_a_retry_can_run(self):
         job = meeting_job.Job("abc", {})
         summary = meeting_job.Handler._summary(job.snapshot())
         self.assertIn("duration", summary)
         self.assertIn("tracks", summary)
+        self.assertIn("audio", summary)  # the retry button is only offered with audio
         self.assertNotIn("json", summary)
 
 
@@ -292,6 +293,44 @@ class TrackPairing(unittest.TestCase):
         again = self.jobs.submit(b"system", {}, "zoom-3-system-16k.mp3")
         self.assertEqual(again["id"], first["id"])
         self.assertEqual(again["tracks"], ["main"])
+
+
+class Retry(unittest.TestCase):
+    """A failed job keeps its upload, so it can be run again without re-uploading."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        root = Path(self.dir.name)
+        self.jobs = meeting_job.Jobs(Path("/bin/true"), root, lock_path=root / "lock",
+                                     pair_wait=10000)
+        # Not submit(): that queues the job and the worker races the test.
+        audio = root / "inbox" / "meeting.wav"
+        audio.write_bytes(b"audio")
+        self.job = meeting_job.Job("0123456789abcdef", {})
+        self.job.tracks = {"main": audio}
+        self.jobs._jobs[self.job.id] = self.job
+
+    def test_a_failed_job_is_queued_again_without_its_error(self):
+        self.job.status, self.job.error, self.job.finished = "error", "ASR unreachable", 1.0
+        again = self.jobs.retry(self.job.id)
+        self.assertIsNone(again["error"])
+        self.assertIn(again["status"], ("queued", "running", "done"))
+
+    def test_a_running_job_is_left_alone(self):
+        self.job.status = "running"
+        self.assertEqual(self.jobs.retry(self.job.id)["status"], "running")
+
+    def test_a_job_whose_audio_is_gone_is_not_run_again(self):
+        self.job.status, self.job.error = "error", "boom"
+        for path in self.job.tracks.values():
+            path.unlink()
+        again = self.jobs.retry(self.job.id)
+        self.assertEqual(again["status"], "error")
+        self.assertEqual(again["error"], "boom")
+
+    def test_an_unknown_job_is_none(self):
+        self.assertIsNone(self.jobs.retry("nope"))
 
 
 class RepetitionLoop(unittest.TestCase):

@@ -372,6 +372,27 @@ class Jobs:
         with self._lock:
             return [job.snapshot() for job in self._jobs.values()]
 
+    def retry(self, identity: str | None) -> dict | None:
+        """Run a finished job again from the audio still in the inbox.
+
+        Returns the job unchanged when it is not finished (already queued,
+        waiting or running) or when the audio is gone, so a double click on the
+        dashboard's retry button cannot put the same job in the queue twice.
+        """
+        with self._lock:
+            job = self._jobs.get(identity or "")
+            if job is None:
+                return None
+            if job.status not in ("done", "error"):
+                return job.snapshot()
+            if not all(path.is_file() for path in job.tracks.values()):
+                return job.snapshot()
+            job.status, job.error, job.progress = "queued", None, None
+            job.started = job.finished = None
+            job.json = job.markdown = None  # the previous result is not this run's
+            self._queue.put(job)
+            return job.snapshot()
+
     def queued(self) -> int:
         return self._queue.qsize()
 
@@ -734,6 +755,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             view = hook_view(self.server.hooks, self.server.jobs, entry["pair"])[0]
             self._json(200, {"ok": True, **view})
+        elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/retry"):
+            job = self.server.jobs.retry(parsed.path[len("/jobs/"):-len("/retry")])
+            if job is None:
+                self._json(404, {"error": "no such job"})
+            else:
+                self._json(202, self._summary(job))
         elif parsed.path == "/mcp":
             try:
                 message = json.loads(body or b"null")
@@ -755,7 +782,7 @@ class Handler(BaseHTTPRequestHandler):
     def _summary(job: dict) -> dict:
         return {key: job[key] for key in ("id", "status", "error", "created",
                                           "started", "finished", "options", "progress",
-                                          "tracks", "duration")}
+                                          "tracks", "duration", "audio")}
 
 
 class Server(ThreadingHTTPServer):
