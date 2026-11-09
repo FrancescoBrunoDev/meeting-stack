@@ -21,7 +21,8 @@
 # verbose_json has no usable segments), and the Nemotron diarizer
 # (diarizer-nemotron/). --keep-audio keeps the upload so the dashboard can play
 # the recording next to the transcript; the files live in
-# ~/.cache/mcp-meeting-transcribe/inbox/ and are never pruned. Send language=de:
+# ~/.cache/mcp-meeting-transcribe/inbox/ and are pruned after
+# --retain-audio-days (default 30; 0 keeps them). Send language=de:
 # with language=auto Qwen3-ASR answers short turns in a foreign language (25 of
 # 226 turns of a German meeting came back in Chinese). Switch back to the
 # one-pass Whisper path with --asr http://127.0.0.1:8731 --model
@@ -35,7 +36,7 @@ Requires=podman.socket
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/meeting-stack/meeting-job.env
-ExecStart=/usr/bin/podman run --rm --name meeting-job --network=host \
+ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --security-opt no-new-privileges \
   -v %h/.cache/mcp-meeting-transcribe:%h/.cache/mcp-meeting-transcribe:rw \
   -v %h/.cache/huggingface:%h/.cache/huggingface:rw \

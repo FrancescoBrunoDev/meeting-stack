@@ -78,6 +78,16 @@ def job_id(audio: bytes) -> str:
     return hashlib.sha256(audio).hexdigest()[:16]
 
 
+JOB_ID = re.compile(r"^[0-9a-f]{16}$")
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Replace a small file in one step: the service is restarted mid-write."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     """Parse a single `Range: bytes=a-b` against a file of `size` bytes.
 
@@ -168,9 +178,7 @@ class Hooks:
 
     def _save(self) -> None:
         # Atomic: the service is restarted while a hook is being written.
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(list(self._items.values()), indent=1), encoding="utf-8")
-        tmp.replace(self.path)
+        write_atomic(self.path, json.dumps(list(self._items.values()), indent=1))
 
     def announce(self, payload: dict) -> tuple[dict | None, str | None]:
         """Remember one announcement. (entry, error) - error is a 400 reason."""
@@ -283,7 +291,8 @@ class Jobs:
                  parallel: int = 4, diarizer: str = "nemotron",
                  model: str = "Whisper-Large-v3-Turbo", asr_mode: str = "full",
                  lock_path: Path = Path("/run/user/1000/halogen-gpu.lock"),
-                 lock_wait: float = 600, pair_wait: float = 900) -> None:
+                 lock_wait: float = 600, pair_wait: float = 900,
+                 retain_days: float = 30) -> None:
         self.meeting = Path(meeting).resolve()
         self.asr = asr
         self.parallel = parallel
@@ -295,15 +304,20 @@ class Jobs:
         self.pair_wait = pair_wait
         self.inbox = root / "inbox"
         self.out = root / "out"
+        self.jobs_file = root / "jobs.json"
+        self.retain_days = retain_days
         self.keep_audio = keep_audio
         self.timeout = timeout
         self.inbox.mkdir(parents=True, exist_ok=True)
         self.out.mkdir(parents=True, exist_ok=True)
         self._jobs: dict[str, Job] = {}
-        self._lock = threading.Lock()
+        # RLock: a state change is persisted while the submitter holds the lock.
+        self._lock = threading.RLock()
         self._current: subprocess.Popen | None = None
         self._current_lock = threading.Lock()
         self._queue: queue.Queue[Job] = queue.Queue()
+        self._load()
+        self.prune()
         threading.Thread(target=self._work, daemon=True).start()
         threading.Thread(target=self._pair_watch, daemon=True).start()
 
@@ -339,22 +353,118 @@ class Jobs:
         """Queue the job, or park it until the other track of its recording arrives."""
         if pair and "main" not in job.tracks:
             job.status = "waiting"  # only the microphone side is here yet
-            return
-        if pair and "second" not in job.tracks and job.started is None:
+        elif pair and "second" not in job.tracks and job.started is None:
             job.status = "waiting"  # the microphone side may still be uploading
+        else:
+            job.status = "queued"
+            self._queue.put(job)
+        self._persist()
+
+    def _persist(self) -> None:
+        """Keep the job list on disk: a restart empties the queue, not the list."""
+        with self._lock:
+            records = [{"id": job.id, "status": job.status, "error": job.error,
+                        "options": job.options, "created": job.created,
+                        "started": job.started, "finished": job.finished,
+                        "progress": job.progress,
+                        "tracks": {name: str(path) for name, path in job.tracks.items()}}
+                       for job in self._jobs.values()]
+            try:
+                write_atomic(self.jobs_file, json.dumps(records, ensure_ascii=False))
+            except OSError:
+                pass  # a full disk must not take a running job down with it
+
+    def _load(self) -> None:
+        """Restore what a previous process wrote; results are read back lazily."""
+        try:
+            records = json.loads(self.jobs_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
             return
-        job.status = "queued"
-        self._queue.put(job)
+        for record in records if isinstance(records, list) else []:
+            try:
+                identity = record["id"]
+                options = record.get("options") or {}
+                tracks = record.get("tracks") or {}
+                if not JOB_ID.fullmatch(identity) or not isinstance(options, dict) \
+                        or not isinstance(tracks, dict):
+                    continue
+                job = Job(identity, dict(options))
+                job.status = str(record.get("status") or "error")
+                job.error = record.get("error") or None
+                job.progress = record.get("progress") or None
+                job.created = float(record.get("created") or 0.0)
+                job.started = record.get("started")
+                job.finished = record.get("finished")
+                job.tracks = {name: Path(path) for name, path in tracks.items()
+                              if name in ("main", "second") and isinstance(path, str)}
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._restore(job)
+            self._jobs[job.id] = job
+        self._persist()
+
+    def _restore(self, job: Job) -> None:
+        """Reconcile one restored job with what is actually on disk."""
+        if job.status == "done":
+            try:
+                job.json = json.loads(Path(f"{self.out / job.id}.json")
+                                      .read_text(encoding="utf-8"))
+                job.markdown = Path(f"{self.out / job.id}.md").read_text(encoding="utf-8")
+            except (OSError, json.JSONDecodeError):
+                job.status, job.error = "error", "the result files are gone"
+        elif job.status == "running":
+            # The worker died with the service; the audio is kept for a retry.
+            job.status = "error"
+            job.error = "the service restarted while this job was running"
+            job.finished = time.time()
+        elif job.status not in ("waiting", "queued"):
+            job.status, job.error = "error", f"unknown job status {job.status!r}"
+        if job.status != "done" and not any(path.is_file() for path in job.tracks.values()):
+            job.status, job.error = "error", "the uploaded audio is gone"
+        elif job.status == "queued":
+            self._queue.put(job)
+
+    def prune(self) -> int:
+        """Delete kept uploads past --retain-audio-days; 0 disables pruning.
+
+        A job that still has to run keeps its audio whatever its age: only the
+        recordings of done and failed jobs are candidates.
+        """
+        if self.retain_days <= 0:
+            return 0
+        cutoff = time.time() - self.retain_days * 86400
+        removed = 0
+        with self._lock:
+            needed = {path for job in self._jobs.values()
+                      if job.status in ("queued", "waiting", "running")
+                      for path in job.tracks.values()}
+            for path in self.inbox.iterdir():
+                try:
+                    if path not in needed and path.is_file() \
+                            and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+        return removed
 
     def _pair_watch(self) -> None:
         """Run a job whose other track never came: one track still beats no transcript."""
+        pruned = time.time()
         while True:
             time.sleep(5)
+            if time.time() - pruned >= 3600:
+                pruned = time.time()
+                self.prune()
             with self._lock:
+                queued = False
                 for job in self._jobs.values():
                     if job.status == "waiting" and time.time() - job.created >= self.pair_wait:
                         job.status = "queued"
                         self._queue.put(job)
+                        queued = True
+                if queued:
+                    self._persist()
 
     def get(self, identity: str | None) -> dict | None:
         with self._lock:
@@ -391,6 +501,7 @@ class Jobs:
             job.started = job.finished = None
             job.json = job.markdown = None  # the previous result is not this run's
             self._queue.put(job)
+            self._persist()
             return job.snapshot()
 
     def queued(self) -> int:
@@ -403,8 +514,14 @@ class Jobs:
             self._queue.task_done()
 
     def _run(self, job: Job) -> None:
-        job.status = "running"
-        job.started = time.time()
+        job.status, job.started = "running", time.time()
+        self._persist()
+        try:
+            self._transcribe(job)
+        finally:
+            self._persist()
+
+    def _transcribe(self, job: Job) -> None:
         # One GPU/NPU user at a time: wait for any image generation to finish.
         if not self.lock.acquire(self.lock_wait):
             job.status = "error"
@@ -832,11 +949,15 @@ def main() -> None:
                              "before transcribing the one that arrived (default 900)")
     parser.add_argument("--keep-audio", action="store_true",
                         help="keep the uploaded audio instead of deleting it after the job")
+    parser.add_argument("--retain-audio-days", type=float, default=30,
+                        help="delete kept uploads older than this many days; 0 keeps them "
+                             "forever (default 30)")
     args = parser.parse_args()
 
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
                 args.asr, args.parallel, args.diarizer, args.model, args.asr_mode,
-                args.lock, args.lock_wait, pair_wait=args.pair_wait)
+                args.lock, args.lock_wait, pair_wait=args.pair_wait,
+                retain_days=args.retain_audio_days)
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
     server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"

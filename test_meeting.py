@@ -7,8 +7,10 @@ rebuilding words the server split, fusing ASR segments with speaker labels,
 merging turns, and the defaults that decide which path runs.
 """
 import importlib.util
+import os
 import sys
 import tempfile
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -331,6 +333,103 @@ class Retry(unittest.TestCase):
 
     def test_an_unknown_job_is_none(self):
         self.assertIsNone(self.jobs.retry("nope"))
+
+
+class Persistence(unittest.TestCase):
+    """A restart empties the queue; the list, the transcript and retry must survive."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+
+    def start(self, **kwargs):
+        jobs = meeting_job.Jobs(Path("/bin/true"), self.root, lock_path=self.root / "lock",
+                                pair_wait=10000, **kwargs)
+        self.addCleanup(jobs.stop)
+        return jobs
+
+    def test_a_finished_job_and_its_transcript_survive_a_restart(self):
+        jobs = self.start()
+        audio = self.root / "inbox" / "kept.wav"
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job("0123456789abcdef", {"language": "de"})
+        job.status, job.finished = "done", 1.0
+        job.tracks = {"main": audio}
+        Path(f"{self.root / 'out' / job.id}.json").write_text('{"turns": []}')
+        Path(f"{self.root / 'out' / job.id}.md").write_text("# transcript\n")
+        jobs._jobs[job.id] = job
+        jobs._persist()
+
+        restored = self.start().get(job.id)
+        self.assertEqual(restored["status"], "done")
+        self.assertEqual(restored["options"], {"language": "de"})
+        self.assertEqual(restored["markdown"], "# transcript\n")
+        self.assertTrue(restored["audio"])
+
+    def test_a_job_waiting_for_its_second_track_stays_waiting(self):
+        jobs = self.start()
+        snap = jobs.submit(b"mic", {}, "zoom-1-mic-16k.mp3")
+        self.assertEqual(snap["status"], "waiting")
+        self.assertEqual(self.start().get(snap["id"])["status"], "waiting")
+
+    def test_a_job_cut_off_by_the_restart_is_an_error_with_the_audio_kept(self):
+        jobs = self.start()
+        audio = self.root / "inbox" / "kept.wav"
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job("fedcba9876543210", {})
+        job.status, job.started = "running", 1.0
+        job.tracks = {"main": audio}
+        jobs._jobs[job.id] = job
+        jobs._persist()
+
+        restored = self.start().get(job.id)
+        self.assertEqual(restored["status"], "error")
+        self.assertIn("restarted", restored["error"])
+        self.assertTrue(audio.is_file())  # so the dashboard's retry can run it
+
+
+class Retention(unittest.TestCase):
+    """Uploads are kept for playback and retries, not forever."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+
+    def start(self, **kwargs):
+        jobs = meeting_job.Jobs(Path("/bin/true"), self.root, lock_path=self.root / "lock",
+                                pair_wait=10000, **kwargs)
+        self.addCleanup(jobs.stop)
+        return jobs
+
+    def test_audio_past_the_retention_is_deleted_unless_a_job_still_needs_it(self):
+        jobs = self.start(retain_days=30)
+        inbox = self.root / "inbox"
+        past = time.time() - 40 * 86400
+        for name in ("old.wav", "needed.wav"):
+            path = inbox / name
+            path.write_bytes(b"x")
+            os.utime(path, (past, past))
+        fresh = inbox / "fresh.wav"
+        fresh.write_bytes(b"x")
+
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.status, job.tracks = "running", {"main": inbox / "needed.wav"}
+        jobs._jobs[job.id] = job
+
+        self.assertEqual(jobs.prune(), 1)
+        self.assertFalse((inbox / "old.wav").exists())
+        self.assertTrue((inbox / "needed.wav").is_file())
+        self.assertTrue(fresh.is_file())
+
+    def test_zero_days_keeps_everything(self):
+        jobs = self.start(retain_days=0)
+        path = self.root / "inbox" / "old.wav"
+        path.write_bytes(b"x")
+        os.utime(path, (time.time() - 400 * 86400,) * 2)
+        self.assertEqual(jobs.prune(), 0)
+        self.assertTrue(path.is_file())
 
 
 class RepetitionLoop(unittest.TestCase):

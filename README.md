@@ -147,8 +147,12 @@ curl -H "Authorization: Bearer $TOKEN" http://box:8099/jobs/<id>/audio    # the 
 `GET /jobs/<id>/audio` answers byte ranges (206), so a player can seek; the
 dashboard passes the token in the query (`?token=…`) because an `<audio src>`
 cannot send headers, and only that route accepts it there. The recording is kept
-when the service runs with `--keep-audio` (the systemd unit does) — the files
-pile up in `inbox/` and nothing prunes them, so delete old ones yourself.
+when the service runs with `--keep-audio` (the systemd unit does) and deleted
+after `--retain-audio-days` (default 30; `0` keeps it forever). Audio of a job
+that is still queued or running is never touched, and the job list itself is
+saved in `jobs.json` under `--dir`: restarting the service keeps the list and
+the finished transcripts, and marks a job that was mid-run as an error with its
+audio still there, so the dashboard's retry can run it again.
 
 ### Two tracks, one transcript
 
@@ -246,6 +250,8 @@ view, and clicking any line seeks to its timestamp.
   `--second-name` (default `Me`), `--diarize-second`, `--second-offset`.
 - `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the
   other track before running anyway.
+- `--retain-audio-days 30` (on `meeting-job`) — delete kept uploads older than
+  this; `0` keeps them forever. Only done and failed jobs are candidates.
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
 The service runs the gufo/Qwen3-ASR path (`--asr http://127.0.0.1:8097 --model

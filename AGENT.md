@@ -87,21 +87,24 @@ bite:
   "fix" that as a missing diarization step.
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
-- Job state is in memory: restarting the unit empties the job list, the `.md` and
-  `.json` files stay in `~/.cache/mcp-meeting-transcribe/out/`. Announcements
-  (`hooks.json`, from `POST /hook`) are the exception and do survive: they are
-  the recorder's word that a recording is complete, and re-announcing after a
-  restart is not something the recorder can be asked to do.
+- Job state is in `jobs.json` under `--dir` (atomic replace, restored at
+  startup): the list, options, status and the paths of the uploads survive a
+  restart, and a finished job's transcript is read back from `out/<id>.json` and
+  `.md`. A job that was `running` when the service died becomes an `error` with
+  its audio kept, so "retry" works; a job that was `queued` is queued again; a
+  `waiting` job is still picked up by `--pair-wait`. Announcements (`hooks.json`)
+  use the same atomic write.
 - `POST /hook` carries no audio; it is `POST /jobs` that does. The hook exists so
   an announced-but-never-uploaded recording shows up as `missing_audio` in
   `GET /hooks` instead of being guessed after `--pair-wait`. Both are idempotent
   by recording key (`zoom-<stamp>`), which is how a retry or a recorder restart
   sweep is absorbed.
-- `--keep-audio` is on in the unit so the dashboard can play a recording; the
-  uploads stay in `~/.cache/mcp-meeting-transcribe/inbox/` forever. `GET
-  /jobs/<id>/audio` serves them with ranges (206) and accepts the bearer token in
-  the query string, because `<audio src>` cannot send headers — only that route
-  checks the query.
+- `--keep-audio` is on in the unit so the dashboard can play a recording. The
+  uploads are pruned after `--retain-audio-days` (default 30; `0` disables),
+  hourly and at startup; a queued, waiting or running job's audio is never
+  pruned. `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
+  bearer token in the query string, because `<audio src>` cannot send headers —
+  only that route checks the query.
 
 ## Gotchas that already cost time
 
