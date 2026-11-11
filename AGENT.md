@@ -87,9 +87,18 @@ bite:
   not sent in one pass unless `--asr-mode full` (`mic_is_diarized()`): gufo has
   no verbose_json, so a whole-track request there returns `segments: []` and
   the job dies with "ASR returned no segments". With `segments` the diarizer
-  provides only the turn boundaries and `second_track_turns(..., diarized=False)`
-  collapses every turn to `Me`. Do not "fix" that as a missing diarization
-  step; a silent mic track is tolerated (`lenient`), not a failed job.
+  provides the turn boundaries; its labels are kept (and matched onto the first
+  track's speakers) when it found more than one voice, otherwise
+  `second_track_turns(..., diarized=False)` collapses every turn to `Me`. Do not
+  "fix" that as a missing diarization step; a silent mic track is tolerated
+  (`lenient`), not a failed job. When both tracks are the same room recorded
+  twice (a mic that also hears the loudspeakers), `merge_tracks()` drops the
+  second track's turns the first already covers instead of duplicating them.
+  `dedupe_turns()` then drops a repeated cut of the same utterance (two
+  overlapping speaker ids, same words): that is why the final speaker count can
+  be lower than the diarizer's. `--diarization FILE` replaces the guessed
+  speakers with an external reference (e.g. pyannote precision-3) by time
+  overlap; the service accepts the same path as the `diarization` job option.
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
 - Job state is in `jobs.json` under `--dir` (atomic replace, restored at

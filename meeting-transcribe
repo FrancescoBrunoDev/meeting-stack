@@ -71,6 +71,15 @@ MAX_TOKENS = 512
 TURN_PAD_S = 0.3
 # Shorter than any word, so the ASR can only invent text for such a clip.
 MIN_CLIP_S = 0.2
+# Two uploads of the same room (a microphone that also hears the loudspeakers)
+# are one conversation recorded twice. When this much of the shorter track's
+# speech is covered by the other, the second track is deduplicated instead of
+# unioned, so the same words do not come out as two different speakers.
+REDUNDANT_SHARE = 0.6
+# How much of a second-track turn the first track must already cover for it to
+# be the same wall-clock audio rather than a second voice.
+COVERED_SHARE = 0.5
+DUPLICATE_WINDOW_S = 1.5
 ATTEMPTS = 3
 RETRY_S = 1.0
 RETRYABLE = (408, 409, 429, 500, 502, 503, 504)
@@ -190,9 +199,12 @@ def pad_turns(turns: list[dict], pad: float) -> list[dict]:
     """
     padded = []
     for index, turn in enumerate(turns):
-        left = pad if index == 0 else min(pad, (turn["start"] - turns[index - 1]["end"]) / 2)
-        right = pad if index + 1 == len(turns) else min(
-            pad, (turns[index + 1]["start"] - turn["end"]) / 2)
+        # Diarizer segments of different speakers may overlap (crosstalk): a
+        # negative pad would shrink a turn past its own start.
+        left = pad if index == 0 else max(
+            0.0, min(pad, (turn["start"] - turns[index - 1]["end"]) / 2))
+        right = pad if index + 1 == len(turns) else max(
+            0.0, min(pad, (turns[index + 1]["start"] - turn["end"]) / 2))
         padded.append(dict(turn,
                            start=round(max(0.0, turn["start"] - left), 3),
                            end=round(turn["end"] + right, 3)))
@@ -223,6 +235,40 @@ def number_speakers(turns: list[dict]) -> list[dict]:
     for turn in turns:
         order.setdefault(turn["speaker"], len(order) + 1)
     return [dict(turn, speaker=order[turn["speaker"]]) for turn in turns]
+
+
+def load_diarization(path: Path) -> list[dict]:
+    """Read an external diarization: a list of segments, or a dict with one.
+
+    pyannote runs in this house print `{"diarization": [{start, end, speaker}]}`;
+    a bare list and this repo's `turns` are accepted too.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("diarization") or data.get("turns") or data.get("segments") or []
+    return [{"start": float(seg["start"]), "end": float(seg["end"]),
+             "speaker": seg["speaker"]} for seg in data]
+
+
+def relabel_turns(turns: list[dict], segments: list[dict]) -> list[dict]:
+    """Give every turn the external speaker it overlaps most, numbered 1..N.
+
+    For a reference diarization the two tracks' own labels are guesses; this
+    replaces them. A turn in a reference gap inherits the previous speaker.
+    """
+    if not segments:
+        return turns
+    labelled = []
+    previous = segments[0]["speaker"]
+    for turn in sorted(turns, key=lambda t: (t["start"], t["end"])):
+        weight: dict = {}
+        for segment in segments:
+            overlap = min(turn["end"], segment["end"]) - max(turn["start"], segment["start"])
+            if overlap > 0:
+                weight[segment["speaker"]] = weight.get(segment["speaker"], 0.0) + overlap
+        previous = max(weight, key=weight.get) if weight else previous
+        labelled.append(dict(turn, speaker=previous, name=None))
+    return number_speakers(labelled)
 
 
 def split_turn(turn: dict, index: int, max_s: float) -> list[dict]:
@@ -569,18 +615,108 @@ def second_track_turns(turns: list[dict], after: int, name: str,
                        diarized: bool = False) -> list[dict]:
     """Label the second track so its speaker ids cannot collide with the first's.
 
-    A microphone track carries one speaker by construction -- the room the
-    recorder sits in -- so it needs no clustering at all: every turn gets the id
-    after the last remote speaker and the second track's name. With
-    --diarize-second the track is clustered as usual and the ids are shifted,
-    which keeps 1..N for remote participants and N+1.. for the room.
+    A microphone track that carries one voice -- the recorder's own room -- needs
+    no clustering at all: every turn gets the id after the last remote speaker
+    and the second track's name. With --diarize-second the track is clustered as
+    usual and the ids are shifted, which keeps 1..N for remote participants and
+    N+1.. for the room; the name is dropped, because several people share it.
     """
     if diarized:
-        turns = [dict(turn, speaker=turn["speaker"] + after)
-                 for turn in number_speakers(turns)]
-    else:
-        turns = [dict(turn, speaker=after + 1) for turn in turns]
-    return [dict(turn, name=name) for turn in turns]
+        return [dict(turn, speaker=turn["speaker"] + after)
+                for turn in number_speakers(turns)]
+    return [dict(turn, speaker=after + 1, name=name) for turn in turns]
+
+
+def match_speakers(first: list[dict], second: list[dict], offset: float = 0.0) -> list[dict]:
+    """Give every second-track speaker the first-track speaker it overlaps most.
+
+    Both tracks share a clock, so a voice heard at the same time is the same
+    person. A voice that only speaks where the first track has nothing (the
+    room kept recording) gets a new number after the last one.
+    """
+    shared: dict[tuple, float] = {}
+    for other in second:
+        start, end = other["start"] + offset, other["end"] + offset
+        for turn in first:
+            overlap = min(turn["end"], end) - max(turn["start"], start)
+            if overlap > 0:
+                key = (other["speaker"], turn["speaker"])
+                shared[key] = shared.get(key, 0.0) + overlap
+    free = max((turn["speaker"] for turn in first), default=0)
+    mapping: dict = {}
+    for speaker in sorted({turn["speaker"] for turn in second}):
+        options = [(weight, number) for (own, number), weight in shared.items() if own == speaker]
+        if options:
+            mapping[speaker] = max(options)[1]
+        else:
+            free += 1
+            mapping[speaker] = free
+    return [dict(turn, speaker=mapping[turn["speaker"]]) for turn in second]
+
+
+def speech_seconds(turns: list[dict]) -> float:
+    return sum(max(0.0, turn["end"] - turn["start"]) for turn in turns)
+
+
+def shared_seconds(first: list[dict], second: list[dict]) -> float:
+    return sum(max(0.0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
+               for a in first for b in second)
+
+
+def covered_share(turn: dict, turns: list[dict]) -> float:
+    length = turn["end"] - turn["start"]
+    if length <= 0:
+        return 0.0
+    return shared_seconds([turn], turns) / length
+
+
+def redundant(first: list[dict], second: list[dict], offset: float = 0.0) -> bool:
+    """Whether both tracks carry the same conversation, not two sides of it."""
+    shifted = [dict(turn, start=turn["start"] + offset, end=turn["end"] + offset)
+               for turn in second]
+    shorter = min(speech_seconds(first), speech_seconds(shifted))
+    return shorter > 0 and shared_seconds(first, shifted) / shorter >= REDUNDANT_SHARE
+
+
+def duplicate_turn(turn: dict, first: list[dict]) -> bool:
+    """Whether this second-track turn repeats audio the first track already has."""
+    if covered_share(turn, first) >= COVERED_SHARE:
+        return True
+    words = set(bare(turn["text"]).split())
+    for other in first:
+        if abs(other["start"] - turn["start"]) > DUPLICATE_WINDOW_S:
+            continue
+        theirs = set(bare(other["text"]).split())
+        union = words | theirs
+        if union and len(words & theirs) / len(union) > COVERED_SHARE:
+            return True
+    return False
+
+
+def dedupe_turns(turns: list[dict]) -> list[dict]:
+    """Drop a turn that repeats the words of an earlier, overlapping one.
+
+    The diarizer sometimes cuts the same utterance into two overlapping turns
+    for two speaker ids; every clip then transcribes the same words twice. Only
+    runs of three words or more are compared, so a shared "ja" stays two lines.
+    """
+    kept: list[dict] = []
+    for turn in sorted(turns, key=lambda t: (t["start"], t["end"])):
+        words = set(bare(turn["text"]).split())
+        repeated = False
+        for other in kept:
+            if abs(other["start"] - turn["start"]) > DUPLICATE_WINDOW_S:
+                continue
+            if min(turn["end"], other["end"]) <= max(turn["start"], other["start"]):
+                continue
+            theirs = set(bare(other["text"]).split())
+            union = words | theirs
+            if min(len(words), len(theirs)) >= 3 and len(words & theirs) / len(union) > COVERED_SHARE:
+                repeated = True
+                break
+        if not repeated:
+            kept.append(turn)
+    return kept
 
 
 def merge_tracks(first: list[dict], second: list[dict], offset: float = 0.0) -> list[dict]:
@@ -588,9 +724,13 @@ def merge_tracks(first: list[dict], second: list[dict], offset: float = 0.0) -> 
 
     Overlapping turns are kept as they are: two people talking at once are two
     lines here, not one garbled one, because the channels already separate them.
+    When the tracks are the same room recorded twice, the second track's turns
+    that the first already covers are dropped instead of repeated.
     """
     shifted = [dict(turn, start=round(turn["start"] + offset, 3),
                     end=round(turn["end"] + offset, 3)) for turn in second]
+    if redundant(first, second, offset):
+        shifted = [turn for turn in shifted if not duplicate_turn(turn, first)]
     return sorted(first + shifted, key=lambda turn: (turn["start"], turn["end"]))
 
 
@@ -599,8 +739,9 @@ def mic_is_diarized(asr_mode: str, diarize_second: bool) -> bool:
 
     A track that is not diarized goes to the ASR in one pass, which needs
     verbose_json to give the words timestamps. gufo answers text only, so with
-    --asr-mode segments the microphone track is diarized anyway and
-    second_track_turns() then collapses every turn back to one speaker.
+    --asr-mode segments the microphone track is diarized anyway; the labels are
+    kept when it found more than one voice, and collapsed to one speaker only
+    when the room really had a single voice.
     """
     return diarize_second or asr_mode != "full"
 
@@ -707,6 +848,10 @@ def main() -> None:
     parser.add_argument("--second-offset", type=float, default=0.0,
                         help="seconds to add to the second track's timestamps when its file "
                              "starts later than the first (default 0)")
+    parser.add_argument("--diarization", type=Path, default=None,
+                        help="external diarization JSON to take the speakers from, e.g. a "
+                             "pyannote run: {\"diarization\": [{start, end, speaker}]} or a "
+                             "plain list; the final turns are relabelled by time overlap")
     parser.add_argument("--merge-gap", type=float, default=2.0,
                         help="merge same-speaker segments up to this gap in seconds (default 2.0)")
     parser.add_argument("--max-segment", type=float, default=MAX_SEGMENT_S,
@@ -729,6 +874,8 @@ def main() -> None:
     second_source = args.second.resolve() if args.second else None
     if second_source is not None and not second_source.is_file():
         raise SystemExit(f"No such audio file: {second_source}")
+    if args.diarization is not None and not args.diarization.is_file():
+        raise SystemExit(f"No such diarization file: {args.diarization}")
     if args.diarizer != "pyannote-rocm" and (args.min_speakers > 0 or args.max_speakers > 0):
         raise SystemExit("--min-speakers/--max-speakers need --diarizer pyannote-rocm")
     if args.diarizer != "sherpa" and args.threshold != 0.5:
@@ -750,17 +897,38 @@ def main() -> None:
         duration = wav_seconds(workdir / "main" / "audio.wav")
         if second_source is not None:
             # With gufo there is no verbose_json, so the microphone track takes
-            # the per-turn path: the diarizer only supplies the boundaries, and
-            # second_track_turns() keeps it one speaker unless --diarize-second.
+            # the per-turn path: the diarizer supplies the boundaries, and its
+            # labels too when the room turns out to hold several voices.
             needs_diarizer = mic_is_diarized(args.asr_mode, args.diarize_second)
             second = track_turns(args, url, second_source, workdir / "second", hotwords,
                                  diarize_it=needs_diarizer,
                                  lenient=needs_diarizer and not args.diarize_second)
-            second = second_track_turns(second, max((t["speaker"] for t in labelled), default=0),
-                                        args.second_name, args.diarize_second)
+            after = max((t["speaker"] for t in labelled), default=0)
+            voices = len({turn["speaker"] for turn in second})
+            if args.diarize_second:
+                second = second_track_turns(second, after, args.second_name, diarized=True)
+            elif voices > 1 and redundant(labelled, second, args.second_offset):
+                # The same room recorded twice, with several voices in it:
+                # calling all of them "Me" would be a lie, and the shared clock
+                # says which first-track speaker each one is.
+                second = match_speakers(labelled, second, args.second_offset)
+            elif voices > 1:
+                second = second_track_turns(second, after, args.second_name, diarized=True)
+            else:
+                second = second_track_turns(second, after, args.second_name)
             labelled = merge_tracks(labelled, second, args.second_offset)
-            print(f"second track: {len(second)} turns ({args.second_name}) added", file=sys.stderr)
+            print(f"second track: {len(second)} turns added", file=sys.stderr)
+            second_duration = wav_seconds(workdir / "second" / "audio.wav")
+            if second_duration:
+                duration = max(duration or 0.0, second_duration)
         print(f"{len(labelled)} turns in total", file=sys.stderr)
+
+    if args.diarization is not None:
+        labelled = relabel_turns(labelled, load_diarization(args.diarization))
+        print(f"relabelled from {args.diarization}: "
+              f"{len({turn['speaker'] for turn in labelled})} speakers", file=sys.stderr)
+    labelled = dedupe_turns(labelled)
+    print(f"{len(labelled)} turns after removing repeated cuts", file=sys.stderr)
 
     result = []
     for turn in labelled:
@@ -771,6 +939,9 @@ def main() -> None:
         if name:
             entry["name"] = name
         result.append(entry)
+    if result:
+        # Never shorter than the last turn, even when only one track reported it.
+        duration = round(max(duration or 0.0, max(turn["end"] for turn in result)), 1)
     document = {"source": str(source), "model": args.model, "language": args.language,
                 # The recording's length, so a client does not have to guess it
                 # from the last turn (which ends where the speech ends).

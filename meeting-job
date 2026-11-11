@@ -64,7 +64,8 @@ OPTION_FLAGS = (("speakers", "--speakers"), ("min_speakers", "--min-speakers"),
                 ("max_segment", "--max-segment"), ("max_tokens", "--max-tokens"),
                 ("diarizer", "--diarizer"), ("model", "--model"),
                 ("asr_mode", "--asr-mode"), ("second_name", "--second-name"),
-                ("second_offset", "--second-offset"))
+                ("second_offset", "--second-offset"),
+                ("diarization", "--diarization"))
 # Booleans: the flag is passed alone, so any truthy value turns it on.
 SWITCH_FLAGS = (("diarize_second", "--diarize-second"),)
 # Query parameters this server consumes itself and never forwards to the worker.

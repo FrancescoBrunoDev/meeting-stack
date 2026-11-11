@@ -7,6 +7,7 @@ rebuilding words the server split, fusing ASR segments with speaker labels,
 merging turns, and the defaults that decide which path runs.
 """
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -113,6 +114,28 @@ class Turns(unittest.TestCase):
         segs = [{"speaker": 1, "start": 0.0, "end": 2.0, "text": "a"},
                 {"speaker": 2, "start": 2.0, "end": 3.0, "text": "b"}]
         self.assertEqual(len(meeting.build_turns_labeled(segs, gap=5.0)), 2)
+
+    def test_an_utterance_cut_for_two_speakers_is_kept_once(self):
+        turns = [{"speaker": 4, "start": 10.0, "end": 12.0,
+                  "text": "Ja wegen der Zeitabrechnung, aber."},
+                 {"speaker": 3, "start": 10.5, "end": 13.0,
+                  "text": "wegen der Zeitabrechnung, aber ja."}]
+        self.assertEqual(len(meeting.dedupe_turns(turns)), 1)
+
+    def test_different_words_talking_at_once_stay_two_lines(self):
+        turns = [{"speaker": 1, "start": 10.0, "end": 12.0, "text": "ich sage etwas"},
+                 {"speaker": 2, "start": 10.5, "end": 13.0, "text": "und ich etwas anderes"}]
+        self.assertEqual(len(meeting.dedupe_turns(turns)), 2)
+
+    def test_a_shared_single_word_is_not_a_duplicate(self):
+        turns = [{"speaker": 1, "start": 10.0, "end": 11.0, "text": "ja"},
+                 {"speaker": 2, "start": 10.5, "end": 11.5, "text": "ja"}]
+        self.assertEqual(len(meeting.dedupe_turns(turns)), 2)
+
+    def test_the_same_words_far_apart_are_two_turns(self):
+        turns = [{"speaker": 1, "start": 10.0, "end": 11.0, "text": "guten morgen zusammen"},
+                 {"speaker": 1, "start": 30.0, "end": 31.0, "text": "guten morgen zusammen"}]
+        self.assertEqual(len(meeting.dedupe_turns(turns)), 2)
 
 
 class AnnouncedRecordings(unittest.TestCase):
@@ -226,6 +249,52 @@ class TwoTracks(unittest.TestCase):
         merged = meeting.merge_tracks([], second, offset=2.5)
         self.assertEqual((merged[0]["start"], merged[0]["end"]), (7.5, 10.5))
 
+    def test_the_same_room_recorded_twice_is_not_repeated(self):
+        # A microphone that also hears the loudspeakers: same speech, other
+        # segmentation. Only the tail the system track does not have survives.
+        first = [{"speaker": 1, "start": 0.0, "end": 40.0, "text": "hallo zusammen"}]
+        second = [{"speaker": 5, "start": 0.1, "end": 39.9, "text": "hallo zusammen"},
+                  {"speaker": 5, "start": 41.0, "end": 50.0, "text": "tschüss"}]
+        merged = meeting.merge_tracks(first, second)
+        self.assertEqual([t["text"] for t in merged], ["hallo zusammen", "tschüss"])
+
+    def test_tracks_of_the_same_room_are_recognised_as_one(self):
+        first = [{"speaker": 1, "start": 0.0, "end": 10.0, "text": "a"}]
+        same = [{"speaker": 5, "start": 0.1, "end": 9.9, "text": "a"}]
+        other = [{"speaker": 5, "start": 12.0, "end": 20.0, "text": "b"}]
+        self.assertTrue(meeting.redundant(first, same))
+        self.assertFalse(meeting.redundant(first, other))
+
+    def test_crosstalk_on_complementary_tracks_is_kept(self):
+        # Local and remote alternate: little shared speech, so nothing is dropped.
+        first = [{"speaker": 1, "start": 0.0, "end": 10.0, "text": "a"},
+                 {"speaker": 1, "start": 20.0, "end": 30.0, "text": "b"}]
+        second = [{"speaker": 2, "start": 10.5, "end": 20.5, "text": "c"}]
+        merged = meeting.merge_tracks(first, second)
+        self.assertEqual([t["text"] for t in merged], ["a", "c", "b"])
+
+    def test_a_repeated_short_turn_is_dropped_even_without_overlap(self):
+        first = [{"speaker": 1, "start": 5.2, "end": 5.5, "text": "ja"},
+                 {"speaker": 1, "start": 30.0, "end": 40.0, "text": "weiter"}]
+        second = [{"speaker": 2, "start": 5.6, "end": 6.0, "text": "ja"},
+                  {"speaker": 2, "start": 32.0, "end": 38.0, "text": "weiter"}]
+        self.assertEqual([t["text"] for t in meeting.merge_tracks(first, second)], ["ja", "weiter"])
+
+    def test_a_voice_of_the_second_track_gets_the_speaker_it_overlaps(self):
+        first = [{"speaker": 1, "start": 0.0, "end": 10.0, "text": "a"},
+                 {"speaker": 2, "start": 10.0, "end": 20.0, "text": "b"}]
+        second = [{"speaker": 1, "start": 0.0, "end": 9.0, "text": "a"},
+                  {"speaker": 2, "start": 10.0, "end": 19.0, "text": "b"},
+                  {"speaker": 3, "start": 21.0, "end": 25.0, "text": "c"}]
+        matched = meeting.match_speakers(first, second)
+        self.assertEqual([t["speaker"] for t in matched], [1, 2, 3])
+
+    def test_padding_never_shrinks_an_overlapping_turn(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 5.0, "text": "a"},
+                 {"speaker": 2, "start": 4.0, "end": 8.0, "text": "b"}]
+        padded = meeting.pad_turns(turns, 0.3)
+        self.assertTrue(all(t["end"] >= t["start"] for t in padded))
+
     def test_a_microphone_track_is_one_speaker_after_the_remote_ones(self):
         turns = [{"speaker": 0, "start": 1.0, "end": 2.0, "text": "a"},
                  {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
@@ -259,6 +328,45 @@ class TwoTracks(unittest.TestCase):
                 self.assertEqual(turns, [])
         finally:
             meeting.diarize = original
+
+
+class ExternalDiarization(unittest.TestCase):
+    """A perfect reference (pyannote precision-3) must replace the guessed labels."""
+
+    def write(self, payload) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "ref.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_a_pyannote_file_and_a_plain_list_are_both_read(self):
+        segments = [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}]
+        self.assertEqual(meeting.load_diarization(self.write({"diarization": segments})), segments)
+        self.assertEqual(meeting.load_diarization(self.write(segments)), segments)
+
+    def test_every_turn_takes_the_reference_speaker_it_overlaps(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 4.0, "text": "a"},
+                 {"speaker": 4, "start": 4.0, "end": 8.0, "text": "b"},
+                 {"speaker": 2, "start": 8.0, "end": 9.0, "text": "c", "name": "Me"}]
+        reference = [{"start": 0.0, "end": 3.5, "speaker": "SPEAKER_01"},
+                     {"start": 4.0, "end": 8.0, "speaker": "SPEAKER_02"},
+                     {"start": 8.2, "end": 9.0, "speaker": "SPEAKER_00"}]
+        relabelled = meeting.relabel_turns(turns, reference)
+        self.assertEqual([t["speaker"] for t in relabelled], [1, 2, 3])
+        self.assertTrue(all(t.get("name") is None for t in relabelled))
+
+    def test_a_turn_in_a_reference_gap_keeps_the_previous_speaker(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 2.0, "text": "a"},
+                 {"speaker": 2, "start": 3.0, "end": 4.0, "text": "b"}]
+        reference = [{"start": 0.0, "end": 2.0, "speaker": "S0"},
+                     {"start": 5.0, "end": 6.0, "speaker": "S1"}]
+        relabelled = meeting.relabel_turns(turns, reference)
+        self.assertEqual([t["speaker"] for t in relabelled], [1, 1])
+
+    def test_an_empty_reference_changes_nothing(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 2.0, "text": "a"}]
+        self.assertEqual(meeting.relabel_turns(turns, []), turns)
 
 
 class JobSummaryFields(unittest.TestCase):

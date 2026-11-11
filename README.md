@@ -193,17 +193,22 @@ gives up. Announcements are idempotent (the same body twice is a 200 and bumps
 while the job list does not.
 
 The two tracks are worth keeping apart. The system track is diarized as usual
-(`Speaker 1…N` are the remote participants); the microphone track is *one*
-speaker by construction — the room the recorder sits in — so it is never
-clustered, only *labelled* `Me` (`--second-name`; `--diarize-second` when
-several people share the room). With `--asr-mode full` it is sent whole in one
-pass and never diarized. With `segments` (gufo, which returns no timestamps)
-the diarizer runs on it too, only to get the turn boundaries — without them
-there is nothing to place on the timeline — and every turn is then collapsed
-back to `Me`. The two timelines are interleaved, and crosstalk stays two lines
-instead of one garbled one, because the channels already separated it.
-`--second-offset` shifts the microphone track if its file starts later than the
-system one.
+(`Speaker 1…N` are the remote participants); a microphone track that carries
+only the recorder's room is *one* speaker, so it is never clustered, only
+*labelled* `Me` (`--second-name`; `--diarize-second` when several people share
+the room). With `--asr-mode full` it is sent whole in one pass and never
+diarized. With `segments` (gufo, which returns no timestamps) the diarizer runs
+on it too, for the turn boundaries — without them there is nothing to place on
+the timeline. If it finds more than one voice, its labels are kept and matched
+to the first track's speakers instead of calling the whole room `Me`.
+
+The two timelines are interleaved, and crosstalk stays two lines instead of one
+garbled one, because the channels already separated it. When both tracks are
+the same room recorded twice (a microphone that also hears the loudspeakers),
+the second track's turns already covered by the first are dropped instead of
+repeated; only speech the system track does not have (the room kept recording,
+or a local voice the call did not carry) is added. `--second-offset` shifts the
+microphone track if its file starts later than the system one.
 
 Running the worker by hand means the same thing:
 
@@ -252,6 +257,11 @@ view, and clicking any line seeks to its timestamp.
 - `--merge-gap 2.0` — merge same-speaker ASR segments across gaps this long.
 - `--second FILE` — the microphone track of a two-track recording; see above.
   `--second-name` (default `Me`), `--diarize-second`, `--second-offset`.
+- `--diarization FILE` — take the final speakers from an external diarization
+  (`{"diarization": [{start, end, speaker}]}` or a plain list), e.g. a pyannote
+  precision-3 run; each turn gets the reference speaker it overlaps most. Also
+  available as a job option (`diarization=<path>`), and the path must be visible
+  inside the service container (i.e. under the mounted cache dir).
 - `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the
   other track before running anyway.
 - `--retain-audio-days 30` (on `meeting-job`) — delete kept uploads older than
