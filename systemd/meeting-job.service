@@ -55,8 +55,13 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --diarizer nemotron --asr-mode segments \
   --keep-audio \
   --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
-  --live-embedder localhost/halogen-diarizer \
-  --live-asr http://127.0.0.1:8731 --live-model Whisper-Large-v3-Turbo
+  --live-embedder localhost/halogen-diarizer
+# --live-asr http://127.0.0.1:8731 --live-model Whisper-Large-v3-Turbo  is one
+# flag away, but on this box it puts a second model on the iGPU next to the 27B
+# that does the translating: measured 20 t/s with it resident against 35.7 t/s
+# earlier without it (cause not isolated: that whisper-server belongs to a
+# root-run Lemonade service and ignores both the unload API and kill as my user).
+# gufo is already resident and costs 0.78 s per clip instead of 0.24 s.
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
