@@ -27,6 +27,23 @@ const LANGUAGES = ["auto", "de", "it", "en", "fr", "es"]
 const TARGETS = ["it", "en", "de", "fr"]
 const CHUNK = 8000 // samples: half a second of 16 kHz audio per request
 
+/** A setting the page remembers: the next meeting starts where this one ended. */
+function useStored<T>(key: string, initial: T) {
+  const name = `live-${key}`
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const stored = localStorage.getItem(name)
+      return stored === null ? initial : (JSON.parse(stored) as T)
+    } catch {
+      return initial
+    }
+  })
+  useEffect(() => {
+    localStorage.setItem(name, JSON.stringify(value))
+  }, [name, value])
+  return [value, setValue] as const
+}
+
 /**
  * Live transcription and translation of a meeting as it happens.
  *
@@ -40,17 +57,17 @@ export default function Live() {
   const [token, setToken] = useState(
     () => new URLSearchParams(location.search).get("token") ?? localStorage.getItem("meeting-token") ?? ""
   )
-  const [language, setLanguage] = useState("de")
-  const [target, setTarget] = useState("it")
-  const [device, setDevice] = useState("")
+  const [language, setLanguage] = useStored("language", "de")
+  const [target, setTarget] = useStored("target", "it")
+  const [device, setDevice] = useStored("device", "")
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
-  const [processing, setProcessing] = useState(true)
+  const [processing, setProcessing] = useStored("processing", true)
   const [rows, setRows] = useState<Row[]>([])
   const [state, setState] = useState("idle")
   const [buffered, setBuffered] = useState(0)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [started, setStarted] = useState(false)
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useStored("expanded", false)
   const [error, setError] = useState<string | null>(null)
 
   const session = useRef<string | null>(null)
@@ -78,7 +95,12 @@ export default function Live() {
     if (!navigator.mediaDevices?.enumerateDevices) return
     try {
       const all = await navigator.mediaDevices.enumerateDevices()
-      setDevices(all.filter((entry) => entry.kind === "audioinput" && entry.label))
+      const inputs = all.filter((entry) => entry.kind === "audioinput" && entry.label)
+      setDevices(inputs)
+      // A remembered device that is no longer plugged in is not a choice.
+      setDevice((current) =>
+        current && !inputs.some((entry) => entry.deviceId === current) ? "" : current
+      )
     } catch {
       // no permission yet: the default input is the only offer
     }

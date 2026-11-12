@@ -388,6 +388,11 @@ lemonade pull bullerwins/translategemma-12b-it-GGUF:Q4_K_M     # 6.8 GB
 meeting-job --translate-model translategemma-12b-it-GGUF-Q4_K_M             --translate-format translategemma
 ```
 
+The page remembers what you chose — spoken language, target, input device, voice
+filters, and whether the transcript was expanded — in `localStorage` under
+`live-*`, so the next meeting starts where the last one ended. A remembered
+device that has since been unplugged is dropped rather than failing to open.
+
 Flags for the live path: `--live-asr`/`--live-model` point it at a faster
 endpoint than the jobs use — a clip every half second makes the fixed cost of a
 request the budget, and Whisper through Lemonade answers in 0.24 s against gufo's
