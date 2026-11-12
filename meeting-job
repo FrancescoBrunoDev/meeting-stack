@@ -853,7 +853,9 @@ class LiveSession:
                     # seconds of audio held back waiting for a pause, and what
                     # the worker is up to: the page has nothing else to show
                     "buffered": round(len(self._pcm) / LIVE_BYTES_PER_S, 1),
-                    "state": self._state}
+                    "state": self._state,
+                    # the worker has drained: no more rows can ever appear
+                    "done": self.done}
 
     def _work(self) -> None:
         while True:

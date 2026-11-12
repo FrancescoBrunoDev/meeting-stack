@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Feed a live session without a browser, and print what comes back translated.
+
+The page is one client of `POST /live/<id>/audio`; this is another, for the cases
+the browser cannot do: a native call (Zoom, Teams) whose audio goes through a
+virtual device, a machine with no Chrome, or a recording replayed into the
+pipeline. ffmpeg does the decoding and the pacing, so a file plays as a meeting
+would and a device streams as it happens.
+
+    # a real meeting, from the line-in/virtual device (macOS: BlackHole 2ch)
+    ./live-feed --url http://box:8099 --token "$TOKEN" --language de --to it \\
+        --input "avfoundation::BlackHole 2ch"
+
+    # the same pipeline, from a file, at realtime speed
+    ./live-feed --url http://box:8099 --language de --to it --input meeting.m4a
+
+Anything ffmpeg can read works as --input; it is passed as `-i <value>`. The
+session holds the GPU lock, so a job waits for it and vice versa.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+CHUNK = 16000                  # bytes: half a second of 16 kHz mono PCM16
+POLL = 0.5                     # seconds between two reads of the session
+
+
+def request(url: str, token: str, data: bytes | None = None) -> dict:
+    headers = {"Content-Type": "application/octet-stream"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    method = "POST" if data is not None else "GET"
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url, data=data, headers=headers, method=method),
+                timeout=30) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:300]
+        raise SystemExit(f"live-feed: {url} answered {error.code}: {detail}") from error
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Stream audio into a live session and print the translation.")
+    parser.add_argument("--url", default="http://127.0.0.1:8099", help="meeting-job base URL")
+    parser.add_argument("--token", default=os.environ.get("MEETING_TOKEN", ""),
+                        help="bearer token (default $MEETING_TOKEN)")
+    parser.add_argument("--input", required=True,
+                        help="ffmpeg input: a file, or a device such as "
+                             "\"avfoundation::BlackHole 2ch\" or \"pulse:my.monitor\"")
+    parser.add_argument("--language", default="", help="spoken language (de, it, ...: auto)")
+    parser.add_argument("--to", default="it", help="translate into this language (default it)")
+    parser.add_argument("--session", default=None, help="session id (default: a random one)")
+    parser.add_argument("--realtime", action="store_true", default=True,
+                        help="pace the input to realtime (default; --no-realtime to go faster)")
+    parser.add_argument("--no-realtime", dest="realtime", action="store_false")
+    args = parser.parse_args()
+
+    base = args.url.rstrip("/")
+    session = args.session or uuid.uuid4().hex[:12]
+    query = urllib.parse.urlencode({"language": args.language, "to": args.to})
+    audio_url = f"{base}/live/{session}/audio?{query}"
+    view_url = f"{base}/live/{session}"
+
+    command = ["ffmpeg", "-v", "error", "-nostdin"]
+    if args.realtime:
+        command.append("-re")
+    command += ["-i", args.input, "-vn", "-ar", "16000", "-ac", "1", "-f", "s16le", "-"]
+    decoder = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    cursor, printed, status, heard = 0, set(), "", False
+    try:
+        while True:
+            chunk = decoder.stdout.read(CHUNK)
+            if not chunk:
+                break
+            if len(chunk) % 2:
+                chunk = chunk[:-1]
+            heard = True
+            request(audio_url, args.token, chunk)
+            view = request(f"{view_url}?since={cursor}", args.token)
+            cursor = view.get("cursor", cursor)
+            for row in view.get("rows", []):
+                index = row["i"]
+                if row.get("done") and index not in printed:
+                    printed.add(index)
+                    text = (row.get("mt") or row.get("error") or "").strip()
+                    print(f"\r{row['src']}\n  → {text}\n", flush=True)
+                    status = ""
+                elif not row.get("done") and sys.stdout.isatty():
+                    # a one-line preview while the translation grows; only for a
+                    # terminal, or a pipe would fill with carriage returns
+                    status = "  … " + (row.get("mt") or "").strip()[-60:]
+                    print(f"\r\033[K{status}", end="", flush=True)
+            if not decoder.poll() and not status:
+                time.sleep(POLL / 2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        decoder.terminate()
+        decoder.wait(timeout=10)
+        request(f"{base}/live/{session}/close", args.token, b"")
+        # the last line is still being transcribed when close returns
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            view = request(f"{view_url}?since={cursor}", args.token)
+            cursor = view.get("cursor", cursor)
+            fresh = [row for row in view.get("rows", []) if row["i"] not in printed]
+            for row in fresh:
+                if row.get("done"):
+                    printed.add(row["i"])
+                    print(f"\r{row['src']}\n  → {(row.get('mt') or row.get('error') or '').strip()}\n")
+            # `done`, not `open`: close returns before the last clip is even
+            # transcribed, and a session with no rows yet looks finished.
+            if view.get("done") and not fresh:
+                break
+            time.sleep(0.5)
+        if not heard:
+            detail = decoder.stderr.read().decode(errors="replace").strip()
+            print(f"live-feed: ffmpeg produced no audio{': ' + detail if detail else ''}",
+                  file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

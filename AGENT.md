@@ -18,6 +18,7 @@ diarizer-nemotron/        NVIDIA Nemotron-3-Diarization via transformers (defaul
 dashboard/src/            React + shadcn/ui source of the web UI
 dashboard.html            built, inlined single file — what :8099 serves
 live.html                 the live page at GET /live: capture, transcript, translation
+live-feed                 the same live API as a CLI: ffmpeg input (file or device) -> lines
 systemd/meeting-job.service
 test_meeting.py
 ```

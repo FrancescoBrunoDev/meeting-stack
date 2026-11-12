@@ -336,6 +336,33 @@ What it is not:
   noise suppression eats the quiet half of the other person's voice. The input
   list only fills once the page has the microphone permission.
 
+### Feeding it without a browser
+
+`live-feed` is the same API as a script: ffmpeg reads the input (a file, or a
+device) and the tool posts half-second chunks, printing each line with its
+translation as it lands. That is the way in on macOS with Zen or Firefox, which
+have no audio in `getDisplayMedia`, and for a call in a native app:
+
+```sh
+# macOS, the system audio of a Zoom/Teams call through BlackHole
+./live-feed --url http://box:8099 --token "$TOKEN" --language de --to it \
+    --input "avfoundation::BlackHole 2ch"
+
+# Linux, the monitor of the speakers (pactl list short sources | grep monitor)
+./live-feed --language de --to it --input "pulse:alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+
+# a recording, replayed at realtime speed into the live path
+./live-feed --language de --to it --input meeting.m4a
+```
+
+The endpoint contract, if you write your own client: `POST /live/<id>/audio`
+with raw **16 kHz mono PCM16** (half a second at a time is plenty, `?language=de&to=it`
+on the first one), `GET /live/<id>?since=<cursor>` until `done` is true, then
+`POST /live/<id>/close`. The token goes in the `Authorization` header; the first
+chunk creates the session and takes the GPU lock (409 if a job has it). Every
+row carries `i` (its index), `src`, `mt`, `done`, and `error` when it did not
+work; `state` and `buffered` describe what the worker is doing meanwhile.
+
 Flags: `--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
 the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
 is where the LLM lives, `--live-idle 120` closes a session that stopped sending

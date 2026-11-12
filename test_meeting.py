@@ -938,6 +938,10 @@ class LiveLines(unittest.TestCase):
         self.assertEqual(session.view(0)["buffered"], 0.8)
         session._set_state("asr")
         self.assertEqual(session.view(0)["state"], "asr")
+        self.assertFalse(session.view(0)["done"])
+        session.close()
+        self.drain(session)
+        self.assertTrue(session.view(0)["done"])
 
     def test_a_change_of_voice_ends_the_line_without_a_pause(self):
         # Two people talking without pausing: only the voice tells them apart.
