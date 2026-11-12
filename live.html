@@ -4,50 +4,95 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Live · meeting-stack</title>
 <style>
-  :root { --bg:#0b0c10; --panel:#14161c; --line:#262a34; --fg:#e8eaf0; --dim:#8b93a7;
-          --mt:#7fd1b9; --err:#ff8a80; }
-  @media (prefers-color-scheme: light) {
-    :root { --bg:#f7f8fa; --panel:#fff; --line:#e2e5ec; --fg:#11141a; --dim:#5c6474;
-            --mt:#0f7a5f; --err:#c62828; }
+  /* The tokens are the dashboard's (dashboard/src/index.css, shadcn neutral):
+     the two pages are one product, and this one is not React, so it borrows the
+     palette and the shapes instead of the components. */
+  :root {
+    --radius: 0.625rem;
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --background: oklch(0.145 0 0);
+      --foreground: oklch(0.985 0 0);
+      --card: oklch(0.205 0 0);
+      --primary: oklch(0.922 0 0);
+      --primary-foreground: oklch(0.205 0 0);
+      --secondary: oklch(0.269 0 0);
+      --secondary-foreground: oklch(0.985 0 0);
+      --muted: oklch(0.269 0 0);
+      --muted-foreground: oklch(0.708 0 0);
+      --destructive: oklch(0.704 0.191 22.216);
+      --border: oklch(1 0 0 / 10%);
+      --input: oklch(1 0 0 / 15%);
+      --ring: oklch(0.556 0 0);
+    }
   }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { position:sticky; top:0; display:flex; flex-wrap:wrap; gap:8px; align-items:center;
-           padding:12px 16px; background:var(--bg); border-bottom:1px solid var(--line); }
-  button, select, input { font:inherit; color:var(--fg); background:var(--panel);
-           border:1px solid var(--line); border-radius:8px; padding:7px 11px; }
-  #device { max-width:220px; }
-  label.check, label.field { display:flex; align-items:center; gap:5px;
-           font-size:12px; color:var(--dim); }
-  label.field select { padding:5px 8px; }
-  header .sep { width:1px; height:22px; background:var(--line); margin:0 2px; }
-  button { cursor:pointer; }
-  button:disabled, select:disabled { opacity:.45; cursor:default; }
-  button.on { border-color:var(--mt); color:var(--mt); }
-  #status { margin-left:auto; color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
-  #vu { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--dim); }
-  #level { width:96px; height:10px; border:1px solid var(--line); border-radius:99px;
-           overflow:hidden; }
-  #level i { display:block; height:100%; width:0; background:var(--mt); }
-  #banner { border:1px solid var(--err); color:var(--err); border-radius:8px;
-            padding:10px 12px; margin:8px 0 4px; line-height:1.5; }
-  #token { width:190px; }
+  body { margin:0; background:var(--background); color:var(--foreground);
+         font:14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         -webkit-font-smoothing:antialiased; }
+  header { position:sticky; top:0; z-index:10; display:flex; flex-wrap:wrap; gap:8px;
+           align-items:center; padding:12px 16px; background:var(--background);
+           border-bottom:1px solid var(--border); }
+  button { font:inherit; font-size:14px; font-weight:500; height:36px; padding:0 16px;
+           border:1px solid var(--border); border-radius:var(--radius); cursor:pointer;
+           color:var(--primary-foreground); background:var(--primary); }
+  button.secondary { color:var(--secondary-foreground); background:var(--secondary);
+           border-color:transparent; }
+  button.on { box-shadow:inset 0 0 0 2px var(--ring); }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline:2px solid var(--ring); outline-offset:2px; }
+  select, input { font:inherit; font-size:14px; height:36px; padding:0 10px;
+           color:var(--foreground); background:var(--background);
+           border:1px solid var(--input); border-radius:calc(var(--radius) - 2px); }
+  #device { width:200px; }
+  #token { width:150px; }
+  label.check, label.field { display:flex; align-items:center; gap:6px;
+           font-size:14px; color:var(--muted-foreground); }
+  label.field select { height:32px; }
+  label.check input { height:auto; }
+  header .sep { width:1px; height:24px; background:var(--border); margin:0 4px; }
+  #status { margin-left:auto; color:var(--muted-foreground); font-size:14px;
+            font-variant-numeric:tabular-nums; }
+  #vu { display:flex; align-items:center; gap:8px; font-size:12px;
+        color:var(--muted-foreground); }
+  /* the shape of shadcn's Progress: muted track, primary fill, no border */
+  #level { width:96px; height:8px; border-radius:99px; overflow:hidden;
+           background:var(--muted); }
+  #level i { display:block; height:100%; width:0; background:var(--primary); }
   main { padding:8px 16px 48px; max-width:1180px; }
-  .row { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:10px 0;
-         border-bottom:1px solid var(--line); }
-  .src { white-space:pre-wrap; }
-  .mt { color:var(--mt); white-space:pre-wrap; }
-  .err { grid-column:1/-1; color:var(--err); font-size:13px; }
-  .hint { color:var(--dim); padding:24px 0; max-width:70ch; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:24px; padding:14px 0;
+         border-bottom:1px solid var(--border); }
+  .src { color:var(--muted-foreground); white-space:pre-wrap; }
+  .mt { color:var(--foreground); white-space:pre-wrap; }
+  .err { grid-column:1/-1; color:var(--destructive); font-size:13px; }
+  .hint { color:var(--muted-foreground); padding:24px 0; max-width:70ch; }
+  .hint b { font-weight:600; color:var(--foreground); }
+  #banner { border:1px solid var(--destructive); color:var(--destructive);
+            border-radius:var(--radius); padding:12px 14px; margin:8px 0 4px;
+            line-height:1.6; }
   @media (max-width:700px) { .row { grid-template-columns:1fr; gap:4px; } }
 </style>
 
 <header>
   <button id="mic">Microfono</button>
-  <button id="system" title="in Chrome: una scheda o lo schermo intero, con l'audio.
+  <button id="system" class="secondary" title="in Chrome: una scheda o lo schermo intero, con l'audio.
 In Firefox e Zen questo non esiste: usa un dispositivo virtuale come ingresso.">Audio di sistema</button>
-  <button id="stop" disabled>Ferma</button>
+  <button id="stop" class="secondary" disabled>Ferma</button>
   <select id="device" title="ingresso audio">
     <option value="">microfono predefinito</option>
   </select>
