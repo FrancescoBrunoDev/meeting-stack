@@ -325,6 +325,14 @@ What it is not:
 - **The microphone needs a secure context.** `getUserMedia` is refused on plain
   `http://` to another host: open the page as `http://127.0.0.1:8099/live` on the
   box, or behind https. Tab audio (`getDisplayMedia`) needs the same.
+- **System audio on macOS.** Chrome never gives audio from a *window*: share a
+  **tab** (only the browser's own sound) or, from Chrome 141, the **entire
+  screen** with "Condividi l'audio di sistema". For a call in a desktop app (Zoom,
+  Teams) neither works — install BlackHole 2ch, route the output through it (a
+  Multi-Output Device keeps it audible), then pick **BlackHole** as the input in
+  the page and untick "filtri voce": noise suppression would eat the other
+  person's voice. The input list appears once the page has the microphone
+  permission, so it fills after the first attempt.
 
 Flags: `--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
 the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)

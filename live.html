@@ -17,6 +17,8 @@
            padding:12px 16px; background:var(--bg); border-bottom:1px solid var(--line); }
   button, select, input { font:inherit; color:var(--fg); background:var(--panel);
            border:1px solid var(--line); border-radius:8px; padding:7px 11px; }
+  #device { max-width:220px; }
+  label.check { display:flex; align-items:center; gap:5px; font-size:12px; color:var(--dim); }
   button { cursor:pointer; }
   button:disabled, select:disabled { opacity:.45; cursor:default; }
   button.on { border-color:var(--mt); color:var(--mt); }
@@ -43,6 +45,11 @@
   <button id="mic">Microfono</button>
   <button id="system">Audio di sistema</button>
   <button id="stop" disabled>Ferma</button>
+  <select id="device" title="ingresso audio">
+    <option value="">microfono predefinito</option>
+  </select>
+  <label class="check" title="per un dispositivo virtuale (BlackHole, Loopback) vanno tolti">
+    <input type="checkbox" id="processing" checked>filtri voce</label>
   <select id="language" title="lingua parlata">
     <option value="de">lingua: de</option>
     <option value="">lingua: auto</option>
@@ -81,6 +88,27 @@
   let ctx = null, mix = null, node = null, streams = [], id = null, watch = null, cursor = 0;
   let timer = null, chain = Promise.resolve(), pending = [], samples = 0;
   $("token").value = new URLSearchParams(location.search).get("token") || "";
+  const mac = /Mac/i.test(navigator.userAgentData ? navigator.userAgentData.platform
+                                                  : navigator.userAgent);
+
+  // Inputs, not just the default one: on macOS the only reliable way to the
+  // *system* audio is a virtual device (BlackHole, Loopback) picked here.
+  async function devices() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    try {
+      const inputs = (await navigator.mediaDevices.enumerateDevices())
+        .filter((device) => device.kind === "audioinput" && device.label);
+      const select = $("device");
+      const chosen = select.value;
+      select.replaceChildren(new Option("microfono predefinito", ""));
+      for (const device of inputs) select.append(new Option(device.label, device.deviceId));
+      if ([...select.options].some((option) => option.value === chosen)) select.value = chosen;
+    } catch (error) {
+      // no permission yet: the default entry is all we can offer
+    }
+  }
+  devices();
+  if (navigator.mediaDevices) navigator.mediaDevices.addEventListener?.("devicechange", devices);
   // A silent refusal is the default failure here: no prompt, no error, nothing.
   // Say it in the page, in words that name the fix.
   const canCapture = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -245,6 +273,8 @@
     $("stop").disabled = !on;
     $("language").disabled = on;
     $("target").disabled = on;
+    $("device").disabled = on;
+    $("processing").disabled = on;
     $("token").hidden = on;
   }
 
@@ -266,9 +296,17 @@
   $("mic").onclick = async () => {
     if (!graph()) return;
     try {
+      const device = $("device").value;
+      // A virtual loopback device must not be filtered: noise suppression eats
+      // exactly the quiet half of the other person's voice.
+      const plain = !$("processing").checked;
       await addStream(await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }));
+        audio: Object.assign({ channelCount: 1 },
+          plain ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+                : { echoCancellation: true, noiseSuppression: true },
+          device ? { deviceId: { exact: device } } : {}) }));
       $("mic").classList.add("on");
+      devices();                       // labels appear once permission is given
     } catch (error) {
       banner("microfono: " + error.message + " — guarda l'icona del microfono nella barra " +
              "degli indirizzi: se il permesso è stato negato una volta, il browser non lo " +
@@ -287,8 +325,14 @@
       await addStream(stream);
       $("system").classList.add("on");
     } catch (error) {
-      banner("audio di sistema: " + error.message + " — su Chrome la condivisione deve " +
-             "partire da una scheda, non da una finestra, e con «Condividi l'audio» attivo.");
+      banner("audio di sistema: " + error.message + " — " + (mac
+        ? "su macOS Chrome non dà audio dalle finestre: scegli «Scheda» (solo audio del " +
+          "browser) oppure «Schermo intero» con «Condividi l'audio di sistema» (Chrome 141+). " +
+          "Per la call di un'app (Zoom, Teams) l'unica via affidabile è un dispositivo " +
+          "virtuale: installa BlackHole 2ch, scegli BlackHole qui accanto come ingresso e " +
+          "togli «filtri voce»."
+        : "su Chrome la condivisione deve partire da una scheda (o dallo schermo intero), " +
+          "non da una finestra, e con «Condividi l'audio» attivo."));
     }
   };
 
