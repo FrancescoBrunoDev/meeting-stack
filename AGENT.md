@@ -109,6 +109,15 @@ bite:
   overlap; the service accepts the same path as the `diarization` job option.
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
+- `--translate-format translategemma` is not cosmetic. TranslateGemma's template
+  takes the languages as *fields* of the user content; llama.cpp's OpenAI endpoint
+  passes only `text`, so the model falls back to English whatever the prompt says
+  (measured: "She had been commissioned by Högel…" for a German line asked in
+  Italian). The template is rendered in `translategemma_prompt()` and the request
+  goes to `/v1/completions`, which accepts a raw prompt and streams
+  `choices[0].text` instead of `delta.content`. It has no context lines: the
+  model translates one line at a time, and on the Tagesschau lines it beat the
+  27B on wording while running 40% faster (28 tok/s against 20).
 - The 27B behind `--translate-model` is loaded by Lemonade with a persisted
   `ctx_size`. It was 262144, which cost 41.5 GB of iGPU GTT for prompts that are
   ~160 tokens long; at 16384 the same box sits at 24.6 GB and generates at the

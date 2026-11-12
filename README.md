@@ -375,6 +375,19 @@ chunk creates the session and takes the GPU lock (409 if a job has it). Every
 row carries `i` (its index), `src`, `mt`, `done`, and `error` when it did not
 work; `state` and `buffered` describe what the worker is doing meanwhile.
 
+The translator can be a **translation-specific model**. TranslateGemma is
+measured at 28 tok/s against the 27B's 20 with at least the same quality on real
+Tagesschau lines — but it needs its own prompt template (source and target
+language as fields, not an instruction), and llama.cpp's OpenAI shim drops those
+fields: with an instruction prompt the model answers **in English**. Hence
+`--translate-format translategemma`, which renders the template here and posts to
+`/v1/completions`:
+
+```sh
+lemonade pull bullerwins/translategemma-12b-it-GGUF:Q4_K_M     # 6.8 GB
+meeting-job --translate-model translategemma-12b-it-GGUF-Q4_K_M             --translate-format translategemma
+```
+
 Flags for the live path: `--live-asr`/`--live-model` point it at a faster
 endpoint than the jobs use — a clip every half second makes the fixed cost of a
 request the budget, and Whisper through Lemonade answers in 0.24 s against gufo's

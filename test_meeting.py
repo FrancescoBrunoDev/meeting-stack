@@ -685,7 +685,7 @@ class LiveSession(unittest.TestCase):
             rows.append(("asr", len(pcm)))
             return text
 
-        def translate(src, target, context, on_token=None):
+        def translate(src, target, context, on_token=None, source=""):
             rows.append(("mt", target, list(context)))
             if on_token is not None:
                 on_token(translated[:4])
@@ -728,7 +728,7 @@ class LiveSession(unittest.TestCase):
         # Streaming: the page has something to rewrite while the tokens arrive.
         seen = []
 
-        def translate(src, target, context, on_token=None):
+        def translate(src, target, context, on_token=None, source=""):
             on_token("Buon")
             seen.extend(session.view(0)["rows"])
             return "Buongiorno"
@@ -787,7 +787,7 @@ class LiveSession(unittest.TestCase):
             raise OSError("connection refused")
 
         session = meeting_job.LiveSession(
-            types.SimpleNamespace(transcribe=transcribe, translate=lambda *a: "",
+            types.SimpleNamespace(transcribe=transcribe, translate=lambda *a, **k: "",
                                   settled=lambda session: None,
                                      embedder="", speaker=meeting_job.LIVE_SPEAKER), "de", "it")
         session.feed(self.speech() + b"\x00\x00" * 16000)
@@ -833,7 +833,7 @@ class LiveLines(unittest.TestCase):
     def fake(self, calls):
         return types.SimpleNamespace(
             transcribe=lambda pcm, language: "",
-            translate=lambda src, target, context, on_token=None: (
+            translate=lambda src, target, context, on_token=None, source="": (
                 calls.append(src), "tradotto")[1],
             settled=lambda session: None,
                                      embedder="", speaker=meeting_job.LIVE_SPEAKER)
@@ -876,7 +876,7 @@ class LiveLines(unittest.TestCase):
         calls = []
         answers = iter(["Heute im Studio.", "", ""])   # the first line translates
 
-        def translate(src, target, context, on_token=None):
+        def translate(src, target, context, on_token=None, source=""):
             calls.append(list(context))
             return next(answers)
 
@@ -895,7 +895,7 @@ class LiveLines(unittest.TestCase):
         # that keys on it moves on, and the page keeps "aveva affid" for ever.
         cursors = []
 
-        def translate(src, target, context, on_token=None):
+        def translate(src, target, context, on_token=None, source=""):
             on_token("aveva")
             cursors.append(session.view(0)["cursor"])
             on_token("aveva affidato al suo agente pubblicitario Högel.")
@@ -920,7 +920,7 @@ class LiveLines(unittest.TestCase):
         calls = []
         fake = types.SimpleNamespace(
             transcribe=lambda pcm, language: "", settled=lambda session: None,
-            translate=lambda src, target, context, on_token=None: (
+            translate=lambda src, target, context, on_token=None, source="": (
                 calls.append(src), "tradotto")[1])
         session = meeting_job.LiveSession(fake, "de", "it")
         session._hear(long_de, closed=False)     # no pause, and past 220 characters
@@ -950,7 +950,7 @@ class LiveLines(unittest.TestCase):
         clips = iter(["Guten Abend, ich begrüsse Sie.", "Bei der Bundeswehr gibt es mehr Gewalt."])
         fake = types.SimpleNamespace(
             transcribe=lambda pcm, language: next(clips),
-            translate=lambda src, target, context, on_token=None: (
+            translate=lambda src, target, context, on_token=None, source="": (
                 calls.append(src), "tradotto")[1],
             embed=lambda pcm: next(voices),
             settled=lambda session: None, embedder="img", speaker=meeting_job.LIVE_SPEAKER)
@@ -969,7 +969,7 @@ class LiveLines(unittest.TestCase):
         calls = []
         fake = types.SimpleNamespace(
             transcribe=lambda pcm, language: "und das ist wichtig.",
-            translate=lambda src, target, context, on_token=None: (
+            translate=lambda src, target, context, on_token=None, source="": (
                 calls.append(src), "tradotto")[1],
             embed=lambda pcm: [1.0, 0.0, 0.0],
             settled=lambda session: None, embedder="img", speaker=meeting_job.LIVE_SPEAKER)
@@ -988,7 +988,7 @@ class LiveLines(unittest.TestCase):
         calls = []
         fake = types.SimpleNamespace(
             transcribe=lambda pcm, language: "Guten Abend.",
-            translate=lambda src, target, context, on_token=None: (
+            translate=lambda src, target, context, on_token=None, source="": (
                 calls.append(src), "Buonasera.")[1],
             settled=lambda session: None, embedder="", speaker=meeting_job.LIVE_SPEAKER)
         session = meeting_job.LiveSession(fake, "de", "it")

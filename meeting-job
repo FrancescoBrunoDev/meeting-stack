@@ -664,6 +664,26 @@ LANG_NAMES = {"it": "Italian", "en": "English", "de": "German", "fr": "French",
               "es": "Spanish", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
               "ru": "Russian", "tr": "Turkish", "sv": "Swedish", "ja": "Japanese",
               "zh": "Chinese", "ar": "Arabic"}
+TRANSLATEGEMMA = "translategemma"
+
+
+def translategemma_prompt(text: str, source: str, target: str) -> str:
+    """The prompt TranslateGemma's own chat template builds, rendered here.
+
+    The model takes the source and target languages as structured fields its
+    template turns into this text; llama.cpp's OpenAI shim drops them, and
+    without them the model translates into English whatever the instruction says
+    (measured). So the template is applied on this side and the request goes to
+    /v1/completions, which takes a raw prompt.
+    """
+    source_name = LANG_NAMES.get((source or "de").lower(), source or "German")
+    target_name = LANG_NAMES.get(target.lower(), target or "Italian")
+    return (f"<start_of_turn>user\nProduce only the {target_name} translation, without any "
+            f"additional explanations or commentary. Please translate the following "
+            f"{source_name} text into {target_name}:\n\n\n{text}"
+            "<end_of_turn>\n<start_of_turn>model\n")
+
+
 def translate_prompt(target: str) -> str:
     """The system prompt, with the language *name*: a bare code gets misread."""
     return TRANSLATE_PROMPT.format(target=LANG_NAMES.get(target.lower(), target or "English"))
@@ -985,10 +1005,10 @@ class LiveSession:
 
         self._set_state("mt")
         try:
-            translated = self.live.translate(text, self.target, context, grew)
+            translated = self.live.translate(text, self.target, context, grew, self.language)
             if not translated and context:
                 # An empty answer is not an answer: try once without the context.
-                translated = self.live.translate(text, self.target, [], None)
+                translated = self.live.translate(text, self.target, [], None, self.language)
         except (OSError, ValueError) as error:
             with self._lock:
                 self.rows[row]["error"] = str(error)[:300]
@@ -1015,7 +1035,7 @@ class Live:
                  lock_path: Path, idle: float = 120, glossary: str = "",
                  silence: float = LIVE_LINE, embedder: str = "",
                  speaker: float = LIVE_SPEAKER, live_asr: str = "",
-                 live_model: str = "") -> None:
+                 live_model: str = "", translate_format: str = "") -> None:
         # The live path can use its own endpoint: a clip every half second makes
         # the fixed cost of a request the whole budget (gufo 0.78 s, Whisper
         # through Lemonade 0.24 s, measured), and the jobs keep their own choice.
@@ -1023,6 +1043,7 @@ class Live:
         self.model = live_model or model
         self.llm = llm.rstrip("/")
         self.translate_model = translate_model
+        self.translate_format = translate_format
         self.glossary = glossary
         self.idle = idle
         self.silence = silence
@@ -1150,34 +1171,49 @@ class Live:
             process.kill()
 
     def translate(self, src: str, target: str, context: list[str],
-                  on_token=None) -> str:
+                  on_token=None, source: str = "") -> str:
         """The line in the target language; `on_token` gets every partial text.
 
-        Streaming is what makes the page feel live: the generation is 0.4-0.5 s
-        for a short line, and showing it grow beats waiting for the whole thing.
+        Streaming is what makes the page feel live: a short line is under a
+        second, and showing it grow beats waiting for the whole thing. Two shapes:
+        an instruct model through /v1/chat/completions with the previous pairs as
+        context, or a translation model with its own template.
         """
         if not src or not self.translate_model:
             return ""
-        content = "".join(f"Context line: {line}\n" for line in context)
-        content += f"\nTranslate this line:\n{src}"
-        system = translate_prompt(target)
-        if self.glossary:
-            system += f" Keep these spellings unchanged: {self.glossary}."
-        payload = {
-            "model": self.translate_model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": content}],
-            "max_tokens": 400, "temperature": 0,
-            "stream": on_token is not None,
-            # A thinking model spends the whole budget before it answers.
-            "chat_template_kwargs": {"enable_thinking": False}}
+        if self.translate_format == TRANSLATEGEMMA:
+            url = self.llm + "/v1/completions"
+            payload = {"model": self.translate_model,
+                       "prompt": translategemma_prompt(src, source, target),
+                       "max_tokens": 400, "temperature": 0}
+            def piece_of(choice: dict) -> str:
+                return choice.get("text") or ""
+        else:
+            content = "".join(f"Context line: {line}\n" for line in context)
+            content += f"\nTranslate this line:\n{src}"
+            system = translate_prompt(target)
+            if self.glossary:
+                system += f" Keep these spellings unchanged: {self.glossary}."
+            url = self.llm + "/v1/chat/completions"
+            payload = {
+                "model": self.translate_model,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": content}],
+                "max_tokens": 400, "temperature": 0,
+                # A thinking model spends the whole budget before it answers.
+                "chat_template_kwargs": {"enable_thinking": False}}
+            def piece_of(choice: dict) -> str:
+                return (choice.get("delta") or {}).get("content") or ""
+        payload["stream"] = on_token is not None
         request = urllib.request.Request(
-            self.llm + "/v1/chat/completions", data=json.dumps(payload).encode(),
+            url, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=60) as response:
             if on_token is None:
                 answer = json.loads(response.read())
-                return str(answer["choices"][0]["message"].get("content") or "").strip().strip('"')
+                choice = answer["choices"][0]
+                text = choice["message"].get("content") if "message" in choice else choice.get("text")
+                return str(text or "").strip().strip('"')
             text = ""
             for line in response:
                 line = line.strip()
@@ -1187,7 +1223,7 @@ class Live:
                 if line.startswith(b"[DONE]"):
                     break
                 try:
-                    piece = json.loads(line)["choices"][0]["delta"].get("content") or ""
+                    piece = piece_of(json.loads(line)["choices"][0])
                 except (ValueError, KeyError, IndexError):
                     continue
                 if piece:
@@ -1599,6 +1635,9 @@ def main() -> None:
     parser.add_argument("--translate-model", default="",
                         help="chat model that translates the live lines, e.g. "
                              "Qwen3.8-27B-GGUF; empty serves the live transcript untranslated")
+    parser.add_argument("--translate-format", default="",
+                        help="'translategemma' for Google's translation models: they need their "
+                             "own prompt template, or they answer in English")
     parser.add_argument("--live-idle", type=float, default=120,
                         help="seconds a live session may go without audio before it closes "
                              "(default 120)")
@@ -1625,7 +1664,8 @@ def main() -> None:
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
     live = Live(args.asr, args.model, args.translate_url, args.translate_model,
                 args.lock, args.live_idle, args.live_glossary, args.live_silence,
-                args.live_embedder, args.live_speaker, args.live_asr, args.live_model)
+                args.live_embedder, args.live_speaker, args.live_asr, args.live_model,
+                args.translate_format)
     server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload, live)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     translate = args.translate_model or "no translation (--translate-model is empty)"
