@@ -131,8 +131,10 @@ bite:
   an empty `content`). The row is appended **before** translating and the answer
   is read as SSE (`stream: true`), each partial written into the row: the page
   follows the cursor and rewrites the cells of the row it names, which is why
-  `view()` sends `i` with every row — and why **the cursor stops at the first row
-  still being translated**: a cursor that moved past an in-flight row left it on
+  `view()` sends `i` with every row — plus `state` (`idle`/`asr`/`mt`) and
+  `buffered` (seconds of audio held back waiting for a pause), because ten silent
+  seconds of speech read as a broken program — and why **the cursor stops at the
+  first row still being translated**: a cursor that moved past an in-flight row left it on
   "…" for ever, because the worker translates a row that is not the last one.
   The marker is the row's own `done`, **not** `mt`: with streaming `mt` is
   non-empty from the first token, and keying on it abandoned rows half way

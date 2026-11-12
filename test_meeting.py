@@ -908,3 +908,13 @@ class LiveLines(unittest.TestCase):
         self.assertLess(len(calls[0]), len(long_de))
         self.assertTrue(session.rows[0]["done"])
         self.assertFalse(session.rows[-1]["done"], "the rest waits in its own line")
+
+    def test_the_view_says_what_the_worker_is_doing(self):
+        # "Nothing on screen" has to be distinguishable from "broken".
+        session = meeting_job.LiveSession(self.fake([]), "de", "it")
+        self.assertEqual(session.view(0)["state"], "idle")
+        self.assertEqual(session.view(0)["buffered"], 0.0)
+        session.feed(b"\x00\x00" * 12000)          # 0.75 s of audio, no pause yet
+        self.assertEqual(session.view(0)["buffered"], 0.8)
+        session._set_state("asr")
+        self.assertEqual(session.view(0)["state"], "asr")

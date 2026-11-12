@@ -20,7 +20,11 @@
   button { cursor:pointer; }
   button:disabled, select:disabled { opacity:.45; cursor:default; }
   button.on { border-color:var(--mt); color:var(--mt); }
-  #status { margin-left:auto; color:var(--dim); font-size:13px; }
+  #status { margin-left:auto; color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
+  #level { width:76px; height:8px; border:1px solid var(--line); border-radius:99px;
+           overflow:hidden; }
+  #level i { display:block; height:100%; width:0; background:var(--mt);
+             transition:width .12s linear; }
   #banner { border:1px solid var(--err); color:var(--err); border-radius:8px;
             padding:10px 12px; margin:8px 0 4px; line-height:1.5; }
   #token { width:190px; }
@@ -49,6 +53,7 @@
     <option value="de">→ de</option><option value="fr">→ fr</option>
   </select>
   <input id="token" placeholder="token" autocomplete="off">
+  <div id="level" title="livello del microfono"><i></i></div>
   <span id="status">pronto</span>
 </header>
 
@@ -122,6 +127,18 @@
     return true;
   }
 
+  function level(bytes) {
+    // The bar is the only proof the microphone reaches the page while the
+    // transcript says nothing: it moves with the voice, and falls on silence.
+    let peak = 0;
+    for (let i = 0; i < bytes.length; i += 2) {
+      const value = Math.abs(((bytes[i] | (bytes[i + 1] << 8)) << 16) >> 16);
+      if (value > peak) peak = value;
+    }
+    $("level").firstElementChild.style.width =
+      Math.min(100, Math.round((peak / 32768) * 300)) + "%";
+  }
+
   function flush() {
     if (!samples || !id) return;
     const bytes = new Uint8Array(samples * 2);
@@ -132,6 +149,7 @@
     }
     pending = [];
     samples = 0;
+    level(bytes);
     const query = `?language=${encodeURIComponent($("language").value)}` +
                   `&to=${encodeURIComponent($("target").value)}`;
     const session = id;
@@ -186,10 +204,20 @@
       const view = await response.json();
       for (const row of view.rows) draw(session, row);
       cursor = view.cursor;
+      progress(view);
       if (!view.open && !view.rows.length) finish();
     } catch (error) {
       say("rete: " + error.message);
     }
+  }
+
+  function progress(view) {
+    // "Nothing on screen" has three different meanings, and saying which one is
+    // the difference between waiting and thinking it is broken.
+    if (view.state === "asr") say("trascrivo…");
+    else if (view.state === "mt") say("traduco…");
+    else if (view.buffered >= 0.5) say(view.buffered.toFixed(1) + " s in attesa di una pausa");
+    else say("in ascolto");
   }
 
   function finish() {
@@ -260,6 +288,7 @@
     streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
     streams = [];
     if (ctx) { ctx.close().catch(() => {}); ctx = null; mix = null; node = null; }
+    $("level").firstElementChild.style.width = "0";
     $("mic").classList.remove("on");
     $("system").classList.remove("on");
     running(false);

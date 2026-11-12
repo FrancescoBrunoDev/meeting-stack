@@ -290,6 +290,11 @@ sentence to be translated. A line that never finds a pause is translated anyway
 after 500 characters or 10 s. A speaker who does not pause for 20 s is cut anyway,
 at the quietest frame.
 
+While a stretch of speech has not reached a pause yet, the page says how many
+seconds are held back (`2.8 s in attesa di una pausa`), then `trascrivo…` and
+`traduco…`, and a level bar moves with the microphone: a transcript that stays
+empty for ten seconds is supposed to look busy, not broken.
+
 The two lines before the current one go back to the model **as source and
 translation pairs** (`Wir müssen… -> Dobbiamo…`), so the wording of the line
 continues the wording already on screen. `--live-glossary "Candido,BSB,Zoom"`

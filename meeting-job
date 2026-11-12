@@ -771,6 +771,9 @@ class LiveSession:
         self._pending = ""
         self._pending_row = 0
         self._pending_at = 0.0
+        # What the worker is doing right now, for the page: silence on screen
+        # while a 10 s stretch waits for a pause reads as "the thing is broken".
+        self._state = "idle"
         self._queue: queue.Queue = queue.Queue()
         self._lock = threading.RLock()
         threading.Thread(target=self._work, daemon=True).start()
@@ -819,7 +822,11 @@ class LiveSession:
             return {"cursor": cursor, "open": not self.closed,
                     "rows": [{"i": index, **row}
                              for index, row in enumerate(self.rows) if index >= since],
-                    "language": self.language, "to": self.target}
+                    "language": self.language, "to": self.target,
+                    # seconds of audio held back waiting for a pause, and what
+                    # the worker is up to: the page has nothing else to show
+                    "buffered": round(len(self._pcm) / LIVE_BYTES_PER_S, 1),
+                    "state": self._state}
 
     def _work(self) -> None:
         while True:
@@ -830,6 +837,7 @@ class LiveSession:
                 self.live.settled(self)     # the GPU is free: a new session may start
                 return
             clip, by_pause = item
+            self._set_state("asr")
             try:
                 src = self.live.transcribe(clip, self.language)
             except (OSError, ValueError) as error:
@@ -838,8 +846,13 @@ class LiveSession:
                     self.rows.append({"src": "", "mt": "", "error": str(error)[:300],
                                       "done": True})
                 continue
+            self._set_state("idle")
             if src:
                 self._hear(src, closed=by_pause)
+
+    def _set_state(self, state: str) -> None:
+        with self._lock:
+            self._state = state
 
     def _hear(self, src: str, closed: bool) -> None:
         """Add a clip's text to the line being built, and close it on a real pause.
@@ -893,6 +906,7 @@ class LiveSession:
             with self._lock:
                 self.rows[row]["mt"] = partial
 
+        self._set_state("mt")
         try:
             translated = self.live.translate(text, self.target, context, grew)
             if not translated and context:
@@ -902,10 +916,12 @@ class LiveSession:
             with self._lock:
                 self.rows[row]["error"] = str(error)[:300]
                 self.rows[row]["done"] = True
+                self._state = "idle"
             return
         with self._lock:
             self.rows[row]["mt"] = translated
             self.rows[row]["done"] = True
+            self._state = "idle"
             if not translated:
                 # Say it, instead of leaving the page on "…" for ever.
                 self.rows[row]["error"] = "the model returned no translation"
