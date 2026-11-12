@@ -21,7 +21,8 @@
   button:disabled, select:disabled { opacity:.45; cursor:default; }
   button.on { border-color:var(--mt); color:var(--mt); }
   #status { margin-left:auto; color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
-  #level { width:76px; height:8px; border:1px solid var(--line); border-radius:99px;
+  #vu { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--dim); }
+  #level { width:64px; height:8px; border:1px solid var(--line); border-radius:99px;
            overflow:hidden; }
   #level i { display:block; height:100%; width:0; background:var(--mt);
              transition:width .12s linear; }
@@ -53,7 +54,8 @@
     <option value="de">→ de</option><option value="fr">→ fr</option>
   </select>
   <input id="token" placeholder="token" autocomplete="off">
-  <div id="level" title="livello del microfono"><i></i></div>
+  <label id="vu" title="livello del microfono">mic
+    <span id="level"><i></i></span></label>
   <span id="status">pronto</span>
 </header>
 
@@ -157,8 +159,9 @@
       .then(() => fetch(`/live/${session}/audio${query}`, { method: "POST", body: bytes, headers: auth() }))
       .then((response) => response.json())
       .then((view) => {
-        if (view.ok) say("in ascolto");
-        else { say(view.error || "errore"); if (!view.open) stop(); }
+        // The label is the poll's job: saying "in ascolto" here overwrote the
+        // counter four times a second and made the header flicker.
+        if (!view.ok) { say(view.error || "errore"); if (!view.open) stop(); }
       })
       .catch((error) => say("rete: " + error.message));
   }
@@ -211,13 +214,23 @@
     }
   }
 
+  // The worker's states are instantaneous and the poll samples them at random:
+  // without a latch the label jumped between "in ascolto" and the real state four
+  // times a second. The seconds counter always moves, which is the real proof
+  // that something is happening.
+  let badge = { state: "idle", at: 0 };
+
   function progress(view) {
-    // "Nothing on screen" has three different meanings, and saying which one is
-    // the difference between waiting and thinking it is broken.
-    if (view.state === "asr") say("trascrivo…");
-    else if (view.state === "mt") say("traduco…");
-    else if (view.buffered >= 0.5) say(view.buffered.toFixed(1) + " s in attesa di una pausa");
-    else say("in ascolto");
+    const now = performance.now();
+    if (view.state === "asr" || view.state === "mt") {
+      badge = { state: view.state, at: now };
+    } else if (now - badge.at > 1200) {
+      badge = { state: "idle", at: now };
+    }
+    const secs = view.buffered.toFixed(1) + " s";
+    if (badge.state === "asr") say("trascrivo… · " + secs);
+    else if (badge.state === "mt") say("traduco… · " + secs);
+    else say("in ascolto · " + secs);
   }
 
   function finish() {

@@ -270,7 +270,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://box:8099/live/demo?since=0"
 curl -X POST -H "Authorization: Bearer $TOKEN" http://box:8099/live/demo/close
 ```
 
-This is not a streaming ASR. A pause of 0.45 s ends an utterance, the utterance
+This is not a streaming ASR. A pause of 0.3 s ends an utterance, the utterance
 goes to the ASR endpoint as one clip. The ASR punctuates every clip as if it
 were a sentence, so its full stops are ignored: the line ends where the speaker
 paused for real, 0.8 s (`--live-silence`), which is what keeps "…gibt es mehr
@@ -295,6 +295,21 @@ seconds are held back (`2.8 s in attesa di una pausa`), then `trascrivo…` and
 `traduco…`, and a level bar moves with the microphone: a transcript that stays
 empty for ten seconds is supposed to look busy, not broken.
 
+A line also ends when **the voice changes**, which is what a pause cannot tell you
+when two people talk without one. That is a disposable diarization: one 28 MB
+3D-Speaker embedding per clip, no clustering, one `podman run` (0.40 s measured,
+and it runs beside the ASR request, so it costs no latency), compared with the
+mean embedding of the line being built. Measured on the box with different texts
+per voice: the same voice scores 0.888-0.954, different voices 0.144-0.408, so
+the threshold is 0.6 (`--live-speaker`). Verified end to end: two voices separated
+by 0.35 s of silence (too short for the line rule) come out as two lines, the same
+voice with the same gap stays one. The limit is a change of voice *inside* one
+clip, which no per-clip embedding can see.
+
+```sh
+podman build -t localhost/halogen-diarizer diarizer/   # the image the embedding runs in
+```
+
 The two lines before the current one go back to the model **as source and
 translation pairs** (`Wir müssen… -> Dobbiamo…`), so the wording of the line
 continues the wording already on screen. `--live-glossary "Candido,BSB,Zoom"`
@@ -314,7 +329,8 @@ What it is not:
 Flags: `--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
 the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
 is where the LLM lives, `--live-idle 120` closes a session that stopped sending
-audio, `--live-glossary`, `--live-silence` (0.45 splits more, 1.2 merges more).
+audio, `--live-glossary`, `--live-silence` (0.5 splits more, 1.2 merges more),
+`--live-embedder` (empty = lines end on pauses only) and `--live-speaker`.
 ASR comes from `--asr`/`--model` like the jobs do, so
 gufo works too but wants an explicit `?language=`. Stopping frees the GPU lock as
 soon as the last utterance is transcribed, not on the next housekeeping tick, so

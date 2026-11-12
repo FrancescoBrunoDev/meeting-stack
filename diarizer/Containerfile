@@ -22,5 +22,6 @@ RUN mkdir -p /models && cd /models \
       https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
 
 COPY diarize.py /diarize.py
+COPY embed.py /embed.py
 
 ENTRYPOINT ["python3", "/diarize.py"]

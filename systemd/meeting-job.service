@@ -27,6 +27,8 @@
 # 226 turns of a German meeting came back in Chinese). Switch back to the
 # one-pass Whisper path with --asr http://127.0.0.1:8731 --model
 # Whisper-Large-v3-Turbo --asr-mode full (Lemonade, do not unload its model).
+# --live-embedder ends a line when the voice changes, not only at a pause
+# (the sherpa image carries the 28 MB 3D-Speaker embedding).
 # --translate-model turns on live translation at GET /live (one line at a time,
 # semi-batch); it loads that model into Lemonade's llm slot and keeps it there.
 # An empty --translate-model serves the live transcript alone.
@@ -52,7 +54,8 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --asr http://127.0.0.1:8097 --model qwen3-asr-1.7b \
   --diarizer nemotron --asr-mode segments \
   --keep-audio \
-  --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF
+  --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
+  --live-embedder localhost/halogen-diarizer
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

@@ -140,23 +140,28 @@ bite:
   non-empty from the first token, and keying on it abandoned rows half way
   ("aveva affid", "Anche lei ne").
   Context is the previous `LIVE_CONTEXT` (2) lines as `source -> translation` pairs, and `--live-glossary` pins names. The
-  row is a **line, not a clip**: `_hear` appends each clip's text to `_pending`
-  and the line closes only when a **pause** ended the clip (`vad_cut` returns
-  `by_pause`; a forced cut at `LIVE_MAX` does not close it). The ASR punctuation
-  is ignored on purpose — gufo and Whisper put a full stop at the end of every
-  clip, and trusting it split "…mehr sexualisierte Gewalt." / "und Fehlverhalten
-  als bislang bekannt." into two rows, each translated as its own sentence. The
-  pause length is `--live-silence` (0.8 s; 0.45 split a broadcast into fragments,
-  0.9 stopped cutting at all on speech that breathes for 0.8 s). A line with no
-  pause is translated after `LIVE_PENDING_CHARS` (500) or `LIVE_PENDING_HOLD`
-  (10 s), and on close. Past `LIVE_PENDING_CHARS` (220) the line is additionally
-  cut at the first full stop after half that — the only place the ASR's
-  punctuation is trusted — so four sentences of broadcast German do not become one
-  row whose translation takes four seconds. Two traps already paid for: a bare ISO code in the prompt
-  is read as an English word ("…code is it"), so `LANG_NAMES` passes the name;
-  and an empty answer (possible on a fragment) is retried once without the
-  context, then written into the row as an error, never left as a silent "…".
-  No speaker labels live.
+  row is a **line, not a clip**: clips are cut tightly (`LIVE_CUT`, 0.3 s) so the
+  ASR sees short requests and two speakers rarely share one; `_hear` appends each
+  clip's text to `_pending` and the line closes on a **longer pause**
+  (`--live-silence`, 0.8 s — `feed` queues a `CLOSE` marker once the silence
+  outlasts it, so the ASR is not involved) **or on a change of voice**.
+  `Live.embed()` runs `diarizer/embed.py` inside `--live-embedder`'s image on a
+  thread beside the ASR request: 0.40 s per clip including the container start,
+  which is why it cannot be serial. The cosine against the running mean of the
+  line's clips picks the split; the threshold is 0.6, measured with different
+  texts (0.888-0.954 within a voice, 0.144-0.408 across). A change of voice
+  *inside* one clip is invisible to a per-clip embedding — that is the reason
+  clips are cut at 0.3 s, and the limit of this approach. Two bugs already paid
+  for here: `feed` used to `return` from inside the cut loop, which made the
+  silence marker dead code, and `--live-silence`'s default (0.8) was silently also
+  the clip cut, so clips spanned two speakers and the embedding averaged them.
+  The ASR punctuation is ignored on purpose — gufo and Whisper put a full stop at
+  the end of every clip, and trusting it split "…mehr sexualisierte Gewalt." /
+  "und Fehlverhalten als bislang bekannt." into two rows, each translated as its
+  own sentence. A line with no pause is translated after `LIVE_PENDING_CHARS`
+  (220, and then cut at a full stop) or `LIVE_PENDING_HOLD` (10 s), and on close.
+  No speaker labels live — the voice only decides *where a line ends*, it never
+  names anybody.
   `Lock(--lock)` for its whole life — **its own instance**, because `flock` on one
   open file description does not exclude itself and reusing `Jobs.lock` would let
   a session and a diarizer overlap. So jobs wait for it and a second session gets

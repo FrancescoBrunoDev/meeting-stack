@@ -632,14 +632,14 @@ class LiveCutting(unittest.TestCase):
     def test_cut_lands_at_the_start_of_the_pause(self):
         cut = meeting_job.vad_cut(self.pcm(1.0, 4000) + self.pcm(1.0, 0), 200)
         self.assertIsNotNone(cut)
-        at, speech, by_pause = cut
+        at, speech = cut
         self.assertTrue(speech)
-        self.assertTrue(by_pause)
         self.assertAlmostEqual(at / meeting_job.LIVE_BYTES_PER_S, 1.0, delta=0.05)
 
     def test_a_short_breath_does_not_end_the_clip(self):
-        # 0.4 s is a breath inside a sentence, not a line boundary
-        self.assertIsNone(meeting_job.vad_cut(self.pcm(1.0, 4000) + self.pcm(0.4, 0), 200))
+        # 0.2 s of silence is a gap between words, not a clip boundary: clips are
+        # cut tightly because the line, not the clip, is what must stay whole
+        self.assertIsNone(meeting_job.vad_cut(self.pcm(1.0, 4000) + self.pcm(0.2, 0), 200))
 
     def test_a_sentence_still_going_is_left_alone(self):
         self.assertIsNone(meeting_job.vad_cut(self.pcm(1.0, 4000), 200))
@@ -653,9 +653,8 @@ class LiveCutting(unittest.TestCase):
     def test_a_stretch_without_a_pause_is_cut_before_the_limit(self):
         cut = meeting_job.vad_cut(self.pcm(meeting_job.LIVE_MAX + 5, 4000), 200)
         self.assertIsNotNone(cut)
-        at, speech, by_pause = cut
+        at, speech = cut
         self.assertTrue(speech)
-        self.assertFalse(by_pause, "a forced cut must not end the line")
         self.assertLessEqual(at / meeting_job.LIVE_BYTES_PER_S, meeting_job.LIVE_MAX)
 
     def test_the_cut_is_not_dragged_to_the_end_of_the_buffer(self):
@@ -663,9 +662,8 @@ class LiveCutting(unittest.TestCase):
         # the pause, and the words after it belong to the next line
         cut = meeting_job.vad_cut(self.pcm(1.0, 4000) + self.pcm(1.0, 0) + self.pcm(1.0, 4000), 200)
         self.assertIsNotNone(cut)
-        at, speech, by_pause = cut
+        at, speech = cut
         self.assertTrue(speech)
-        self.assertTrue(by_pause)
         self.assertAlmostEqual(at / meeting_job.LIVE_BYTES_PER_S, 1.0, delta=0.05)
 
     def test_the_quiet_room_below_the_floor_still_counts_as_silence(self):
@@ -694,10 +692,21 @@ class LiveSession(unittest.TestCase):
             return translated
 
         return types.SimpleNamespace(transcribe=transcribe, translate=translate,
-                                     settled=lambda session: None)
+                                     settled=lambda session: None,
+                                     embedder="", speaker=meeting_job.LIVE_SPEAKER)
 
     def speech(self):
         return (4000).to_bytes(2, "little", signed=True) * 16000
+
+    def say(self, session, seconds=1.0):
+        """One clip, then the pause that closes the line — what the browser sends."""
+        speech = (4000).to_bytes(2, "little", signed=True) * int(16000 * seconds)
+        session.feed(speech + b"\x00\x00" * 16000)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not session._pending:
+            time.sleep(0.01)
+        session.feed(b"\x00\x00" * 16000)          # silence past LIVE_LINE
+        time.sleep(0.05)
 
     def drain(self, session, limit=5.0):
         deadline = time.monotonic() + limit
@@ -725,7 +734,8 @@ class LiveSession(unittest.TestCase):
             return "Buongiorno"
 
         fake = types.SimpleNamespace(transcribe=lambda pcm, language: "Guten Tag.",
-                                     translate=translate, settled=lambda session: None)
+                                     translate=translate, settled=lambda session: None,
+                                     embedder="", speaker=meeting_job.LIVE_SPEAKER)
         session = meeting_job.LiveSession(fake, "de", "it")
         session.feed(self.speech() + b"\x00\x00" * 16000)
         session.close()
@@ -737,8 +747,8 @@ class LiveSession(unittest.TestCase):
     def test_the_context_of_the_next_line_is_the_previous_pair(self):
         calls = []
         session = meeting_job.LiveSession(self.fake(calls), "de", "it")
-        session.feed(self.speech() + b"\x00\x00" * 16000)
-        session.feed(self.speech() + b"\x00\x00" * 16000)
+        self.say(session)
+        self.say(session)
         session.close()
         self.drain(session)
         translations = [call for call in calls if call[0] == "mt"]
@@ -765,8 +775,8 @@ class LiveSession(unittest.TestCase):
 
     def test_every_row_carries_its_index(self):
         session = meeting_job.LiveSession(self.fake([]), "de", "it")
-        session.feed(self.speech() + b"\x00\x00" * 16000)
-        session.feed(self.speech() + b"\x00\x00" * 16000)
+        self.say(session)
+        self.say(session)
         session.close()
         self.drain(session)
         self.assertEqual([row["i"] for row in session.view(0)["rows"]], [0, 1])
@@ -778,7 +788,8 @@ class LiveSession(unittest.TestCase):
 
         session = meeting_job.LiveSession(
             types.SimpleNamespace(transcribe=transcribe, translate=lambda *a: "",
-                                  settled=lambda session: None), "de", "it")
+                                  settled=lambda session: None,
+                                     embedder="", speaker=meeting_job.LIVE_SPEAKER), "de", "it")
         session.feed(self.speech() + b"\x00\x00" * 16000)
         session.close()
         self.drain(session)
@@ -813,12 +824,19 @@ class LiveSession(unittest.TestCase):
 class LiveLines(unittest.TestCase):
     """A line is a stretch of speech between two pauses, not one ASR clip."""
 
+    def drain(self, session, limit=5.0):
+        deadline = time.monotonic() + limit
+        while time.monotonic() < deadline and not session.done:
+            time.sleep(0.02)
+        self.assertTrue(session.done)
+
     def fake(self, calls):
         return types.SimpleNamespace(
             transcribe=lambda pcm, language: "",
             translate=lambda src, target, context, on_token=None: (
                 calls.append(src), "tradotto")[1],
-            settled=lambda session: None)
+            settled=lambda session: None,
+                                     embedder="", speaker=meeting_job.LIVE_SPEAKER)
 
     def test_a_clip_that_stops_for_a_breath_waits_for_the_rest(self):
         calls = []
@@ -864,7 +882,8 @@ class LiveLines(unittest.TestCase):
 
         session = meeting_job.LiveSession(
             types.SimpleNamespace(transcribe=lambda pcm, language: "", translate=translate,
-                                  settled=lambda session: None), "de", "it")
+                                  settled=lambda session: None,
+                                     embedder="", speaker=meeting_job.LIVE_SPEAKER), "de", "it")
         session._hear("Heute im Studio.", closed=True)
         session._hear("Ein schönen guten Abend.", closed=True)
         self.assertEqual(len(calls), 3, "one retry, without the context")
@@ -885,7 +904,8 @@ class LiveLines(unittest.TestCase):
 
         session = meeting_job.LiveSession(
             types.SimpleNamespace(transcribe=lambda pcm, language: "",
-                                  translate=translate, settled=lambda session: None), "de", "it")
+                                  translate=translate, settled=lambda session: None,
+                                     embedder="", speaker=meeting_job.LIVE_SPEAKER), "de", "it")
         session._hear("Ihr Werbeauftragte Högel in Auftrag gegeben hatte.", closed=True)
         self.assertEqual(cursors, [0, 0], "the row was abandoned mid-sentence")
         self.assertEqual(session.view(0)["cursor"], 1)
@@ -918,3 +938,65 @@ class LiveLines(unittest.TestCase):
         self.assertEqual(session.view(0)["buffered"], 0.8)
         session._set_state("asr")
         self.assertEqual(session.view(0)["state"], "asr")
+
+    def test_a_change_of_voice_ends_the_line_without_a_pause(self):
+        # Two people talking without pausing: only the voice tells them apart.
+        calls = []
+        voices = iter([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        clips = iter(["Guten Abend, ich begrüsse Sie.", "Bei der Bundeswehr gibt es mehr Gewalt."])
+        fake = types.SimpleNamespace(
+            transcribe=lambda pcm, language: next(clips),
+            translate=lambda src, target, context, on_token=None: (
+                calls.append(src), "tradotto")[1],
+            embed=lambda pcm: next(voices),
+            settled=lambda session: None, embedder="img", speaker=meeting_job.LIVE_SPEAKER)
+        session = meeting_job.LiveSession(fake, "de", "it")
+        speech = (4000).to_bytes(2, "little", signed=True) * 16000
+        session._queue.put((speech, False))       # nobody pauses
+        session._queue.put((speech, False))
+        session._queue.put(None)
+        self.drain(session)
+        self.assertEqual([row["src"] for row in session.rows],
+                         ["Guten Abend, ich begrüsse Sie.",
+                          "Bei der Bundeswehr gibt es mehr Gewalt."])
+        self.assertEqual(len(calls), 2, "the first line was closed by the voice change")
+
+    def test_the_same_voice_keeps_one_line(self):
+        calls = []
+        fake = types.SimpleNamespace(
+            transcribe=lambda pcm, language: "und das ist wichtig.",
+            translate=lambda src, target, context, on_token=None: (
+                calls.append(src), "tradotto")[1],
+            embed=lambda pcm: [1.0, 0.0, 0.0],
+            settled=lambda session: None, embedder="img", speaker=meeting_job.LIVE_SPEAKER)
+        session = meeting_job.LiveSession(fake, "de", "it")
+        speech = (4000).to_bytes(2, "little", signed=True) * 16000
+        for _ in range(2):
+            session._queue.put((speech, False))
+        session._queue.put(None)
+        self.drain(session)
+        self.assertEqual(len(session.rows), 1)
+        self.assertEqual(calls, ["und das ist wichtig. und das ist wichtig."])
+
+    def test_silence_closes_the_line_without_waiting_for_the_asr(self):
+        # Clips are cut at 0.45 s so the ASR sees short, cheap requests; the line
+        # is closed by silence that keeps going, or by a change of voice.
+        calls = []
+        fake = types.SimpleNamespace(
+            transcribe=lambda pcm, language: "Guten Abend.",
+            translate=lambda src, target, context, on_token=None: (
+                calls.append(src), "Buonasera.")[1],
+            settled=lambda session: None, embedder="", speaker=meeting_job.LIVE_SPEAKER)
+        session = meeting_job.LiveSession(fake, "de", "it")
+        speech = (4000).to_bytes(2, "little", signed=True) * 16000
+        session.feed(speech + b"\x00\x00" * 16000)     # 1 s of speech, then silence
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not session._pending:
+            time.sleep(0.01)
+        session.feed(b"\x00\x00" * 16000)             # the pause keeps going
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not calls:
+            time.sleep(0.02)
+        self.assertEqual(calls, ["Guten Abend."], "the pause did not close the line")
+        session.close()
+        self.drain(session)

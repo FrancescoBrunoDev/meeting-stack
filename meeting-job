@@ -636,8 +636,9 @@ class Jobs:
 LIVE_RATE = 16000
 LIVE_FRAME = 0.02                       # seconds of audio per energy frame
 LIVE_BYTES_PER_S = LIVE_RATE * 2
-LIVE_SILENCE = 0.8                      # a pause this long ends a clip and the line
-LIVE_MIN_SPEECH = 0.8                   # a shorter cut is dropped, not transcribed
+LIVE_CUT = 0.3                          # a pause this long ends an ASR clip
+LIVE_LINE = 0.8                         # a pause this long ends the line
+LIVE_MIN_SPEECH = 0.6                   # a shorter cut is dropped, not transcribed
 LIVE_MAX = 20.0                         # no pause at all: cut here, at the quietest frame
 LIVE_FLOOR = 200                        # RMS below this is silence in any room
 TRANSLATE_PROMPT = (
@@ -647,6 +648,10 @@ TRANSLATE_PROMPT = (
     "are given only. A line may be a fragment that ends mid-thought: translate the "
     "words you are given, do not complete the sentence yourself.")
 LIVE_CONTEXT = 2                        # translated lines handed back as context
+# Same voice stays well above this, different voices well below (measured on the
+# box with different texts: 0.888-0.954 within one voice, 0.144-0.408 across), so
+# a line also ends where the voice changes, which a pause cannot tell you.
+LIVE_SPEAKER = 0.6
 LIVE_PENDING_CHARS = 220                # a longer line is closed at a full stop
 SENTENCE_END = ".!?\u2026"
 CLOSERS = "\"'\u00bb\u201c\u201d\u2019)]"  # may follow the full stop: "«…»"
@@ -690,12 +695,14 @@ def frame_rms(pcm: bytes) -> list[int]:
             for i in range(0, len(pcm) - step + 1, step)]
 
 
-def vad_cut(pcm: bytes, threshold: int, silence: float = LIVE_SILENCE) -> tuple[int, bool, bool] | None:
+def vad_cut(pcm: bytes, threshold: int,
+            silence: float = LIVE_CUT) -> tuple[int, bool] | None:
     """Where the clip ends in `pcm`, or None while it is still going.
 
-    Returns the cut, whether there was speech in it, and whether a pause is what
-    ended it — a forced cut in the middle of a long turn does not end the line.
-    The cut lands on the start of a pause, so a clip never opens mid-word.
+        Returns the cut and whether there was speech in it. The cut lands on the
+    start of a pause, so a clip never opens mid-word. A clip boundary says
+    nothing about the line: the line ends on a longer pause (a close marker
+    queued by `feed`) or on a change of voice, never on the cut itself.
     """
     frames = frame_rms(pcm)
     if not frames:
@@ -715,13 +722,13 @@ def vad_cut(pcm: bytes, threshold: int, silence: float = LIVE_SILENCE) -> tuple[
             continue
         run += 1
         if run >= need and speech >= minimum:
-            return max(index + 1 - run, 1) * step, True, True
+            return max(index + 1 - run, 1) * step, True
     if len(frames) * LIVE_FRAME < LIVE_MAX:
         return None
     quietest = int(len(frames) * 0.6)
     window = frames[quietest:]
     at = quietest + min(range(len(window)), key=window.__getitem__)
-    return max(at, 1) * step, any(spoken[:at]), False
+    return max(at, 1) * step, any(spoken[:at])
 
 
 def wav_bytes(pcm: bytes) -> bytes:
@@ -747,11 +754,15 @@ def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
     return bytes(body), boundary
 
 
+# Queued after a clip when the pause outlasted LIVE_LINE: close the line now.
+CLOSE = object()
+
+
 class LiveSession:
     """One stream: audio chunks in, transcribed and translated rows out."""
 
     def __init__(self, live: "Live", language: str, target: str,
-                 silence: float = LIVE_SILENCE) -> None:
+                 silence: float = LIVE_LINE) -> None:
         self.live = live
         self.language = language
         self.target = target
@@ -774,6 +785,8 @@ class LiveSession:
         # What the worker is doing right now, for the page: silence on screen
         # while a 10 s stretch waits for a pause reads as "the thing is broken".
         self._state = "idle"
+        self._voice: list[float] | None = None   # mean of the line's clips
+        self._closing = False                    # a close is already queued
         self._queue: queue.Queue = queue.Queue()
         self._lock = threading.RLock()
         threading.Thread(target=self._work, daemon=True).start()
@@ -790,13 +803,27 @@ class LiveSession:
                 floor = sorted(self._history)[len(self._history) // 5]
                 self._noise = max(LIVE_FLOOR, int(floor * 2.5))
             while True:
-                cut = vad_cut(self._pcm, self._noise, self.silence)
+                cut = vad_cut(self._pcm, self._noise)
                 if cut is None:
-                    return
-                at, speech, by_pause = cut
+                    break               # and fall through to the silence check
+                at, speech = cut
                 clip, self._pcm = self._pcm[:at], self._pcm[at:]
                 if speech and len(clip) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S:
-                    self._queue.put((clip, by_pause))
+                    self._queue.put(clip)
+            # The clip is queued but the line is not over: silence that keeps
+            # going past LIVE_LINE closes it, without waiting for the ASR. This
+            # is what lets clips stay short (0.45 s) while lines stay whole, and
+            # what lets a voice change be seen between two short clips.
+            if self._pending and not self._closing and len(self._pcm) >= 640:
+                tail = self._pcm[-int(self.silence * 3 * LIVE_BYTES_PER_S):]
+                quiet = 0
+                for value in reversed(frame_rms(tail)):
+                    if value >= self._noise:
+                        break
+                    quiet += 1
+                if quiet * LIVE_FRAME >= self.silence:
+                    self._closing = True
+                    self._queue.put(CLOSE)
 
     def close(self) -> None:
         with self._lock:
@@ -808,7 +835,7 @@ class LiveSession:
             # Only if someone is still talking: Whisper invents words on silence.
             if (len(tail) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S
                     and any(value >= self._noise for value in frame_rms(tail))):
-                self._queue.put((tail, True))
+                self._queue.put(tail)
             self._queue.put(None)
 
     def view(self, since: int) -> dict:
@@ -831,12 +858,28 @@ class LiveSession:
     def _work(self) -> None:
         while True:
             item = self._queue.get()
+            if item is CLOSE:
+                self._flush()
+                continue
             if item is None:
                 self._flush()               # half a sentence still counts as words
                 self.done = True
                 self.live.settled(self)     # the GPU is free: a new session may start
                 return
-            clip, by_pause = item
+            clip = item
+            box: dict = {}
+            listener = None
+            if self.live.embedder:
+                # The container start plus the model is 0.40 s: run it beside the
+                # ASR instead of after it, so a voice change costs no latency.
+                def listen() -> None:
+                    try:
+                        box["voice"] = self.live.embed(clip)
+                    except (OSError, ValueError, subprocess.TimeoutExpired):
+                        box["voice"] = None
+
+                listener = threading.Thread(target=listen, daemon=True)
+                listener.start()
             self._set_state("asr")
             try:
                 src = self.live.transcribe(clip, self.language)
@@ -847,14 +890,37 @@ class LiveSession:
                                       "done": True})
                 continue
             self._set_state("idle")
+            voice = None
+            if listener is not None:
+                listener.join(timeout=60)
+                voice = box.get("voice")
+            other = self._other_voice(voice)
+            if other and self._pending:
+                # Someone else is talking: the previous line ends here, even if
+                # nobody paused for long enough.
+                self._flush()
             if src:
-                self._hear(src, closed=by_pause)
+                self._hear(src, closed=other, voice=voice)
 
     def _set_state(self, state: str) -> None:
         with self._lock:
             self._state = state
 
-    def _hear(self, src: str, closed: bool) -> None:
+    def _other_voice(self, voice: list[float] | None) -> bool:
+        """True when this clip is a different speaker from the line being built."""
+        if voice is None:
+            return False
+        with self._lock:
+            if self._voice is None:
+                return False
+            similarity = sum(a * b for a, b in zip(voice, self._voice))
+            if similarity < self.live.speaker:
+                print(f"live: new speaker ({similarity:.2f} < {self.live.speaker:.2f})",
+                      flush=True)
+                return True
+            return False
+
+    def _hear(self, src: str, closed: bool, voice: list[float] | None = None) -> None:
         """Add a clip's text to the line being built, and close it on a real pause.
 
         The ASR punctuates every clip as if it were a sentence, so its full stops
@@ -865,6 +931,9 @@ class LiveSession:
         translated as two sentences.
         """
         with self._lock:
+            if voice is not None:
+                self._voice = voice if self._voice is None else [
+                    (old + new) / 2 for old, new in zip(self._voice, voice)]
             if not self._pending:
                 self.rows.append({"src": src, "mt": "", "done": False})
                 self._pending, self._pending_row = src, len(self.rows) - 1
@@ -878,6 +947,7 @@ class LiveSession:
                 return
             text, row = self._pending, self._pending_row
             self._pending = ""
+            self._voice = None              # the next clip opens a new line
             if overlong and not closed and not held:
                 # Cut the line at a full stop and let the rest keep growing.
                 head, tail = sentence_head(text, LIVE_PENDING_CHARS // 2)
@@ -887,6 +957,7 @@ class LiveSession:
                     text, self._pending = head, tail
                     self._pending_row = len(self.rows) - 1
                     self._pending_at = time.monotonic()
+                    self._voice = voice      # the tail is the same speaker
         self._say(text, row)
 
     def _flush(self) -> None:
@@ -895,6 +966,8 @@ class LiveSession:
                 return
             text, row = self._pending, self._pending_row
             self._pending = ""
+            self._voice = None
+            self._closing = False
         self._say(text, row)
 
     def _say(self, text: str, row: int) -> None:
@@ -936,7 +1009,8 @@ class Live:
 
     def __init__(self, asr: str, model: str, llm: str, translate_model: str,
                  lock_path: Path, idle: float = 120, glossary: str = "",
-                 silence: float = LIVE_SILENCE) -> None:
+                 silence: float = LIVE_LINE, embedder: str = "",
+                 speaker: float = LIVE_SPEAKER) -> None:
         self.asr = asr.rstrip("/")
         self.model = model
         self.llm = llm.rstrip("/")
@@ -944,6 +1018,8 @@ class Live:
         self.glossary = glossary
         self.idle = idle
         self.silence = silence
+        self.embedder = embedder        # diarizer image, empty = line ends on pauses only
+        self.speaker = speaker
         # Its own Lock: two flock()s on one open file description never exclude
         # each other, so reusing Jobs.lock would let a session and a diarizer run
         # together, which is exactly what the lock is for.
@@ -996,6 +1072,32 @@ class Live:
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(request, timeout=60) as response:
             return str(json.loads(response.read()).get("text", "")).strip()
+
+    def embed(self, pcm: bytes) -> list[float] | None:
+        """One speaker embedding for one clip, through the diarizer image.
+
+        A container per clip costs 0.40 s, which the caller hides by asking for it
+        beside the ASR request. No embedder, a dead image or too little audio all
+        mean "no opinion": the line then ends on pauses alone.
+        """
+        if not self.embedder or len(pcm) < LIVE_MIN_SPEECH * LIVE_BYTES_PER_S:
+            return None
+        try:
+            process = subprocess.run(
+                ["podman", "run", "--rm", "-i", "--entrypoint", "python3",
+                 self.embedder, "/embed.py"],
+                input=wav_bytes(pcm), capture_output=True, timeout=60)
+            if process.returncode != 0:
+                raise ValueError(process.stderr.decode(errors="replace")[-200:])
+            vector = [float(value) for value in json.loads(process.stdout)]
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            # One failure is enough: a missing image must not cost a container
+            # per clip for the rest of the day.
+            print(f"live: speaker embedding off ({error})", flush=True)
+            self.embedder = ""
+            return None
+        norm = math.sqrt(sum(value * value for value in vector))
+        return [value / norm for value in vector] if norm else None
 
     def translate(self, src: str, target: str, context: list[str],
                   on_token=None) -> str:
@@ -1445,8 +1547,16 @@ def main() -> None:
                         help="seconds a live session may go without audio before it closes "
                              "(default 120)")
     parser.add_argument("--live-silence", type=float, default=0.8,
-                        help="a pause this long ends a live line (default 0.8; 0.45 is "
-                             "chattier and splits more, 1.2 merges more)")
+                        help="a pause this long ends a live line (default 0.8; 0.5 is "
+                             "chattier and splits more, 1.2 merges more); clips are cut "
+                             f"at {LIVE_CUT:g}s whatever this says")
+    parser.add_argument("--live-embedder", default="",
+                        help="diarizer image used for speaker embeddings, so a line also "
+                             "ends when the voice changes (e.g. localhost/halogen-diarizer); "
+                             "empty ends lines on pauses only")
+    parser.add_argument("--live-speaker", type=float, default=LIVE_SPEAKER,
+                        help="cosine below which two clips are different speakers "
+                             f"(default {LIVE_SPEAKER})")
     parser.add_argument("--live-glossary", default="",
                         help="names and terms the live translation must leave unchanged, "
                              "comma separated (default: none)")
@@ -1458,10 +1568,13 @@ def main() -> None:
                 retain_days=args.retain_audio_days)
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
     live = Live(args.asr, args.model, args.translate_url, args.translate_model,
-                args.lock, args.live_idle, args.live_glossary, args.live_silence)
+                args.lock, args.live_idle, args.live_glossary, args.live_silence,
+                args.live_embedder, args.live_speaker)
     server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload, live)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     translate = args.translate_model or "no translation (--translate-model is empty)"
+    print(f"live: speech embedding {'via ' + args.live_embedder if args.live_embedder else 'off'}"
+          f", line closes at {args.live_silence:g}s of pause", flush=True)
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)
     print(f"live translation: {translate}", flush=True)
 
