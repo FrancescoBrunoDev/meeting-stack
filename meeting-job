@@ -47,7 +47,9 @@ import mimetypes
 import os
 import queue
 import re
+import select
 import signal
+import struct
 import subprocess
 import threading
 import time
@@ -636,7 +638,7 @@ class Jobs:
 LIVE_RATE = 16000
 LIVE_FRAME = 0.02                       # seconds of audio per energy frame
 LIVE_BYTES_PER_S = LIVE_RATE * 2
-LIVE_CUT = 0.3                          # a pause this long ends an ASR clip
+LIVE_CUT = 0.6                          # a pause this long ends an ASR clip
 LIVE_LINE = 0.8                         # a pause this long ends the line
 LIVE_MIN_SPEECH = 0.6                   # a shorter cut is dropped, not transcribed
 LIVE_MAX = 20.0                         # no pause at all: cut here, at the quietest frame
@@ -1012,9 +1014,13 @@ class Live:
     def __init__(self, asr: str, model: str, llm: str, translate_model: str,
                  lock_path: Path, idle: float = 120, glossary: str = "",
                  silence: float = LIVE_LINE, embedder: str = "",
-                 speaker: float = LIVE_SPEAKER) -> None:
-        self.asr = asr.rstrip("/")
-        self.model = model
+                 speaker: float = LIVE_SPEAKER, live_asr: str = "",
+                 live_model: str = "") -> None:
+        # The live path can use its own endpoint: a clip every half second makes
+        # the fixed cost of a request the whole budget (gufo 0.78 s, Whisper
+        # through Lemonade 0.24 s, measured), and the jobs keep their own choice.
+        self.asr = (live_asr or asr).rstrip("/")
+        self.model = live_model or model
         self.llm = llm.rstrip("/")
         self.translate_model = translate_model
         self.glossary = glossary
@@ -1022,6 +1028,9 @@ class Live:
         self.silence = silence
         self.embedder = embedder        # diarizer image, empty = line ends on pauses only
         self.speaker = speaker
+        self._embed_lock = threading.Lock()     # one pipe, shared by every session
+        self._embed_process = None
+        self._embed_failures = 0
         # Its own Lock: two flock()s on one open file description never exclude
         # each other, so reusing Jobs.lock would let a session and a diarizer run
         # together, which is exactly what the lock is for.
@@ -1076,30 +1085,69 @@ class Live:
             return str(json.loads(response.read()).get("text", "")).strip()
 
     def embed(self, pcm: bytes) -> list[float] | None:
-        """One speaker embedding for one clip, through the diarizer image.
+        """One speaker embedding for one clip, through a process that stays open.
 
-        A container per clip costs 0.40 s, which the caller hides by asking for it
-        beside the ASR request. No embedder, a dead image or too little audio all
+        A container per clip cost 0.40 s of startup — measured, and with clips cut
+        every half second it was the whole latency budget. The first clip pays it,
+        the rest are about 20 ms. No embedder, a dead one or too little audio all
         mean "no opinion": the line then ends on pauses alone.
         """
         if not self.embedder or len(pcm) < LIVE_MIN_SPEECH * LIVE_BYTES_PER_S:
             return None
-        try:
-            process = subprocess.run(
-                ["podman", "run", "--rm", "-i", "--entrypoint", "python3",
-                 self.embedder, "/embed.py"],
-                input=wav_bytes(pcm), capture_output=True, timeout=60)
-            if process.returncode != 0:
-                raise ValueError(process.stderr.decode(errors="replace")[-200:])
-            vector = [float(value) for value in json.loads(process.stdout)]
-        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-            # One failure is enough: a missing image must not cost a container
-            # per clip for the rest of the day.
-            print(f"live: speaker embedding off ({error})", flush=True)
-            self.embedder = ""
-            return None
+        with self._embed_lock:
+            if self._embed_failures >= 3:
+                return None
+            process = self._embedder()
+            if process is None:
+                return None
+            payload = wav_bytes(pcm)
+            try:
+                process.stdin.write(struct.pack(">I", len(payload)) + payload)
+                process.stdin.flush()
+                if not select.select([process.stdout], [], [], 10)[0]:
+                    raise ValueError("no answer within 10 s")
+                answer = json.loads(process.stdout.readline() or b"{}")
+                if "error" in answer:
+                    raise ValueError(answer["error"])
+                vector = [float(value) for value in answer["vector"]]
+            except (OSError, ValueError) as error:
+                self._stop_embedder()
+                self._embed_failures += 1
+                if self._embed_failures == 3:
+                    # A missing image must not cost a container per clip all day.
+                    print(f"live: speaker embedding off ({error})", flush=True)
+                return None
+            self._embed_failures = 0
         norm = math.sqrt(sum(value * value for value in vector))
         return [value / norm for value in vector] if norm else None
+
+    def _embedder(self) -> "subprocess.Popen[bytes] | None":
+        if self._embed_process is not None and self._embed_process.poll() is None:
+            return self._embed_process
+        try:
+            self._embed_process = subprocess.Popen(
+                ["podman", "run", "--rm", "-i", "--entrypoint", "python3",
+                 self.embedder, "/embed.py", "--loop"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as error:
+            self._embed_failures += 1
+            print(f"live: no embedder ({error})", flush=True)
+            return None
+        return self._embed_process
+
+    def _stop_embedder(self) -> None:
+        process, self._embed_process = self._embed_process, None
+        if process is None:
+            return
+        for step in (lambda: process.stdin.close(), process.terminate):
+            try:
+                step()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
 
     def translate(self, src: str, target: str, context: list[str],
                   on_token=None) -> str:
@@ -1540,6 +1588,11 @@ def main() -> None:
     parser.add_argument("--retain-audio-days", type=float, default=30,
                         help="delete kept uploads older than this many days; 0 keeps them "
                              "forever (default 30)")
+    parser.add_argument("--live-asr", default="",
+                        help="ASR base URL for the live path only (default: --asr); Whisper "
+                             "through Lemonade answers a clip in 0.24 s against gufo's 0.78 s")
+    parser.add_argument("--live-model", default="",
+                        help="ASR model for the live path only (default: --model)")
     parser.add_argument("--translate-url", default="http://127.0.0.1:8731",
                         help="OpenAI-compatible chat endpoint for live translation "
                              "(default Lemonade on 127.0.0.1:8731)")
@@ -1572,12 +1625,13 @@ def main() -> None:
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
     live = Live(args.asr, args.model, args.translate_url, args.translate_model,
                 args.lock, args.live_idle, args.live_glossary, args.live_silence,
-                args.live_embedder, args.live_speaker)
+                args.live_embedder, args.live_speaker, args.live_asr, args.live_model)
     server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload, live)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     translate = args.translate_model or "no translation (--translate-model is empty)"
     print(f"live: speech embedding {'via ' + args.live_embedder if args.live_embedder else 'off'}"
-          f", line closes at {args.live_silence:g}s of pause", flush=True)
+          f", line closes at {args.live_silence:g}s of pause"
+          f", asr {live.asr} ({live.model})", flush=True)
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)
     print(f"live translation: {translate}", flush=True)
 

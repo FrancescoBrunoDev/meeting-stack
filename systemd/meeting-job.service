@@ -55,7 +55,8 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --diarizer nemotron --asr-mode segments \
   --keep-audio \
   --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
-  --live-embedder localhost/halogen-diarizer
+  --live-embedder localhost/halogen-diarizer \
+  --live-asr http://127.0.0.1:8731 --live-model Whisper-Large-v3-Turbo
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

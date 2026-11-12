@@ -152,9 +152,11 @@ bite:
   clip's text to `_pending` and the line closes on a **longer pause**
   (`--live-silence`, 0.8 s — `feed` queues a `CLOSE` marker once the silence
   outlasts it, so the ASR is not involved) **or on a change of voice**.
-  `Live.embed()` runs `diarizer/embed.py` inside `--live-embedder`'s image on a
-  thread beside the ASR request: 0.40 s per clip including the container start,
-  which is why it cannot be serial. The cosine against the running mean of the
+  `Live.embed()` keeps ONE `podman run -i ... /embed.py --loop` open (4-byte
+  big-endian length, then the WAV; one JSON line back) and runs it on a thread
+  beside the ASR request. A container per clip cost 0.40 s of pure startup —
+  measured: 0.50 s for the first clip, 0.02 s each after that — which with clips
+  cut every half second was the whole latency budget. The cosine against the running mean of the
   line's clips picks the split; the threshold is 0.6, measured with different
   texts (0.888-0.954 within a voice, 0.144-0.408 across). A change of voice
   *inside* one clip is invisible to a per-clip embedding — that is the reason

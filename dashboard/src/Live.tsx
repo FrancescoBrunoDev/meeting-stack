@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { AlertCircle, KeyRound, Mic, Monitor, Square } from "lucide-react"
+import { AlertCircle, ChevronDown, ChevronUp, KeyRound, Mic, Monitor, Square } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import {
   Card,
@@ -50,6 +50,7 @@ export default function Live() {
   const [buffered, setBuffered] = useState(0)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [started, setStarted] = useState(false)
+  const [expanded, setExpanded] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const session = useRef<string | null>(null)
@@ -448,20 +449,34 @@ export default function Live() {
       </Card>
 
       {rows.length > 0 ? (
-        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {/* A window on the tail of the conversation: the newest line is fully
-              there, the ones above fade out, and the whole thing still scrolls
-              (with a snap, so a row does not stop half cut in two). */}
+        <Card
+          className={cn(
+            "flex min-h-0 flex-col overflow-hidden",
+            expanded ? "flex-1" : "flex-none"
+          )}
+        >
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
+            <CardTitle className="text-base">Transcript</CardTitle>
+            <Button variant="ghost" size="sm" onClick={() => setExpanded((value) => !value)}>
+              {expanded ? <ChevronUp /> : <ChevronDown />}
+              {expanded ? "Collapse" : "Expand"}
+            </Button>
+          </CardHeader>
+          {/* Three lines are the tail you read while listening; Expand opens the
+              whole thing. The newest line is full, the ones above step back. */}
           <div
             ref={list}
             onScroll={watching}
-            className="flex min-h-[16rem] flex-1 snap-y snap-proximity flex-col overflow-y-auto"
+            className={cn(
+              "flex snap-y snap-proximity flex-col overflow-y-auto",
+              expanded && "min-h-0 flex-1"
+            )}
           >
-            {/* `mt-auto`: with a few lines they sit at the bottom of the window,
+            {/* `mt-auto`: with few lines they sit at the bottom of the window,
                 which is where the newest one belongs — the empty space goes up
                 under the gradient instead of hanging below the text. */}
             <div className="mt-auto flex flex-col">
-              {rows.map((row) => (
+              {(expanded ? rows : rows.slice(-3)).map((row) => (
                 <div
                   key={row.i}
                   className="grid snap-start gap-1 border-b px-6 py-4 last:border-b-0 sm:grid-cols-2 sm:gap-6"

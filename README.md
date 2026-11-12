@@ -317,10 +317,10 @@ clip, which no per-clip embedding can see.
 podman build -t localhost/halogen-diarizer diarizer/   # the image the embedding runs in
 ```
 
-The transcript is a window on the tail of the conversation: the newest line is
-full, the ones above it step back (opacities 1, 0.86, 0.72, 0.58, 0.44, 0.3), the
-window fills the rest of the screen and scrolls with a snap, and it follows the
-newest line unless you have scrolled up to read.
+The transcript shows the last three lines — the newest full, the ones above it
+stepping back (opacities 1, 0.86, 0.72) — and **Expand** opens the whole thing,
+scrollable with a snap and following the newest line unless you have scrolled up
+to read.
 
 The two lines before the current one go back to the model **as source and
 translation pairs** (`Wir müssen… -> Dobbiamo…`), so the wording of the line
@@ -375,7 +375,15 @@ chunk creates the session and takes the GPU lock (409 if a job has it). Every
 row carries `i` (its index), `src`, `mt`, `done`, and `error` when it did not
 work; `state` and `buffered` describe what the worker is doing meanwhile.
 
-Flags: `--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
+Flags for the live path: `--live-asr`/`--live-model` point it at a faster
+endpoint than the jobs use — a clip every half second makes the fixed cost of a
+request the budget, and Whisper through Lemonade answers in 0.24 s against gufo's
+0.78 s (measured) — `--live-embedder` is the diarizer image whose embedding is
+kept in one long-lived container (0.40 s of container startup per clip became
+0.02 s), and `--live-silence` is the pause that ends a line (0.8 s; clips are cut
+at 0.6 s).
+
+`--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
 the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
 is where the LLM lives, `--live-idle 120` closes a session that stopped sending
 audio, `--live-glossary`, `--live-silence` (0.5 splits more, 1.2 merges more),
