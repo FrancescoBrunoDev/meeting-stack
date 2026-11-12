@@ -109,6 +109,15 @@ bite:
   overlap; the service accepts the same path as the `diarization` job option.
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
+- The 27B behind `--translate-model` is loaded by Lemonade with a persisted
+  `ctx_size`. It was 262144, which cost 41.5 GB of iGPU GTT for prompts that are
+  ~160 tokens long; at 16384 the same box sits at 24.6 GB and generates at the
+  same 20 tok/s (measured, four runs). Put it back with
+  `curl -X POST localhost:8731/api/v1/load -d '{"model_name":"Qwen3.8-27B-GGUF","ctx_size":262144}'`
+  after an `unload`, if something else on the box needs the long context.
+  Thinking must stay off in the request (`chat_template_kwargs.enable_thinking`):
+  measured on the same line, 11 generated tokens with the flag against 148
+  without, for the same answer.
 - Job state is in `jobs.json` under `--dir` (atomic replace, restored at
   startup): the list, options, status and the paths of the uploads survive a
   restart, and a finished job's transcript is read back from `out/<id>.json` and
