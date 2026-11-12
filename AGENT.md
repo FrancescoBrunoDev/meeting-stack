@@ -134,6 +134,9 @@ bite:
   `view()` sends `i` with every row — and why **the cursor stops at the first row
   still being translated**: a cursor that moved past an in-flight row left it on
   "…" for ever, because the worker translates a row that is not the last one.
+  The marker is the row's own `done`, **not** `mt`: with streaming `mt` is
+  non-empty from the first token, and keying on it abandoned rows half way
+  ("aveva affid", "Anche lei ne").
   Context is the previous `LIVE_CONTEXT` (2) lines as `source -> translation` pairs, and `--live-glossary` pins names. The
   row is a **line, not a clip**: `_hear` appends each clip's text to `_pending`
   and the line closes only when a **pause** ended the clip (`vad_cut` returns
@@ -144,7 +147,10 @@ bite:
   pause length is `--live-silence` (0.8 s; 0.45 split a broadcast into fragments,
   0.9 stopped cutting at all on speech that breathes for 0.8 s). A line with no
   pause is translated after `LIVE_PENDING_CHARS` (500) or `LIVE_PENDING_HOLD`
-  (10 s), and on close. Two traps already paid for: a bare ISO code in the prompt
+  (10 s), and on close. Past `LIVE_PENDING_CHARS` (220) the line is additionally
+  cut at the first full stop after half that — the only place the ASR's
+  punctuation is trusted — so four sentences of broadcast German do not become one
+  row whose translation takes four seconds. Two traps already paid for: a bare ISO code in the prompt
   is read as an English word ("…code is it"), so `LANG_NAMES` passes the name;
   and an empty answer (possible on a fragment) is retried once without the
   context, then written into the row as an error, never left as a silent "…".
