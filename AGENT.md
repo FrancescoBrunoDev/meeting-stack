@@ -17,6 +17,7 @@ diarizer-pyannote-rocm/   pyannote.audio on the iGPU
 diarizer-nemotron/        NVIDIA Nemotron-3-Diarization via transformers (default)
 dashboard/src/            React + shadcn/ui source of the web UI
 dashboard.html            built, inlined single file — what :8099 serves
+live.html                 the live page at GET /live: capture, transcript, translation
 systemd/meeting-job.service
 test_meeting.py
 ```
@@ -119,6 +120,49 @@ bite:
   pruned. `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
   bearer token in the query string, because `<audio src>` cannot send headers —
   only that route checks the query.
+- Live (`/live`, `POST /live/<id>/audio`, `live.html`): the browser resamples to
+  16 kHz mono PCM16 (`new AudioContext({sampleRate: 16000})` — Safari gives 48 kHz
+  and the page refuses, it would pitch everything) and posts half a second at a
+  time. The server accumulates, cuts on the first pause of 0.45 s
+  (`vad_cut`/`frame_rms`, ~20 lines of stdlib), sends the utterance as one WAV to
+  `--asr`, and translates it with `--translate-model` on `--translate-url`, last
+  two source lines as context and `chat_template_kwargs.enable_thinking=false`
+  (without that the thinking model spends `max_tokens` on reasoning and returns
+  an empty `content`). The row is appended **before** translating and the answer
+  is read as SSE (`stream: true`), each partial written into the row: the page
+  follows the cursor and rewrites the cells of the row it names, which is why
+  `view()` sends `i` with every row — and why **the cursor stops at the first row
+  still being translated**: a cursor that moved past an in-flight row left it on
+  "…" for ever, because the worker translates a row that is not the last one.
+  Context is the previous `LIVE_CONTEXT` (2) lines as `source -> translation` pairs, and `--live-glossary` pins names. The
+  row is a **line, not a clip**: `_hear` appends each clip's text to `_pending`
+  and the line closes only when a **pause** ended the clip (`vad_cut` returns
+  `by_pause`; a forced cut at `LIVE_MAX` does not close it). The ASR punctuation
+  is ignored on purpose — gufo and Whisper put a full stop at the end of every
+  clip, and trusting it split "…mehr sexualisierte Gewalt." / "und Fehlverhalten
+  als bislang bekannt." into two rows, each translated as its own sentence. The
+  pause length is `--live-silence` (0.8 s; 0.45 split a broadcast into fragments,
+  0.9 stopped cutting at all on speech that breathes for 0.8 s). A line with no
+  pause is translated after `LIVE_PENDING_CHARS` (500) or `LIVE_PENDING_HOLD`
+  (10 s), and on close. Two traps already paid for: a bare ISO code in the prompt
+  is read as an English word ("…code is it"), so `LANG_NAMES` passes the name;
+  and an empty answer (possible on a fragment) is retried once without the
+  context, then written into the row as an error, never left as a silent "…".
+  No speaker labels live.
+  `Lock(--lock)` for its whole life — **its own instance**, because `flock` on one
+  open file description does not exclude itself and reusing `Jobs.lock` would let
+  a session and a diarizer overlap. So jobs wait for it and a second session gets
+  a 409; `--live-idle` (120 s) closes an abandoned one. `LiveSession._work` calls
+  `Live.settled()` when it drains and that releases the lock at once — doing it in
+  the reaper made a restart right after "Ferma" wait up to 5 s for a 409 — while
+  the session stays readable for `--live-idle` so the last rows can be collected.
+  Measured on the box (2.8 s Italian clip, looped): 0.24 s per 10 s clip through
+  Whisper-Large-v3-Turbo, 0.78 s through gufo; 0.59 s per line with
+  Qwen3.8-27B-GGUF (17 tokens at 35.7 tok/s); on the page the source line shows at
+  3.4 s, the translation starts 0.3 s later and completes 0.6 s later.
+  A speaker who does not pause for 20 s is cut at the quietest frame. Live
+  capture needs a secure context: `http://127.0.0.1:8099/live` or https, never
+  plain http to another host.
 
 ## Gotchas that already cost time
 

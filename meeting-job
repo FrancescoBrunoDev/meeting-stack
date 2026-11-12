@@ -35,10 +35,14 @@ small ones. Auth is a bearer token on every route but /health. Stdlib only.
 from __future__ import annotations
 
 import argparse
+import array
 import base64
 import binascii
+import collections
 import hashlib
+import io
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -47,7 +51,11 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
+import uuid
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -620,6 +628,385 @@ class Jobs:
             self._terminate(process)
 
 
+# --- live: audio in, source line and translation out -------------------------
+# A browser streams 16 kHz mono PCM16; a pause in the speech ends an utterance,
+# the utterance goes to the ASR endpoint as one clip, and the line comes back
+# translated. Semi-batch on purpose: a whole utterance keeps the words Whisper
+# needs, and the measured cost of one is a fraction of a second.
+LIVE_RATE = 16000
+LIVE_FRAME = 0.02                       # seconds of audio per energy frame
+LIVE_BYTES_PER_S = LIVE_RATE * 2
+LIVE_SILENCE = 0.8                      # a pause this long ends a clip and the line
+LIVE_MIN_SPEECH = 0.8                   # a shorter cut is dropped, not transcribed
+LIVE_MAX = 20.0                         # no pause at all: cut here, at the quietest frame
+LIVE_FLOOR = 200                        # RMS below this is silence in any room
+TRANSLATE_PROMPT = (
+    "You translate one line at a time from a live meeting into {target}. Keep the "
+    "wording continuous with the context: it is the same conversation, line by line. "
+    "Do not repeat the context, do not add quotes or notes, and translate the line you "
+    "are given only. A line may be a fragment that ends mid-thought: translate the "
+    "words you are given, do not complete the sentence yourself.")
+LIVE_CONTEXT = 2                        # translated lines handed back as context
+LIVE_PENDING_CHARS = 500                # a line this long is translated unsplit
+LIVE_PENDING_HOLD = 10.0                # seconds a line may wait for a real pause
+# The name, never the code: "translate into the language whose ISO 639-1 code is it"
+# reads as the English pronoun and the model answers in English.
+LANG_NAMES = {"it": "Italian", "en": "English", "de": "German", "fr": "French",
+              "es": "Spanish", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
+              "ru": "Russian", "tr": "Turkish", "sv": "Swedish", "ja": "Japanese",
+              "zh": "Chinese", "ar": "Arabic"}
+def translate_prompt(target: str) -> str:
+    """The system prompt, with the language *name*: a bare code gets misread."""
+    return TRANSLATE_PROMPT.format(target=LANG_NAMES.get(target.lower(), target or "English"))
+
+
+def frame_rms(pcm: bytes) -> list[int]:
+    """The level of every 20 ms frame, so speech and room noise can be told apart."""
+    step = int(LIVE_RATE * LIVE_FRAME) * 2
+    return [int(math.sqrt(sum(sample * sample for sample in array.array("h", pcm[i:i + step]))
+                          / (step // 2)))
+            for i in range(0, len(pcm) - step + 1, step)]
+
+
+def vad_cut(pcm: bytes, threshold: int, silence: float = LIVE_SILENCE) -> tuple[int, bool, bool] | None:
+    """Where the clip ends in `pcm`, or None while it is still going.
+
+    Returns the cut, whether there was speech in it, and whether a pause is what
+    ended it — a forced cut in the middle of a long turn does not end the line.
+    The cut lands on the start of a pause, so a clip never opens mid-word.
+    """
+    frames = frame_rms(pcm)
+    if not frames:
+        return None
+    spoken = [value >= threshold for value in frames]
+    step = int(LIVE_RATE * LIVE_FRAME) * 2
+    # The first pause long enough to end an utterance, wherever it sits in the
+    # buffer: waiting for the buffer to *end* in silence would glue the next
+    # speaker's first words onto the previous line whenever they talk quickly.
+    need = max(int(silence / LIVE_FRAME), 1)
+    minimum = max(int(LIVE_MIN_SPEECH / LIVE_FRAME), 1)
+    run = speech = 0
+    for index, value in enumerate(spoken):
+        if value:
+            run = 0
+            speech += 1
+            continue
+        run += 1
+        if run >= need and speech >= minimum:
+            return max(index + 1 - run, 1) * step, True, True
+    if len(frames) * LIVE_FRAME < LIVE_MAX:
+        return None
+    quietest = int(len(frames) * 0.6)
+    window = frames[quietest:]
+    at = quietest + min(range(len(window)), key=window.__getitem__)
+    return max(at, 1) * step, any(spoken[:at]), False
+
+
+def wav_bytes(pcm: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(LIVE_RATE)
+        handle.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
+    """A multipart/form-data body with text fields and one file part."""
+    boundary = "----halogen" + uuid.uuid4().hex
+    body = bytearray()
+    for name, value in fields.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
+    body += (f"--{boundary}\r\n"
+             f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+             f"Content-Type: audio/wav\r\n\r\n").encode()
+    body += data + f"\r\n--{boundary}--\r\n".encode()
+    return bytes(body), boundary
+
+
+class LiveSession:
+    """One stream: audio chunks in, transcribed and translated rows out."""
+
+    def __init__(self, live: "Live", language: str, target: str,
+                 silence: float = LIVE_SILENCE) -> None:
+        self.live = live
+        self.language = language
+        self.target = target
+        self.silence = silence
+        self.rows: list[dict] = []
+        self.closed = False
+        self.done = False                      # the worker drained the queue
+        self.locked = False                    # still holds the GPU lock
+        self.last = time.monotonic()
+        self._pcm = b""
+        self._noise = LIVE_FLOOR
+        self._history: collections.deque = collections.deque(maxlen=int(30 / LIVE_FRAME))
+        self._sources: collections.deque = collections.deque(maxlen=LIVE_CONTEXT)
+        # The line being built: clips cut in the middle of a sentence keep landing
+        # in the same row, so the page does not show one line per chunk and the
+        # translator sees the whole sentence instead of half of it.
+        self._pending = ""
+        self._pending_row = 0
+        self._pending_at = 0.0
+        self._queue: queue.Queue = queue.Queue()
+        self._lock = threading.RLock()
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def feed(self, pcm: bytes) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.last = time.monotonic()
+            self._pcm += pcm
+            self._history.extend(frame_rms(pcm))
+            if self._history:
+                # The room's own level: a noisy room must not look like speech.
+                floor = sorted(self._history)[len(self._history) // 5]
+                self._noise = max(LIVE_FLOOR, int(floor * 2.5))
+            while True:
+                cut = vad_cut(self._pcm, self._noise, self.silence)
+                if cut is None:
+                    return
+                at, speech, by_pause = cut
+                clip, self._pcm = self._pcm[:at], self._pcm[at:]
+                if speech and len(clip) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S:
+                    self._queue.put((clip, by_pause))
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.last = time.monotonic()
+            tail, self._pcm = self._pcm, b""
+            # Only if someone is still talking: Whisper invents words on silence.
+            if (len(tail) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S
+                    and any(value >= self._noise for value in frame_rms(tail))):
+                self._queue.put((tail, True))
+            self._queue.put(None)
+
+    def view(self, since: int) -> dict:
+        with self._lock:
+            # The cursor stops at the first row that is still being written, so a
+            # reader that follows it can never skip past an untranslated line: the
+            # worker translates a row that is not the last one, and a cursor that
+            # had already moved on left "…" on the page for good.
+            cursor = next((index for index, row in enumerate(self.rows)
+                           if not (row["mt"] or row.get("error"))), len(self.rows))
+            return {"cursor": cursor, "open": not self.closed,
+                    "rows": [{"i": index, **row}
+                             for index, row in enumerate(self.rows) if index >= since],
+                    "language": self.language, "to": self.target}
+
+    def _work(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._flush()               # half a sentence still counts as words
+                self.done = True
+                self.live.settled(self)     # the GPU is free: a new session may start
+                return
+            clip, by_pause = item
+            try:
+                src = self.live.transcribe(clip, self.language)
+            except (OSError, ValueError) as error:
+                # One failed clip must not end the session: say so and go on.
+                with self._lock:
+                    self.rows.append({"src": "", "mt": "", "error": str(error)[:300]})
+                continue
+            if src:
+                self._hear(src, closed=by_pause)
+
+    def _hear(self, src: str, closed: bool) -> None:
+        """Add a clip's text to the line being built, and close it on a real pause.
+
+        The ASR punctuates every clip as if it were a sentence, so its full stops
+        mean nothing here: a clip ends where the speaker paused to breathe, and
+        the line ends where the speaker paused for real (`LIVE_SILENCE`, 0.8 s).
+        Merging on the pause is what stops "Bei der Bundeswehr gibt es mehr
+        Gewalt." and "und Fehlverhalten als bislang bekannt." from being
+        translated as two sentences.
+        """
+        with self._lock:
+            if not self._pending:
+                self.rows.append({"src": src, "mt": ""})
+                self._pending, self._pending_row = src, len(self.rows) - 1
+                self._pending_at = time.monotonic()
+            else:
+                self._pending = f"{self._pending} {src}".strip()
+                self.rows[self._pending_row]["src"] = self._pending
+            overlong = (len(self._pending) >= LIVE_PENDING_CHARS
+                        or time.monotonic() - self._pending_at >= LIVE_PENDING_HOLD)
+            if not closed and not overlong:
+                return
+            text, row = self._pending, self._pending_row
+            self._pending = ""
+        self._say(text, row)
+
+    def _flush(self) -> None:
+        with self._lock:
+            if not self._pending:
+                return
+            text, row = self._pending, self._pending_row
+            self._pending = ""
+        self._say(text, row)
+
+    def _say(self, text: str, row: int) -> None:
+        """Translate the whole sentence into its row, filling it token by token."""
+        with self._lock:
+            context = list(self._sources)
+
+        def grew(partial: str) -> None:
+            with self._lock:
+                self.rows[row]["mt"] = partial
+
+        try:
+            translated = self.live.translate(text, self.target, context, grew)
+            if not translated and context:
+                # An empty answer is not an answer: try once without the context.
+                translated = self.live.translate(text, self.target, [], None)
+        except (OSError, ValueError) as error:
+            with self._lock:
+                self.rows[row]["error"] = str(error)[:300]
+            return
+        with self._lock:
+            self.rows[row]["mt"] = translated
+            if not translated:
+                # Say it, instead of leaving the page on "…" for ever.
+                self.rows[row]["error"] = "the model returned no translation"
+            elif translated:
+                # Both sides of the line: the source alone tells the model what
+                # was said, the pair tells it how we said it before.
+                self._sources.append(f"{text} -> {translated}")
+
+
+class Live:
+    """The live sessions, and the GPU lock they share with the job queue."""
+
+    def __init__(self, asr: str, model: str, llm: str, translate_model: str,
+                 lock_path: Path, idle: float = 120, glossary: str = "",
+                 silence: float = LIVE_SILENCE) -> None:
+        self.asr = asr.rstrip("/")
+        self.model = model
+        self.llm = llm.rstrip("/")
+        self.translate_model = translate_model
+        self.glossary = glossary
+        self.idle = idle
+        self.silence = silence
+        # Its own Lock: two flock()s on one open file description never exclude
+        # each other, so reusing Jobs.lock would let a session and a diarizer run
+        # together, which is exactly what the lock is for.
+        self.gpu = Lock(lock_path)
+        self.sessions: dict[str, LiveSession] = {}
+        self._lock = threading.Lock()
+        threading.Thread(target=self._reap, daemon=True).start()
+
+    def feed(self, identity: str, pcm: bytes, language: str, target: str) -> LiveSession | None:
+        """Add audio, opening the session on the first chunk. None means GPU busy."""
+        with self._lock:
+            session = self.sessions.get(identity)
+            if session is None:
+                if not self.gpu.acquire(0):
+                    return None
+                session = self.sessions[identity] = LiveSession(self, language, target,
+                                                                self.silence)
+                session.locked = True
+        session.feed(pcm)
+        return session
+
+    def settled(self, session: LiveSession) -> None:
+        """The worker drained: free the GPU now, but let the page read the tail.
+
+        Releasing here rather than in the reaper is what makes "Ferma" immediate:
+        otherwise a new session waits up to one reaper tick for the lock.
+        """
+        with self._lock:
+            if session.locked:
+                session.locked = False
+                self.gpu.release()
+
+    def get(self, identity: str) -> LiveSession | None:
+        with self._lock:
+            return self.sessions.get(identity)
+
+    def close(self, identity: str) -> LiveSession | None:
+        session = self.get(identity)
+        if session is not None:
+            session.close()
+        return session
+
+    def transcribe(self, pcm: bytes, language: str) -> str:
+        fields = {"model": self.model, "response_format": "json", "max_tokens": "512"}
+        if language:
+            fields["language"] = language
+        body, boundary = multipart(fields, "clip.wav", wav_bytes(pcm))
+        request = urllib.request.Request(
+            self.asr + "/v1/audio/transcriptions", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return str(json.loads(response.read()).get("text", "")).strip()
+
+    def translate(self, src: str, target: str, context: list[str],
+                  on_token=None) -> str:
+        """The line in the target language; `on_token` gets every partial text.
+
+        Streaming is what makes the page feel live: the generation is 0.4-0.5 s
+        for a short line, and showing it grow beats waiting for the whole thing.
+        """
+        if not src or not self.translate_model:
+            return ""
+        content = "".join(f"Context line: {line}\n" for line in context)
+        content += f"\nTranslate this line:\n{src}"
+        system = translate_prompt(target)
+        if self.glossary:
+            system += f" Keep these spellings unchanged: {self.glossary}."
+        payload = {
+            "model": self.translate_model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": content}],
+            "max_tokens": 400, "temperature": 0,
+            "stream": on_token is not None,
+            # A thinking model spends the whole budget before it answers.
+            "chat_template_kwargs": {"enable_thinking": False}}
+        request = urllib.request.Request(
+            self.llm + "/v1/chat/completions", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if on_token is None:
+                answer = json.loads(response.read())
+                return str(answer["choices"][0]["message"].get("content") or "").strip().strip('"')
+            text = ""
+            for line in response:
+                line = line.strip()
+                if not line.startswith(b"data: "):
+                    continue
+                line = line[len(b"data: "):]
+                if line.startswith(b"[DONE]"):
+                    break
+                try:
+                    piece = json.loads(line)["choices"][0]["delta"].get("content") or ""
+                except (ValueError, KeyError, IndexError):
+                    continue
+                if piece:
+                    text += piece
+                    on_token(text)
+        return text.strip().strip('"')
+
+    def _reap(self) -> None:
+        while True:
+            time.sleep(5)
+            now = time.monotonic()
+            with self._lock:
+                for identity, session in list(self.sessions.items()):
+                    if not session.closed and now - session.last > self.idle:
+                        session.close()
+                    elif session.done and now - session.last > self.idle:
+                        # Readable for a while after the end so the last row can
+                        # still be collected; then forgotten.
+                        del self.sessions[identity]
+
+
 class ToolError(Exception):
     pass
 
@@ -731,6 +1118,10 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path)
         if path.path.startswith("/jobs/") and path.path.endswith("/audio"):
             return urllib.parse.parse_qs(path.query).get("token", [""])[0] == token
+        if path.path.startswith("/live/"):
+            # The live page speaks fetch() and sets the header; the query token is
+            # for curl and for a browser tab opened straight on an audio URL.
+            return urllib.parse.parse_qs(path.query).get("token", [""])[0] == token
         return False
 
     def _json(self, status: int, payload: dict) -> None:
@@ -774,6 +1165,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._html(200, page)
             return
+        if path == "/live":
+            try:
+                page = (HERE / "live.html").read_text(encoding="utf-8")
+            except OSError:
+                self._text(500, "live.html is missing next to meeting-job\n")
+                return
+            self._html(200, page)
+            return
         if path == "/health":
             self._json(200, {"status": "ok", "jobs": len(self.server.jobs.list()),
                              "queue": self.server.jobs.queued()})
@@ -802,6 +1201,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, job)
         elif path == "/mcp":
             self._text(405, "the MCP endpoint accepts POST\n")
+        elif path.startswith("/live/"):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                since = int(query.get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            session = self.server.live.get(path.removeprefix("/live/"))
+            if session is None:
+                self._json(404, {"error": "no such live session"})
+            else:
+                self._json(200, session.view(since))
         else:
             self._json(404, {"error": "not found"})
 
@@ -893,6 +1303,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             else:
                 self._json(200, reply)
+        elif parsed.path.startswith("/live/") and parsed.path.endswith(("/audio", "/close")):
+            identity, _, action = parsed.path[len("/live/"):].rpartition("/")
+            if action == "close":
+                session = self.server.live.close(identity)
+                if session is None:
+                    self._json(404, {"error": "no such live session"})
+                else:
+                    self._json(200, {"ok": True, "cursor": session.view(0)["cursor"]})
+                return
+            if not body:
+                self._json(400, {"error": "empty body: send PCM16 mono 16 kHz"})
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            session = self.server.live.feed(identity, body, query.get("language", [""])[0],
+                                            query.get("to", [""])[0])
+            if session is None:
+                self._json(409, {"error": "the GPU is busy: a transcription job is running"})
+            else:
+                view = session.view(0)
+                self._json(202, {"ok": True, "cursor": view["cursor"],
+                                 "open": view["open"]})
         else:
             self._json(404, {"error": "not found"})
 
@@ -905,11 +1336,12 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     def __init__(self, address, jobs: Jobs, hooks: Hooks, token: str,
-                 max_upload: int) -> None:
+                 max_upload: int, live: Live) -> None:
         self.jobs = jobs
         self.hooks = hooks
         self.token = token
         self.max_upload = max_upload
+        self.live = live
         super().__init__(address, Handler)
 
 
@@ -953,6 +1385,21 @@ def main() -> None:
     parser.add_argument("--retain-audio-days", type=float, default=30,
                         help="delete kept uploads older than this many days; 0 keeps them "
                              "forever (default 30)")
+    parser.add_argument("--translate-url", default="http://127.0.0.1:8731",
+                        help="OpenAI-compatible chat endpoint for live translation "
+                             "(default Lemonade on 127.0.0.1:8731)")
+    parser.add_argument("--translate-model", default="",
+                        help="chat model that translates the live lines, e.g. "
+                             "Qwen3.8-27B-GGUF; empty serves the live transcript untranslated")
+    parser.add_argument("--live-idle", type=float, default=120,
+                        help="seconds a live session may go without audio before it closes "
+                             "(default 120)")
+    parser.add_argument("--live-silence", type=float, default=0.8,
+                        help="a pause this long ends a live line (default 0.8; 0.45 is "
+                             "chattier and splits more, 1.2 merges more)")
+    parser.add_argument("--live-glossary", default="",
+                        help="names and terms the live translation must leave unchanged, "
+                             "comma separated (default: none)")
     args = parser.parse_args()
 
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
@@ -960,9 +1407,13 @@ def main() -> None:
                 args.lock, args.lock_wait, pair_wait=args.pair_wait,
                 retain_days=args.retain_audio_days)
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
-    server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload)
+    live = Live(args.asr, args.model, args.translate_url, args.translate_model,
+                args.lock, args.live_idle, args.live_glossary, args.live_silence)
+    server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload, live)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
+    translate = args.translate_model or "no translation (--translate-model is empty)"
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)
+    print(f"live translation: {translate}", flush=True)
 
     def shutdown(signum, frame) -> None:
         jobs.stop()

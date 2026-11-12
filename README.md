@@ -2,7 +2,7 @@
 
 Diarized transcripts of long meetings, on the Strix Halo box.
 
-Two tools, a web dashboard and three diarizer images:
+Two tools, a service, a web page and three diarizer images:
 
 - **`meeting-transcribe`** — one audio file in, a speaker-labelled transcript out
   (`PREFIX.md` + `PREFIX.json`).
@@ -11,6 +11,8 @@ Two tools, a web dashboard and three diarizer images:
   `meeting_result`.
 - **`meeting-eval`** — score a transcript against a reference before changing the
   pipeline.
+- **`GET /live`** — stream audio from the browser and read the translation as it
+  arrives (see [Live](#live-audio-in-a-translated-line-out)).
 - **`dashboard.html`** — the web UI `meeting-job` serves at `/` (and `/ui`):
   upload with a progress bar, live job list, and the transcript in a dialog next
   to an audio player — the sentence being spoken is highlighted and followed
@@ -248,6 +250,70 @@ token goes in the field at the bottom of the upload card and stays in
 `localStorage`. Opening a finished job shows the recording in a native player
 above the transcript; the line being spoken is highlighted and scrolled into
 view, and clicking any line seeks to its timestamp.
+
+## Live: audio in, a translated line out
+
+The same service also answers a live stream at `GET /live` (the page) and
+`POST /live/<session>/audio` (16 kHz mono PCM16, raw body). The page captures the
+microphone, or the tab's audio, and shows two columns: what was said and its
+translation.
+
+```sh
+# the page posts one chunk every half second; here the same thing from a file
+ffmpeg -v error -i meeting.wav -f s16le -ar 16000 -ac 1 - | split -b 16000 - /tmp/live-
+for part in /tmp/live-*; do
+  curl -s --data-binary @$part \
+    "http://box:8099/live/demo/audio?language=de&to=it" -H "Authorization: Bearer $TOKEN"
+  sleep 0.5
+done
+curl -H "Authorization: Bearer $TOKEN" "http://box:8099/live/demo?since=0"
+curl -X POST -H "Authorization: Bearer $TOKEN" http://box:8099/live/demo/close
+```
+
+This is not a streaming ASR. A pause of 0.45 s ends an utterance, the utterance
+goes to the ASR endpoint as one clip. The ASR punctuates every clip as if it
+were a sentence, so its full stops are ignored: the line ends where the speaker
+paused for real, 0.8 s (`--live-silence`), which is what keeps "…gibt es mehr
+Gewalt." and "und Fehlverhalten als bislang bekannt." in one line instead of two
+translated fragments. The line is then translated by an LLM (named in the
+prompt: a bare ISO code is read as an English word) and, if the model answers
+nothing at all, retried once without the context and then reported instead of
+sitting on "…".
+Semi-batch on purpose: a whole utterance is what keeps the words Whisper needs,
+and one is cheap. Measured on this box with a looped 2.8 s Italian clip: 0.24 s
+to transcribe 10 s through `Whisper-Large-v3-Turbo`, 0.78 s through
+gufo/Qwen3-ASR, 0.59 s to translate a line with `Qwen3.8-27B-GGUF` (0.45 s of
+generation at 35.7 tok/s, the rest prompt), and on the page the source line
+appears at 3.4 s, the translation **starts 0.3 s later and completes 0.6 s
+later** — the tokens are streamed into the row, so nothing waits for the whole
+sentence to be translated. A line that never finds a pause is translated anyway
+after 500 characters or 10 s. A speaker who does not pause for 20 s is cut anyway,
+at the quietest frame.
+
+The two lines before the current one go back to the model **as source and
+translation pairs** (`Wir müssen… -> Dobbiamo…`), so the wording of the line
+continues the wording already on screen. `--live-glossary "Candido,BSB,Zoom"`
+adds names and terms the translation must leave untouched.
+
+What it is not:
+
+- **No speaker labels.** Live attribution would need online clustering; the
+  batch transcript is still the labelled truth, so a live session is a preview.
+- **One session at a time.** A live session holds the same
+  `/run/user/1000/halogen-gpu.lock` for its whole life, so a job waits for it and
+  vice versa (a second session gets a 409).
+- **The microphone needs a secure context.** `getUserMedia` is refused on plain
+  `http://` to another host: open the page as `http://127.0.0.1:8099/live` on the
+  box, or behind https. Tab audio (`getDisplayMedia`) needs the same.
+
+Flags: `--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
+the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
+is where the LLM lives, `--live-idle 120` closes a session that stopped sending
+audio, `--live-glossary`, `--live-silence` (0.45 splits more, 1.2 merges more).
+ASR comes from `--asr`/`--model` like the jobs do, so
+gufo works too but wants an explicit `?language=`. Stopping frees the GPU lock as
+soon as the last utterance is transcribed, not on the next housekeeping tick, so
+a second session can start immediately.
 
 ## Flags worth knowing
 

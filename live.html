@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="it">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live · meeting-stack</title>
+<style>
+  :root { --bg:#0b0c10; --panel:#14161c; --line:#262a34; --fg:#e8eaf0; --dim:#8b93a7;
+          --mt:#7fd1b9; --err:#ff8a80; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f7f8fa; --panel:#fff; --line:#e2e5ec; --fg:#11141a; --dim:#5c6474;
+            --mt:#0f7a5f; --err:#c62828; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position:sticky; top:0; display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+           padding:12px 16px; background:var(--bg); border-bottom:1px solid var(--line); }
+  button, select, input { font:inherit; color:var(--fg); background:var(--panel);
+           border:1px solid var(--line); border-radius:8px; padding:7px 11px; }
+  button { cursor:pointer; }
+  button:disabled, select:disabled { opacity:.45; cursor:default; }
+  button.on { border-color:var(--mt); color:var(--mt); }
+  #status { margin-left:auto; color:var(--dim); font-size:13px; }
+  #banner { border:1px solid var(--err); color:var(--err); border-radius:8px;
+            padding:10px 12px; margin:8px 0 4px; line-height:1.5; }
+  #token { width:190px; }
+  main { padding:8px 16px 48px; max-width:1180px; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:10px 0;
+         border-bottom:1px solid var(--line); }
+  .src { white-space:pre-wrap; }
+  .mt { color:var(--mt); white-space:pre-wrap; }
+  .err { grid-column:1/-1; color:var(--err); font-size:13px; }
+  .hint { color:var(--dim); padding:24px 0; max-width:70ch; }
+  @media (max-width:700px) { .row { grid-template-columns:1fr; gap:4px; } }
+</style>
+
+<header>
+  <button id="mic">Microfono</button>
+  <button id="system">Audio di sistema</button>
+  <button id="stop" disabled>Ferma</button>
+  <select id="language" title="lingua parlata">
+    <option value="de">lingua: de</option>
+    <option value="">lingua: auto</option>
+    <option value="it">it</option>
+    <option value="en">en</option><option value="fr">fr</option><option value="es">es</option>
+  </select>
+  <select id="target" title="traduci in">
+    <option value="it">→ it</option><option value="en">→ en</option>
+    <option value="de">→ de</option><option value="fr">→ fr</option>
+  </select>
+  <input id="token" placeholder="token" autocomplete="off">
+  <span id="status">pronto</span>
+</header>
+
+<main><div id="banner" hidden></div><div id="rows"><div class="hint" id="hint">
+  Scegli il microfono, o l'audio di sistema (la scheda o la finestra da cui parla la call).
+  Insieme danno tutti i partecipanti: puoi aggiungerli entrambi. Il testo compare quando chi
+  parla fa una pausa; la traduzione un istante dopo.
+</div></div></main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const rows = $("rows");
+  const say = (text) => { $("status").textContent = text; };
+
+  const token = () => new URLSearchParams(location.search).get("token")
+    || $("token").value || "";
+  const auth = () => ({ "Authorization": "Bearer " + token() });
+
+  // `id` is the session the microphone feeds; `watch` is the one being read, and
+  // it outlives the first by a few seconds so the last utterance still lands.
+  let ctx = null, mix = null, node = null, streams = [], id = null, watch = null, cursor = 0;
+  let timer = null, chain = Promise.resolve(), pending = [], samples = 0;
+  $("token").value = new URLSearchParams(location.search).get("token") || "";
+  // A silent refusal is the default failure here: no prompt, no error, nothing.
+  // Say it in the page, in words that name the fix.
+  const canCapture = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  function banner(text) {
+    const box = $("banner");
+    box.textContent = text;
+    box.hidden = false;
+  }
+  if (!canCapture) {
+    banner("Questo browser non dà il microfono a una pagina servita da " + location.origin +
+           ": l'audio è permesso solo in https o su localhost, e senza di esso non parte nulla. " +
+           "Da un altro computer fai un tunnel — ssh -L 8099:localhost:8099 " +
+           (location.hostname || "utente@box") + " — e apri http://localhost:8099/live.");
+    $("mic").disabled = true;
+    $("system").disabled = true;
+  } else if (!window.isSecureContext) {
+    banner("Attenzione: origine non sicura (" + location.origin + "). Chrome può rifiutare " +
+           "il microfono senza chiedere niente; se i pulsanti non fanno nulla, apri la pagina " +
+           "in https o via un tunnel su localhost:8099.");
+  }
+
+  function graph() {
+    if (ctx) return true;
+    ctx = new AudioContext({ sampleRate: 16000 });
+    if (ctx.sampleRate !== 16000) {          // Safari: no 16 kHz context, so no stream
+      say("questo browser non dà un AudioContext a 16 kHz: usa Chrome o Firefox");
+      ctx.close(); ctx = null;
+      return false;
+    }
+    mix = ctx.createGain();
+    node = ctx.createScriptProcessor(4096, 1, 1);
+    node.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      event.outputBuffer.getChannelData(0).fill(0);   // this node is only a tap
+      const pcm = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        const value = Math.max(-1, Math.min(1, input[i]));
+        pcm[i] = value < 0 ? value * 0x8000 : value * 0x7fff;
+      }
+      pending.push(pcm);
+      samples += pcm.length;
+      if (samples >= 8000) flush();                   // half a second per POST, so a pause is seen quickly
+    };
+    mix.connect(node);
+    node.connect(ctx.destination);                    // Chrome only runs a connected node
+    return true;
+  }
+
+  function flush() {
+    if (!samples || !id) return;
+    const bytes = new Uint8Array(samples * 2);
+    let at = 0;
+    for (const pcm of pending) {
+      bytes.set(new Uint8Array(pcm.buffer), at);
+      at += pcm.length * 2;
+    }
+    pending = [];
+    samples = 0;
+    const query = `?language=${encodeURIComponent($("language").value)}` +
+                  `&to=${encodeURIComponent($("target").value)}`;
+    const session = id;
+    chain = chain
+      .then(() => fetch(`/live/${session}/audio${query}`, { method: "POST", body: bytes, headers: auth() }))
+      .then((response) => response.json())
+      .then((view) => {
+        if (view.ok) say("in ascolto");
+        else { say(view.error || "errore"); if (!view.open) stop(); }
+      })
+      .catch((error) => say("rete: " + error.message));
+  }
+
+  // Rows are keyed by session and index: the last one keeps growing while the
+  // translation streams in, so the same row is drawn again, not appended twice.
+  const drawn = new Map();
+
+  function draw(session, row) {
+    const key = session + ":" + row.i;
+    let cell = drawn.get(key);
+    if (!cell) {
+      const hint = $("hint");
+      if (hint) hint.remove();
+      const div = document.createElement("div");
+      div.className = "row";
+      const src = document.createElement("div");
+      src.className = "src";
+      const mt = document.createElement("div");
+      mt.className = "mt";
+      div.append(src, mt);
+      rows.append(div);
+      cell = { src, mt };
+      drawn.set(key, cell);
+    }
+    cell.src.textContent = row.src;
+    cell.mt.textContent = row.error || row.mt || "…";
+    cell.mt.className = row.error ? "err" : "mt";
+    // Follow the tail only if the reader is already at the bottom.
+    const near = window.innerHeight + window.scrollY >= document.body.scrollHeight - 160;
+    if (near) window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  async function poll() {
+    const session = watch;
+    if (!session) return;
+    try {
+      // The server's cursor stops at the first row still being translated, so
+      // following it is enough: that row comes back until its cells are full.
+      const since = cursor;
+      const response = await fetch(`/live/${session}?since=${since}`, { headers: auth() });
+      if (response.status === 401) { say("token mancante o errato"); return; }
+      const view = await response.json();
+      for (const row of view.rows) draw(session, row);
+      cursor = view.cursor;
+      if (!view.open && !view.rows.length) finish();
+    } catch (error) {
+      say("rete: " + error.message);
+    }
+  }
+
+  function finish() {
+    if (timer) { clearInterval(timer); timer = null; }
+    watch = null;
+    running(false);
+  }
+
+  // One switch for the header: while a session runs the language is fixed (the
+  // server takes it from the first chunk) and the token is no longer needed.
+  function running(on) {
+    $("stop").disabled = !on;
+    $("language").disabled = on;
+    $("target").disabled = on;
+    $("token").hidden = on;
+  }
+
+  async function addStream(stream) {
+    if (!id) {
+      // shortcut: starting again while the previous tail is still being read
+      // drops that tail; keep two cursors if a lost last line ever matters
+      id = watch = (crypto.randomUUID ? crypto.randomUUID() : "live-" + Date.now());
+      cursor = 0;
+      timer = setInterval(poll, 400);
+      running(true);
+    }
+    streams.push(stream);
+    ctx.createMediaStreamSource(stream).connect(mix);
+    if (ctx.state === "suspended") await ctx.resume();
+    say("in ascolto");
+  }
+
+  $("mic").onclick = async () => {
+    if (!graph()) return;
+    try {
+      await addStream(await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }));
+      $("mic").classList.add("on");
+    } catch (error) {
+      banner("microfono: " + error.message + " — guarda l'icona del microfono nella barra " +
+             "degli indirizzi: se il permesso è stato negato una volta, il browser non lo " +
+             "richiede più (chrome://settings/content/microphone) e la pagina resta muta.");
+    }
+  };
+
+  $("system").onclick = async () => {
+    if (!graph()) return;
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      stream.getVideoTracks().forEach((track) => track.stop());
+      if (!stream.getAudioTracks().length) {
+        throw new Error("nessun audio condiviso: scegli una scheda e spunta «condividi audio»");
+      }
+      await addStream(stream);
+      $("system").classList.add("on");
+    } catch (error) {
+      banner("audio di sistema: " + error.message + " — su Chrome la condivisione deve " +
+             "partire da una scheda, non da una finestra, e con «Condividi l'audio» attivo.");
+    }
+  };
+
+  $("stop").onclick = () => stop();
+
+  function stop() {
+    const session = id;
+    flush();                                  // the last partial second is still words
+    id = null;                                // the next start opens a new session
+    streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
+    streams = [];
+    if (ctx) { ctx.close().catch(() => {}); ctx = null; mix = null; node = null; }
+    $("mic").classList.remove("on");
+    $("system").classList.remove("on");
+    running(false);
+    say("fermato");
+    if (!session) return finish();
+    if (watch !== session) return;             // a newer session is already being read
+    // Close first, then keep polling: the last utterance is still being
+    // transcribed, and its row only shows up a second or two later.
+    chain
+      .then(() => fetch(`/live/${session}/close`, { method: "POST", headers: auth() }))
+      .catch(() => {});
+    setTimeout(finish, 15000);
+  }
+})();
+</script>
+</html>
