@@ -18,7 +18,10 @@
   button, select, input { font:inherit; color:var(--fg); background:var(--panel);
            border:1px solid var(--line); border-radius:8px; padding:7px 11px; }
   #device { max-width:220px; }
-  label.check { display:flex; align-items:center; gap:5px; font-size:12px; color:var(--dim); }
+  label.check, label.field { display:flex; align-items:center; gap:5px;
+           font-size:12px; color:var(--dim); }
+  label.field select { padding:5px 8px; }
+  header .sep { width:1px; height:22px; background:var(--line); margin:0 2px; }
   button { cursor:pointer; }
   button:disabled, select:disabled { opacity:.45; cursor:default; }
   button.on { border-color:var(--mt); color:var(--mt); }
@@ -43,23 +46,27 @@
 
 <header>
   <button id="mic">Microfono</button>
-  <button id="system">Audio di sistema</button>
+  <button id="system" title="in Chrome: una scheda o lo schermo intero, con l'audio.
+In Firefox e Zen questo non esiste: usa un dispositivo virtuale come ingresso.">Audio di sistema</button>
   <button id="stop" disabled>Ferma</button>
   <select id="device" title="ingresso audio">
     <option value="">microfono predefinito</option>
   </select>
   <label class="check" title="per un dispositivo virtuale (BlackHole, Loopback) vanno tolti">
     <input type="checkbox" id="processing" checked>filtri voce</label>
-  <select id="language" title="lingua parlata">
-    <option value="de">lingua: de</option>
-    <option value="">lingua: auto</option>
-    <option value="it">it</option>
-    <option value="en">en</option><option value="fr">fr</option><option value="es">es</option>
-  </select>
-  <select id="target" title="traduci in">
-    <option value="it">→ it</option><option value="en">→ en</option>
-    <option value="de">→ de</option><option value="fr">→ fr</option>
-  </select>
+  <span class="sep"></span>
+  <label class="field" title="lingua parlata: si fissa quando parte la sessione">lingua
+    <select id="language">
+      <option value="de">de</option>
+      <option value="">auto</option>
+      <option value="it">it</option>
+      <option value="en">en</option><option value="fr">fr</option><option value="es">es</option>
+    </select></label>
+  <label class="field" title="traduci in: si fissa quando parte la sessione">→
+    <select id="target">
+      <option value="it">it</option><option value="en">en</option>
+      <option value="de">de</option><option value="fr">fr</option>
+    </select></label>
   <input id="token" placeholder="token" autocomplete="off">
   <label id="vu" title="livello del microfono">mic
     <span id="level"><i></i></span></label>
@@ -67,9 +74,12 @@
 </header>
 
 <main><div id="banner" hidden></div><div id="rows"><div class="hint" id="hint">
-  Scegli il microfono, o l'audio di sistema (la scheda o la finestra da cui parla la call).
-  Insieme danno tutti i partecipanti: puoi aggiungerli entrambi. Il testo compare quando chi
-  parla fa una pausa; la traduzione un istante dopo.
+  Scegli il microfono; in Chrome puoi aggiungere l'audio di sistema condividendo una
+  <b>scheda</b> (o lo schermo intero, con l'audio), mai una finestra. In Firefox e Zen, e per
+  una call dentro un'app, quell'audio non esiste: serve un dispositivo virtuale — BlackHole su
+  macOS, un monitor di PipeWire su Linux — scelto qui sopra come ingresso, senza «filtri voce».
+  Insieme danno tutti i partecipanti. Il testo compare quando chi parla fa una pausa; la
+  traduzione un istante dopo.
 </div></div></main>
 
 <script>
