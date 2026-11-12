@@ -27,8 +27,6 @@
   button.on { border-color:var(--mt); color:var(--mt); }
   #status { margin-left:auto; color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
   #vu { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--dim); }
-  #dot { width:8px; height:8px; border-radius:99px; background:var(--line); }
-  #dot.live { background:var(--mt); box-shadow:0 0 6px var(--mt); }
   #level { width:96px; height:10px; border:1px solid var(--line); border-radius:99px;
            overflow:hidden; }
   #level i { display:block; height:100%; width:0; background:var(--mt); }
@@ -69,8 +67,7 @@ In Firefox e Zen questo non esiste: usa un dispositivo virtuale come ingresso.">
       <option value="de">de</option><option value="fr">fr</option>
     </select></label>
   <input id="token" placeholder="token" autocomplete="off">
-  <span id="vu" title="livello del microfono: il pallino verde dice che l'audio arriva">
-    <i id="dot"></i>mic <span id="level"><i></i></span></span>
+  <span id="vu" title="livello del microfono">mic <span id="level"><i></i></span></span>
   <span id="status">pronto</span>
 </header>
 
@@ -177,18 +174,15 @@ In Firefox e Zen questo non esiste: usa un dispositivo virtuale come ingresso.">
     return true;
   }
 
-  let shown = 0, lastLoud = 0;
+  let shown = 0;
 
   function meter(peak) {
     // The bar is the only proof the microphone reaches the page while the
     // transcript says nothing. Speech peaks around 1000-8000 of 32768, so the
     // scale tops out at 8000: a quiet voice still moves a third of the bar.
-    const now = performance.now();
     const level = Math.min(1, peak / 8000);
-    if (level > 0.05) lastLoud = now;
     shown = Math.max(level, shown * 0.82);          // a fall, not a snap
     $("level").firstElementChild.style.width = Math.round(shown * 100) + "%";
-    $("dot").classList.toggle("live", now - lastLoud < 400);
   }
 
   function flush() {
@@ -377,7 +371,6 @@ In Firefox e Zen questo non esiste: usa un dispositivo virtuale come ingresso.">
     streams = [];
     if (ctx) { ctx.close().catch(() => {}); ctx = null; mix = null; node = null; }
     $("level").firstElementChild.style.width = "0";
-    $("dot").classList.remove("live");
     shown = 0;
     $("mic").classList.remove("on");
     $("system").classList.remove("on");
