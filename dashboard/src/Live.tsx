@@ -19,7 +19,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
 
 type Row = { i: number; src: string; mt: string; done?: boolean; error?: string }
 
@@ -305,7 +304,10 @@ export default function Live() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-end gap-3">
+          {/* Two rows on purpose: the buttons are one height, the labelled
+              columns are another, and mixing them made the meter sit on the floor
+              of the row instead of beside the buttons. */}
+          <div className="flex flex-wrap items-center gap-3">
             <Button onClick={startMicrophone} disabled={started}>
               <Mic />
               Microphone
@@ -319,9 +321,9 @@ export default function Live() {
               Stop
             </Button>
             <Meter level={level} live={started} />
+          </div>
 
-            <Separator orientation="vertical" className="h-8" />
-
+          <div className="flex flex-wrap items-end gap-3">
             <div className="grid gap-1.5">
               <Label htmlFor="device" className="text-xs">
                 Input
@@ -349,15 +351,17 @@ export default function Live() {
               </Select>
             </div>
 
-            <Button
-              variant={processing ? "secondary" : "outline"}
-              size="sm"
-              onClick={() => setProcessing((value) => !value)}
-              disabled={started}
-              title="Echo cancellation and noise suppression: turn them off for a virtual device"
-            >
-              {processing ? "Voice filters on" : "Voice filters off"}
-            </Button>
+            <div className="grid gap-1.5">
+              <Label className="text-xs">Voice filters</Label>
+              <Button
+                variant={processing ? "secondary" : "outline"}
+                onClick={() => setProcessing((value) => !value)}
+                disabled={started}
+                title="Echo cancellation and noise suppression: turn them off for a virtual device"
+              >
+                {processing ? "On" : "Off"}
+              </Button>
+            </div>
 
             <div className="grid gap-1.5">
               <Label htmlFor="language" className="text-xs">
@@ -501,7 +505,7 @@ function Meter({ level, live }: { level: React.RefObject<number>; live: boolean 
   }, [live, level])
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex h-9 items-center gap-2">
       <span className="text-xs text-muted-foreground">mic</span>
       <Progress value={shown * 100} className="w-24" />
     </div>
