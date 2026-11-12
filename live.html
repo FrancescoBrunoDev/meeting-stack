@@ -90,6 +90,9 @@
   $("token").value = new URLSearchParams(location.search).get("token") || "";
   const mac = /Mac/i.test(navigator.userAgentData ? navigator.userAgentData.platform
                                                   : navigator.userAgent);
+  // Gecko (Firefox, and Zen on top of it) has no audio in getDisplayMedia at all:
+  // the API exists there for video only, so the share dialog is a dead end.
+  const gecko = /Firefox\//.test(navigator.userAgent);
 
   // Inputs, not just the default one: on macOS the only reliable way to the
   // *system* audio is a virtual device (BlackHole, Loopback) picked here.
@@ -315,6 +318,16 @@
   };
 
   $("system").onclick = async () => {
+    if (gecko) {
+      banner("Questo browser (Firefox, e Zen sopra Firefox) non sa dare audio da una " +
+             "condivisione: getDisplayMedia lì porta solo il video, l'audio non è " +
+             "implementato (bugzilla 1541425, ancora aperto). Per l'audio di sistema usa un " +
+             "dispositivo virtuale e scegli quello come ingresso qui accanto, togliendo " +
+             "«filtri voce»: BlackHole 2ch su macOS, un loopback di PipeWire o PulseAudio su " +
+             "Linux. In alternativa apri questa pagina in Chrome, dove la scheda condivisa " +
+             "porta anche l'audio.");
+      return;
+    }
     if (!graph()) return;
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
