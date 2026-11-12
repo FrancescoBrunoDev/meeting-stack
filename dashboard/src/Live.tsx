@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { cn } from "@/lib/utils"
 import { Progress } from "@/components/ui/progress"
 import {
   Select,
@@ -60,6 +61,8 @@ export default function Live() {
   const samples = useRef<Int16Array[]>([])
   const queued = useRef(0)
   const level = useRef(0)
+  const list = useRef<HTMLDivElement>(null)
+  const tail = useRef(true) // follow the newest line unless the reader scrolled up
 
   const deviceLabel = devices.find((entry) => entry.deviceId === device)?.label ?? "Default input"
 
@@ -130,6 +133,18 @@ export default function Live() {
       clearInterval(timer)
     }
   }, [sessionId, auth])
+
+  // Follow the tail, but never steal the scroll from someone reading back.
+  useEffect(() => {
+    const element = list.current
+    if (element && tail.current) element.scrollTop = element.scrollHeight
+  }, [rows])
+
+  function watching() {
+    const element = list.current
+    if (!element) return
+    tail.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48
+  }
 
   function graph(): boolean {
     if (context.current) return true
@@ -288,7 +303,10 @@ export default function Live() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-5xl space-y-6 px-4 py-8">
+    // A column that fills the window: the controls take what they need and the
+    // transcript gets the rest, so "the last few lines" means the same thing on
+    // a laptop and on a monitor instead of depending on a hard-coded height.
+    <div className="mx-auto flex h-[calc(100svh-3.25rem)] w-full max-w-5xl flex-col gap-6 overflow-y-auto px-4 py-8">
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-3">
@@ -296,11 +314,8 @@ export default function Live() {
             <SessionBadge state={state} started={started} buffered={buffered} />
           </CardTitle>
           <CardDescription>
-            Streaming transcription and translation. A line ends on a pause or when the voice
-            changes; there are no speaker labels here — the batch transcript is the labelled
-            truth. In Chrome you can add the system audio by sharing a tab, never a window;
-            in Firefox and Zen, and for a call in a desktop app, pick a virtual input device
-            (BlackHole, a PipeWire monitor) and turn voice filters off.
+            A line ends on a pause or when the voice changes. No speaker labels here: the
+            batch transcript is the labelled truth.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -312,7 +327,12 @@ export default function Live() {
               <Mic />
               Microphone
             </Button>
-            <Button variant="secondary" onClick={startSystem} disabled={started}>
+            <Button
+              variant="secondary"
+              onClick={startSystem}
+              disabled={started}
+              title="Chrome shares a tab's audio, never a window's. Firefox and Zen have no display audio at all: pick a virtual input device (BlackHole, a PipeWire monitor) and turn voice filters off."
+            >
               <Monitor />
               System audio
             </Button>
@@ -428,21 +448,39 @@ export default function Live() {
       </Card>
 
       {rows.length > 0 ? (
-        <Card>
-          <CardContent className="divide-y p-0">
-            {rows.map((row) => (
-              <div key={row.i} className="grid gap-1 px-6 py-4 sm:grid-cols-2 sm:gap-6">
-                <p className="whitespace-pre-wrap text-sm text-muted-foreground">{row.src}</p>
-                <p className="whitespace-pre-wrap text-sm">
-                  {row.error ? (
-                    <span className="text-destructive">{row.error}</span>
-                  ) : (
-                    row.mt || "…"
-                  )}
-                </p>
-              </div>
-            ))}
-          </CardContent>
+        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          {/* A window on the tail of the conversation: the newest line is fully
+              there, the ones above fade out, and the whole thing still scrolls
+              (with a snap, so a row does not stop half cut in two). */}
+          <div
+            ref={list}
+            onScroll={watching}
+            className="flex min-h-[16rem] flex-1 snap-y snap-proximity flex-col overflow-y-auto"
+          >
+            {/* `mt-auto`: with a few lines they sit at the bottom of the window,
+                which is where the newest one belongs — the empty space goes up
+                under the gradient instead of hanging below the text. */}
+            <div className="mt-auto flex flex-col">
+              {rows.map((row) => (
+                <div
+                  key={row.i}
+                  className="grid snap-start gap-1 border-b px-6 py-4 last:border-b-0 sm:grid-cols-2 sm:gap-6"
+                  style={{ opacity: fade(rows.length - 1 - row.i) }}
+                >
+                  <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+                    {row.src}
+                  </p>
+                  <p className="whitespace-pre-wrap text-sm">
+                    {row.error ? (
+                      <span className="text-destructive">{row.error}</span>
+                    ) : (
+                      row.mt || "…"
+                    )}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
         </Card>
       ) : (
         <p className="text-sm text-muted-foreground">
@@ -452,6 +490,15 @@ export default function Live() {
       )}
     </div>
   )
+}
+
+// How the tail reads: the newest line full, the ones above it stepping back. A
+// mask on the container faded nothing until the rows overflowed it, and this is
+// also true with four lines on screen.
+const FADE = [1, 0.86, 0.72, 0.58, 0.44, 0.3]
+
+function fade(distance: number) {
+  return FADE[Math.min(Math.max(distance, 0), FADE.length - 1)]
 }
 
 function SessionBadge({

@@ -19,7 +19,11 @@ dashboard/src/            React + shadcn/ui source of the web UI
 dashboard.html            built, inlined single file — what :8099 serves
 dashboard/src/Live.tsx    the live view: capture, transcript, translation (shadcn
                           components, same bundle — GET /live serves dashboard.html
-                          and App picks the view from the path)
+                          and App picks the view from the path). The rows are a fixed
+                          window on the tail (`h-[calc(100svh-3.25rem)]` column,
+                          `flex-1` card, `mt-auto` rows) with a per-row opacity
+                          gradient and `snap-y`; a container mask was tried first and
+                          faded nothing until the rows overflowed it.
 live-feed                 the same live API as a CLI: ffmpeg input (file or device) -> lines
 systemd/meeting-job.service
 test_meeting.py

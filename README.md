@@ -317,6 +317,11 @@ clip, which no per-clip embedding can see.
 podman build -t localhost/halogen-diarizer diarizer/   # the image the embedding runs in
 ```
 
+The transcript is a window on the tail of the conversation: the newest line is
+full, the ones above it step back (opacities 1, 0.86, 0.72, 0.58, 0.44, 0.3), the
+window fills the rest of the screen and scrolls with a snap, and it follows the
+newest line unless you have scrolled up to read.
+
 The two lines before the current one go back to the model **as source and
 translation pairs** (`Wir müssen… -> Dobbiamo…`), so the wording of the line
 continues the wording already on screen. `--live-glossary "Candido,BSB,Zoom"`
