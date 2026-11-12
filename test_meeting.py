@@ -711,7 +711,8 @@ class LiveSession(unittest.TestCase):
         session.feed(self.speech() + b"\x00\x00" * 16000)
         session.close()
         self.drain(session)
-        self.assertEqual(session.rows, [{"src": "Guten Tag.", "mt": "Buongiorno"}])
+        self.assertEqual(session.rows, [{"src": "Guten Tag.", "mt": "Buongiorno",
+                                         "done": True}])
         self.assertEqual([call[0] for call in calls], ["asr", "mt"])
 
     def test_the_row_is_there_before_the_translation_is_finished(self):
@@ -729,7 +730,8 @@ class LiveSession(unittest.TestCase):
         session.feed(self.speech() + b"\x00\x00" * 16000)
         session.close()
         self.drain(session)
-        self.assertEqual(seen, [{"i": 0, "src": "Guten Tag.", "mt": "Buon"}])
+        self.assertEqual(seen, [{"i": 0, "src": "Guten Tag.", "mt": "Buon",
+                                "done": False}])
         self.assertEqual(session.rows[0]["mt"], "Buongiorno")
 
     def test_the_context_of_the_next_line_is_the_previous_pair(self):
@@ -868,3 +870,41 @@ class LiveLines(unittest.TestCase):
         self.assertEqual(len(calls), 3, "one retry, without the context")
         self.assertEqual(calls[-1], [])
         self.assertEqual(session.rows[1]["error"], "the model returned no translation")
+
+    def test_the_cursor_does_not_move_while_a_line_is_streaming(self):
+        # `mt` holds the first token long before the line is finished: a cursor
+        # that keys on it moves on, and the page keeps "aveva affid" for ever.
+        cursors = []
+
+        def translate(src, target, context, on_token=None):
+            on_token("aveva")
+            cursors.append(session.view(0)["cursor"])
+            on_token("aveva affidato al suo agente pubblicitario Högel.")
+            cursors.append(session.view(0)["cursor"])
+            return "aveva affidato al suo agente pubblicitario Högel."
+
+        session = meeting_job.LiveSession(
+            types.SimpleNamespace(transcribe=lambda pcm, language: "",
+                                  translate=translate, settled=lambda session: None), "de", "it")
+        session._hear("Ihr Werbeauftragte Högel in Auftrag gegeben hatte.", closed=True)
+        self.assertEqual(cursors, [0, 0], "the row was abandoned mid-sentence")
+        self.assertEqual(session.view(0)["cursor"], 1)
+        self.assertEqual(session.rows[0]["mt"],
+                         "aveva affidato al suo agente pubblicitario Högel.")
+
+    def test_a_line_that_runs_on_is_cut_at_a_full_stop(self):
+        long_de = ("Ihr Werbeauftragte Högel in Auftrag gegeben hatte. Demnach wird höchstens "
+                   "jeder dritte Fall überhaupt gemeldet. Am häufigsten betroffen sind junge "
+                   "Frauen und nicht heterosexuelle Männer. Verteidigungsminister Pistorius "
+                   "sagte, für solche Vorfälle gebe es Null Toleranz.")
+        calls = []
+        fake = types.SimpleNamespace(
+            transcribe=lambda pcm, language: "", settled=lambda session: None,
+            translate=lambda src, target, context, on_token=None: (
+                calls.append(src), "tradotto")[1])
+        session = meeting_job.LiveSession(fake, "de", "it")
+        session._hear(long_de, closed=False)     # no pause, and past 220 characters
+        self.assertTrue(calls, "the long line was not translated at all")
+        self.assertLess(len(calls[0]), len(long_de))
+        self.assertTrue(session.rows[0]["done"])
+        self.assertFalse(session.rows[-1]["done"], "the rest waits in its own line")
