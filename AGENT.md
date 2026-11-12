@@ -17,9 +17,9 @@ diarizer-pyannote-rocm/   pyannote.audio on the iGPU
 diarizer-nemotron/        NVIDIA Nemotron-3-Diarization via transformers (default)
 dashboard/src/            React + shadcn/ui source of the web UI
 dashboard.html            built, inlined single file — what :8099 serves
-live.html                 the live page at GET /live: capture, transcript, translation
-                          (hand-written, no React: it borrows the dashboard's shadcn
-                          tokens from index.css, not its components)
+dashboard/src/Live.tsx    the live view: capture, transcript, translation (shadcn
+                          components, same bundle — GET /live serves dashboard.html
+                          and App picks the view from the path)
 live-feed                 the same live API as a CLI: ffmpeg input (file or device) -> lines
 systemd/meeting-job.service
 test_meeting.py
@@ -123,7 +123,7 @@ bite:
   pruned. `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
   bearer token in the query string, because `<audio src>` cannot send headers —
   only that route checks the query.
-- Live (`/live`, `POST /live/<id>/audio`, `live.html`): the browser resamples to
+- Live (`/live`, `POST /live/<id>/audio`, `dashboard/src/Live.tsx`): the browser resamples to
   16 kHz mono PCM16 (`new AudioContext({sampleRate: 16000})` — Safari gives 48 kHz
   and the page refuses, it would pitch everything) and posts half a second at a
   time. The server accumulates, cuts on the first pause of 0.45 s

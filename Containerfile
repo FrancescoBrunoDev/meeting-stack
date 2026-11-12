@@ -19,7 +19,7 @@ RUN apt-get update \
  && command -v podman >/dev/null || ln -sf /usr/bin/podman-remote /usr/bin/podman
 
 WORKDIR /app
-COPY meeting-job meeting-transcribe lockfile.py dashboard.html live.html /app/
+COPY meeting-job meeting-transcribe lockfile.py dashboard.html /app/
 RUN chmod +x /app/meeting-job /app/meeting-transcribe
 
 # The container writes into the mounted cache dir and talks to the host podman.

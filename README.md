@@ -11,8 +11,9 @@ Two tools, a service, a web page and three diarizer images:
   `meeting_result`.
 - **`meeting-eval`** — score a transcript against a reference before changing the
   pipeline.
-- **`GET /live`** — stream audio from the browser and read the translation as it
-  arrives (see [Live](#live-audio-in-a-translated-line-out)).
+- **`GET /live`** — a second view of the same dashboard: stream audio from the
+  browser and read the translation as it arrives (see
+  [Live](#live-audio-in-a-translated-line-out)).
 - **`dashboard.html`** — the web UI `meeting-job` serves at `/` (and `/ui`):
   upload with a progress bar, live job list, and the transcript in a dialog next
   to an audio player — the sentence being spoken is highlighted and followed
@@ -243,6 +244,12 @@ the repo ships only the built file — `meeting-job` has no static-asset route:
 cd dashboard && npm install      # once
 npm run build                    # -> ../dashboard.html (one inlined file)
 ```
+
+The same bundle answers `GET /live` with the live view (`dashboard/src/Live.tsx`):
+`App` picks it from the path, the header links the two, and a full page load
+between them keeps the state honest. The live page used to be a hand-written
+`live.html` — it now uses the same components, so there is one design system and
+one build.
 
 Source lives in `dashboard/src`; the components in `dashboard/src/components/ui`
 are the unmodified shadcn registry files (new-york, neutral theme). The bearer

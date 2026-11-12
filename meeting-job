@@ -1320,10 +1320,11 @@ class Handler(BaseHTTPRequestHandler):
             self._html(200, page)
             return
         if path == "/live":
+            # One bundle, two views: the page picks its view from the path.
             try:
-                page = (HERE / "live.html").read_text(encoding="utf-8")
+                page = (HERE / "dashboard.html").read_text(encoding="utf-8")
             except OSError:
-                self._text(500, "live.html is missing next to meeting-job\n")
+                self._text(500, "dashboard.html is missing next to meeting-job\n")
                 return
             self._html(200, page)
             return
