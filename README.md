@@ -377,20 +377,21 @@ work; `state` and `buffered` describe what the worker is doing meanwhile.
 
 The translator can be a **translation-specific model**. TranslateGemma is
 measured at 28 tok/s against the 27B's 20 with at least the same quality on real
-Tagesschau lines — but it needs its languages as *fields*, not as an instruction:
-without them it answers **in English**. llama.cpp knows the family and reads them
-from `chat_template_kwargs`, so one flag is enough:
+Tagesschau lines — but it needs its own prompt template (source and target
+language as fields, not an instruction), and llama.cpp's OpenAI shim drops those
+fields: with an instruction prompt the model answers **in English**. Hence
+`--translate-format translategemma`, which renders the template here and posts to
+`/v1/completions`:
 
 ```sh
 lemonade pull bullerwins/translategemma-12b-it-GGUF:Q4_K_M     # 6.8 GB
-# ctx_size -1 asks for the model's native 131072 and llama-server will not start
-lemonade load translategemma-12b-it-GGUF-Q4_K_M --llamacpp vulkan --ctx-size 16384 --save-options
-meeting-job --translate-model translategemma-12b-it-GGUF-Q4_K_M \
-            --translate-format translategemma
+meeting-job --translate-model translategemma-12b-it-GGUF-Q4_K_M             --translate-format translategemma
 ```
 
-This model takes no context lines: its template allows only user and assistant
-messages, so each line is translated on its own.
+The page remembers what you chose — spoken language, target, input device, voice
+filters, and whether the transcript was expanded — in `localStorage` under
+`live-*`, so the next meeting starts where the last one ended. A remembered
+device that has since been unplugged is dropped rather than failing to open.
 
 Flags for the live path: `--live-asr`/`--live-model` point it at a faster
 endpoint than the jobs use — a clip every half second makes the fixed cost of a
