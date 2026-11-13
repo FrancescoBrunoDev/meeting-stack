@@ -110,14 +110,33 @@ bite:
 - `podman.socket` must be enabled (`systemctl --user enable --now podman.socket`)
   or every job fails with a connection error.
 - `--translate-format translategemma` is not cosmetic. TranslateGemma's template
-  takes the languages as *fields* of the user content; llama.cpp's OpenAI endpoint
-  passes only `text`, so the model falls back to English whatever the prompt says
-  (measured: "She had been commissioned by Högel…" for a German line asked in
-  Italian). The template is rendered in `translategemma_prompt()` and the request
-  goes to `/v1/completions`, which accepts a raw prompt and streams
-  `choices[0].text` instead of `delta.content`. It has no context lines: the
-  model translates one line at a time, and on the Tagesschau lines it beat the
-  27B on wording while running 40% faster (28 tok/s against 20).
+  takes the source and target languages as *fields* of the user content. Without
+  them the model answers **in English** whatever the instruction says (measured:
+  "She had been commissioned by Högel…" for a German line asked in Italian).
+  llama.cpp knows this family and reads them from `chat_template_kwargs`, so the
+  flag only adds `{"source_lang_code", "target_lang_code"}` — do not rebuild the
+  template by hand, that was the first attempt and it is a copy that can drift.
+  The template accepts no role but user/assistant, so this path sends **no system
+  message and no context lines**: one line in, one line out. On the Tagesschau
+  lines it beat the 27B on wording while running 40% faster (28 tok/s against 20).
+- Voxtral-Mini-3B is a modern ASR that also translates, and it imports into
+  Lemonade from a plain GGUF (`lemonade pull ggml-org/Voxtral-Mini-3B-2507-GGUF:Q4_K_M`
+  picks up the mmproj by itself). Two walls, both measured: the transcription
+  endpoint answers `Audio transcription not supported by gpu`, and through the
+  chat endpoint the model *converses* about the audio instead of transcribing —
+  the Unsloth template has no audio placeholder, so the audio lands inside a chat
+  turn. With a system prompt that forces it ("You are a transcription engine…")
+  it transcribes German correctly in 0.7 s and does German audio to Italian in
+  0.75 s at 83 tok/s. Its Italian is still worse than the 12B's: gender flipped
+  ("sie" became "gli"), preambles to strip, "Null Toleranz" mistranslated. Good
+  ASR, not a replacement for the translator.
+- A Lemonade model that "fails to start" may just want its context pinned. With
+  the global `ctx_size: -1` the 12B asked for its native 131072 and llama-server
+  refused to come up; `lemonade load <model> --llamacpp vulkan --ctx-size 16384
+  --save-options` fixed it and wrote the choice to
+  `/var/lib/lemonade/recipe_options.json`. The CLI says the same sentence as the
+  API, so the diagnosis comes from running llama-server by hand and reading its
+  output.
 - The 27B behind `--translate-model` is loaded by Lemonade with a persisted
   `ctx_size`. It was 262144, which cost 41.5 GB of iGPU GTT for prompts that are
   ~160 tokens long; at 16384 the same box sits at 24.6 GB and generates at the

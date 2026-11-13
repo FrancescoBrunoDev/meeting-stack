@@ -667,23 +667,6 @@ LANG_NAMES = {"it": "Italian", "en": "English", "de": "German", "fr": "French",
 TRANSLATEGEMMA = "translategemma"
 
 
-def translategemma_prompt(text: str, source: str, target: str) -> str:
-    """The prompt TranslateGemma's own chat template builds, rendered here.
-
-    The model takes the source and target languages as structured fields its
-    template turns into this text; llama.cpp's OpenAI shim drops them, and
-    without them the model translates into English whatever the instruction says
-    (measured). So the template is applied on this side and the request goes to
-    /v1/completions, which takes a raw prompt.
-    """
-    source_name = LANG_NAMES.get((source or "de").lower(), source or "German")
-    target_name = LANG_NAMES.get(target.lower(), target or "Italian")
-    return (f"<start_of_turn>user\nProduce only the {target_name} translation, without any "
-            f"additional explanations or commentary. Please translate the following "
-            f"{source_name} text into {target_name}:\n\n\n{text}"
-            "<end_of_turn>\n<start_of_turn>model\n")
-
-
 def translate_prompt(target: str) -> str:
     """The system prompt, with the language *name*: a bare code gets misread."""
     return TRANSLATE_PROMPT.format(target=LANG_NAMES.get(target.lower(), target or "English"))
@@ -1181,39 +1164,34 @@ class Live:
         """
         if not src or not self.translate_model:
             return ""
+        payload = {"model": self.translate_model, "max_tokens": 400,
+                   "temperature": 0,
+                   "chat_template_kwargs": {"enable_thinking": False}}
         if self.translate_format == TRANSLATEGEMMA:
-            url = self.llm + "/v1/completions"
-            payload = {"model": self.translate_model,
-                       "prompt": translategemma_prompt(src, source, target),
-                       "max_tokens": 400, "temperature": 0}
-            def piece_of(choice: dict) -> str:
-                return choice.get("text") or ""
+            # llama.cpp knows this family and renders the model's own template,
+            # which wants the languages as fields: given them the model answers in
+            # the target language, without them it defaults to en-GB whatever the
+            # instruction says. The template also refuses any role but user and
+            # assistant, so no system message and no context lines here.
+            payload["messages"] = [{"role": "user", "content": src}]
+            payload["chat_template_kwargs"].update(
+                {"source_lang_code": source or "de", "target_lang_code": target})
         else:
             content = "".join(f"Context line: {line}\n" for line in context)
             content += f"\nTranslate this line:\n{src}"
             system = translate_prompt(target)
             if self.glossary:
                 system += f" Keep these spellings unchanged: {self.glossary}."
-            url = self.llm + "/v1/chat/completions"
-            payload = {
-                "model": self.translate_model,
-                "messages": [{"role": "system", "content": system},
-                             {"role": "user", "content": content}],
-                "max_tokens": 400, "temperature": 0,
-                # A thinking model spends the whole budget before it answers.
-                "chat_template_kwargs": {"enable_thinking": False}}
-            def piece_of(choice: dict) -> str:
-                return (choice.get("delta") or {}).get("content") or ""
+            payload["messages"] = [{"role": "system", "content": system},
+                                   {"role": "user", "content": content}]
         payload["stream"] = on_token is not None
         request = urllib.request.Request(
-            url, data=json.dumps(payload).encode(),
+            self.llm + "/v1/chat/completions", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=60) as response:
             if on_token is None:
                 answer = json.loads(response.read())
-                choice = answer["choices"][0]
-                text = choice["message"].get("content") if "message" in choice else choice.get("text")
-                return str(text or "").strip().strip('"')
+                return str(answer["choices"][0]["message"].get("content") or "").strip().strip('"')
             text = ""
             for line in response:
                 line = line.strip()
@@ -1223,7 +1201,7 @@ class Live:
                 if line.startswith(b"[DONE]"):
                     break
                 try:
-                    piece = piece_of(json.loads(line)["choices"][0])
+                    piece = json.loads(line)["choices"][0]["delta"].get("content") or ""
                 except (ValueError, KeyError, IndexError):
                     continue
                 if piece:
