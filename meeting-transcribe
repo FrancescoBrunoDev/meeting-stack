@@ -510,13 +510,12 @@ def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
     raise SystemExit(failure)
 
 
-# One audio.cpp request has to hold the whole meeting in the model's context:
-# MOSS spends ~795 tokens a minute on the prompt, and a 38-minute meeting
-# (30365 tokens of prompt) comes back "reached max_tokens before EOS" with
-# nothing to show even when allowed 24000 output tokens. There is no knob to
-# raise it: the model spec exposes no load or session options, and the server
-# has no context flag. Fifteen minutes leaves room for both halves.
-AUDIOCPP_MAX_S = 900
+# MOSS spends ~795 tokens of prompt a minute, and the cap has to be generous:
+# on a 38-minute meeting 24000 output tokens still end in "reached max_tokens
+# before EOS", while the UI's own run of the same meeting finished with 65536
+# (decode cache 99900 steps). A tight cap does not truncate the transcript, it
+# loses it.
+AUDIOCPP_MAX_TOKENS = 65536
 
 
 def audiocpp_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dict]:
@@ -531,18 +530,12 @@ def audiocpp_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dic
     normalize_wav(source, shared)
     remote = Path(args.asr_remote_dir or args.asr_dir) / name
     seconds = wav_seconds(shared) or 0.0
-    if seconds > AUDIOCPP_MAX_S:
-        shared.unlink(missing_ok=True)
-        raise SystemExit(
-            f"{seconds / 60:.0f} min is more than one audio.cpp request can hold "
-            f"({AUDIOCPP_MAX_S / 60:.0f} min): the prompt would eat the model's context and "
-            "the transcript would come back empty. Split the file, or use another --asr-mode.")
-    # Speech is 3-5 tokens a second; the cap has to clear the whole meeting,
-    # because hitting it loses the answer instead of truncating it.
-    cap = max(args.max_tokens, int(seconds * 8), 4096)
+    cap = max(args.max_tokens, AUDIOCPP_MAX_TOKENS)
     # One request for the whole file means one silence as long as the meeting:
-    # the answer arrives when the model is done, not a word at a time.
-    wait = max(args.asr_timeout, seconds * 0.6 + 300)
+    # the answer arrives when the model is done, not a word at a time. A
+    # 38-minute meeting measured 25 minutes of wall time, so 0.6x would have cut
+    # it off just before the end.
+    wait = max(args.asr_timeout, seconds * 1.2 + 600)
     try:
         text = transcribe_diarized(args.asr.rstrip("/") + "/v1/audio/transcriptions",
                                    remote, args.model, wait, cap)

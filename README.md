@@ -411,12 +411,12 @@ a second session can start immediately.
 
   It needs a directory the ASR server can read (`audio.cpp` takes a path, not an
   upload — `--asr-dir` is where the 16 kHz mono WAV is written, `--asr-remote-dir`
-  is how that same directory looks to the server), and `ffmpeg`. It is the best
-  transcriber measured here — on a 38-minute German meeting it found 3 speakers
-  where the Whisper+Nemotron chain found 8 — but **one request only holds about
-  15 minutes**: the prompt costs ~795 tokens a minute and the model's context is
-  ~32k, so a longer file comes back with `reached max_tokens before EOS` and no
-  transcript. Longer files need splitting.
+  is how that same directory looks to the server), and `ffmpeg`. One request
+  covers a whole meeting: a 38-minute German recording came back as 429 turns in
+  25 minutes of wall time, with 30365 prompt tokens. The `max_tokens` cap has to
+  be generous (65536) and it must travel under `"options"` — at 24000 the model
+  stops with `reached max_tokens before EOS` and the transcript is lost, and at
+  the top level of the request the server ignores it without a word.
 - `--asr-mode full` (default) — one request for the whole file.
   `--asr-mode segments` is the older per-clip path, kept for ASR endpoints that
   return text without timestamps.

@@ -52,21 +52,25 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   -e MEETING_TOKEN \
   localhost/meeting-job:latest \
   --dir %h/.cache/mcp-meeting-transcribe --port 8099 \
-  --asr http://127.0.0.1:8097 --model qwen3-asr-1.7b \
-  --diarizer nemotron --asr-mode segments \
+  --asr http://127.0.0.1:8090 --model moss-transcribe-diarize \
+  --asr-mode audiocpp --asr-dir /asr-share --asr-remote-dir /opt/audiocpp \
   --keep-audio \
   --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
   --live-embedder localhost/halogen-diarizer
-# MOSS-Transcribe-Diarize through audio.cpp on :8090 is the better transcriber
-# (3 speakers on the 38-minute meeting against this chain's 8, and the numbers
-# right) but it is NOT enabled here, because one request cannot hold a long
-# meeting: the prompt costs ~795 tokens a minute and the model has ~32k, so a
-# 38-minute file leaves nothing for the transcript and comes back empty. It is
-# one flag away for files under 15 minutes:
-#   --asr http://127.0.0.1:8090 --model moss-transcribe-diarize \
-#   --asr-mode audiocpp --asr-dir /asr-share --asr-remote-dir /opt/audiocpp
-# (plus the -v %h/audio:/asr-share mount above, and ffmpeg, which is now in the
-# image: audio.cpp reads 16 kHz mono WAV and takes a path, not an upload).
+# The batch ASR is MOSS-Transcribe-Diarize through audio.cpp on :8090: one request
+# for the whole meeting, and it answers the speaker labels and the timestamps
+# itself, so no diarizer container runs any more. Two consequences: audio.cpp
+# takes a path rather than an upload (hence the ~/audio mount, which is its own
+# work directory, and --asr-dir/--asr-remote-dir), and it reads only 16 kHz mono
+# WAV, so meeting-transcribe normalizes with ffmpeg.
+# Measured on a 38-minute German meeting: 429 turns in 25 minutes of wall time,
+# prompt 30365 tokens. The max_tokens cap must be generous and must travel under
+# "options" — at 24000 the model ends in "reached max_tokens before EOS" and the
+# transcript is lost, not truncated; at 65536 (what the UI used) it finishes.
+# That cap is memory: the decode cache is prompt + max_tokens.
+# The old chain (gufo :8097 + nemotron, --asr-mode segments) is still there:
+#   --asr http://127.0.0.1:8097 --model qwen3-asr-1.7b --diarizer nemotron \
+#   --asr-mode segments
 # --live-asr http://127.0.0.1:8731 --live-model Whisper-Large-v3-Turbo  is one
 # flag away, but on this box it puts a second model on the iGPU next to the 27B
 # that does the translating: measured 20 t/s with it resident against 35.7 t/s

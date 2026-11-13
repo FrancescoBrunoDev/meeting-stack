@@ -35,13 +35,14 @@ live in the archived `halogen-runner` repo and are out of scope.
 ## The machine's moving parts
 
 - ASR: gufo `http://127.0.0.1:8097`, `qwen3-asr-1.7b`, `response_format=json`,
-  is what the unit runs. `--asr-mode audiocpp` (audio.cpp on `:8090`,
-  MOSS-Transcribe-Diarize) is the better transcriber — 3 speakers on the
-  38-minute meeting against this chain's 8 — but one request holds only ~15
-  minutes: the prompt costs ~795 tokens a minute against a ~32k context, and a
-  longer file comes back `reached max_tokens before EOS` with no transcript. The
-  guard is `AUDIOCPP_MAX_S`. audio.cpp takes a path (not an upload) and 16 kHz
-  mono WAV, hence `--asr-dir`/`--asr-remote-dir` and ffmpeg in the image.
+  is the old chain, still selectable. The unit now runs `--asr-mode audiocpp`
+  (audio.cpp on `:8090`, MOSS-Transcribe-Diarize): one request for the whole
+  meeting, speakers and timestamps from the model, no diarizer. It takes a path
+  (not an upload) and 16 kHz mono WAV, hence `--asr-dir`/`--asr-remote-dir` and
+  ffmpeg in the image. `max_tokens` must be large (65536) AND under `"options"`:
+  at the top level the server ignores it and uses 5120, and a tight cap ends in
+  `reached max_tokens before EOS`, which loses the transcript instead of
+  truncating it. 38 minutes measured 25 minutes of wall time.
   `--asr-mode segments`. Resident model (~4.8 GB RSS, ~15.9 GB of the
   iGPU), do not unload it.
 - ASR, one-pass alternative: Lemonade `http://127.0.0.1:8731`, OpenAI-compatible,
