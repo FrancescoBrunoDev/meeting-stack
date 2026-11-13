@@ -482,10 +482,12 @@ def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
     the ASR server can read it (--asr-dir).
 
     `max_tokens` is not a nicety here: MOSS stops with "reached max_tokens before
-    EOS" when the meeting runs past its default cap, and the answer is lost.
+    EOS" when the meeting runs past its default cap (5120), and the answer is
+    lost. It has to travel under "options": at the top level the server ignores
+    it without a word, which is exactly how a long meeting comes back empty.
     """
     body = json.dumps({"model": model, "audio": str(audio),
-                       "max_tokens": max_tokens}).encode()
+                       "options": {"max_tokens": max_tokens}}).encode()
     failure = "ASR unreachable"
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(
@@ -509,10 +511,11 @@ def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
 
 
 # One audio.cpp request has to hold the whole meeting in the model's context:
-# MOSS spends ~795 tokens a minute on the prompt and its capacity is ~32k, so a
-# 38-minute meeting (30365 tokens) leaves no room for the transcript and the
-# model answers "reached max_tokens before EOS" with nothing to show. Fifteen
-# minutes leaves about 20k for the words.
+# MOSS spends ~795 tokens a minute on the prompt, and a 38-minute meeting
+# (30365 tokens of prompt) comes back "reached max_tokens before EOS" with
+# nothing to show even when allowed 24000 output tokens. There is no knob to
+# raise it: the model spec exposes no load or session options, and the server
+# has no context flag. Fifteen minutes leaves room for both halves.
 AUDIOCPP_MAX_S = 900
 
 
