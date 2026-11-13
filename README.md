@@ -399,6 +399,24 @@ a second session can start immediately.
 
 ## Flags worth knowing
 
+- `--asr-mode audiocpp` — one request to [audio.cpp](https://github.com/ggml-org/audio.cpp)
+  with `MOSS-Transcribe-Diarize`, which returns the speaker labels and the
+  timestamps itself, so no diarizer runs at all:
+
+  ```sh
+  ./meeting-transcribe meeting.wav --asr http://127.0.0.1:8090 \
+      --model moss-transcribe-diarize --asr-mode audiocpp \
+      --asr-dir ~/audio --asr-remote-dir /opt/audiocpp
+  ```
+
+  It needs a directory the ASR server can read (`audio.cpp` takes a path, not an
+  upload — `--asr-dir` is where the 16 kHz mono WAV is written, `--asr-remote-dir`
+  is how that same directory looks to the server), and `ffmpeg`. It is the best
+  transcriber measured here — on a 38-minute German meeting it found 3 speakers
+  where the Whisper+Nemotron chain found 8 — but **one request only holds about
+  15 minutes**: the prompt costs ~795 tokens a minute and the model's context is
+  ~32k, so a longer file comes back with `reached max_tokens before EOS` and no
+  transcript. Longer files need splitting.
 - `--asr-mode full` (default) — one request for the whole file.
   `--asr-mode segments` is the older per-clip path, kept for ASR endpoints that
   return text without timestamps.

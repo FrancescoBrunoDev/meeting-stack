@@ -14,7 +14,7 @@
 FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 podman-remote ca-certificates \
+ && apt-get install -y --no-install-recommends python3 podman-remote ca-certificates ffmpeg \
  && rm -rf /var/lib/apt/lists/* \
  && command -v podman >/dev/null || ln -sf /usr/bin/podman-remote /usr/bin/podman
 

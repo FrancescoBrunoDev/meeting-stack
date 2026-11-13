@@ -45,6 +45,7 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --security-opt no-new-privileges \
   -v %h/.cache/mcp-meeting-transcribe:%h/.cache/mcp-meeting-transcribe:rw \
   -v %h/.cache/huggingface:%h/.cache/huggingface:rw \
+  -v %h/audio:/asr-share:rw \
   -v /run/user/%U:/run/user/%U \
   -e HOME=%h \
   -e CONTAINER_HOST=unix:///run/user/%U/podman/podman.sock \
@@ -56,6 +57,16 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --keep-audio \
   --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
   --live-embedder localhost/halogen-diarizer
+# MOSS-Transcribe-Diarize through audio.cpp on :8090 is the better transcriber
+# (3 speakers on the 38-minute meeting against this chain's 8, and the numbers
+# right) but it is NOT enabled here, because one request cannot hold a long
+# meeting: the prompt costs ~795 tokens a minute and the model has ~32k, so a
+# 38-minute file leaves nothing for the transcript and comes back empty. It is
+# one flag away for files under 15 minutes:
+#   --asr http://127.0.0.1:8090 --model moss-transcribe-diarize \
+#   --asr-mode audiocpp --asr-dir /asr-share --asr-remote-dir /opt/audiocpp
+# (plus the -v %h/audio:/asr-share mount above, and ffmpeg, which is now in the
+# image: audio.cpp reads 16 kHz mono WAV and takes a path, not an upload).
 # --live-asr http://127.0.0.1:8731 --live-model Whisper-Large-v3-Turbo  is one
 # flag away, but on this box it puts a second model on the iGPU next to the 27B
 # that does the translating: measured 20 t/s with it resident against 35.7 t/s

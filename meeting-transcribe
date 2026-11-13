@@ -40,6 +40,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -435,6 +436,127 @@ def transcribe(url: str, clip: bytes, model: str, language: str | None,
     return unwrap(text)
 
 
+TIMESTAMP = re.compile(r"\[(\d+(?:\.\d+)?)\]")
+SPEAKER = re.compile(r"\[S(\d+)\]")
+
+
+def parse_diarized(text: str) -> list[dict]:
+    """Split audio.cpp's answer into turns.
+
+    It answers one line: "[0.26][S01] words[end][start][S02] words[end]", where
+    every segment after the first is preceded by the previous end and its own
+    start, and the last one ends with a lone end.
+    """
+    chunks = SPEAKER.split(text)
+    lead = TIMESTAMP.findall(chunks[0])
+    start = float(lead[-1]) if lead else 0.0
+    turns = []
+    for index in range(1, len(chunks) - 1, 2):
+        speaker, body = int(chunks[index]), chunks[index + 1]
+        times = TIMESTAMP.findall(body)
+        spoken = TIMESTAMP.split(body)[0].strip()
+        end = float(times[0]) if times else start
+        if spoken:
+            turns.append({"speaker": speaker, "start": round(start, 2),
+                          "end": round(max(end, start), 2), "text": spoken})
+        start = float(times[1]) if len(times) > 1 else end
+    return turns
+
+
+def normalize_wav(source: Path, out: Path) -> None:
+    """16 kHz mono s16le, which is all audio.cpp accepts without SOXR."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source),
+         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out)],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"ffmpeg could not convert {source}: {result.stderr.strip()[:300]}")
+
+
+def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
+                        max_tokens: int, attempts: int = ATTEMPTS) -> str:
+    """audio.cpp transcribes a file it opens itself, and labels the speakers.
+
+    The clip travels as a path, not as an upload, so the file has to sit where
+    the ASR server can read it (--asr-dir).
+
+    `max_tokens` is not a nicety here: MOSS stops with "reached max_tokens before
+    EOS" when the meeting runs past its default cap, and the answer is lost.
+    """
+    body = json.dumps({"model": model, "audio": str(audio),
+                       "max_tokens": max_tokens}).encode()
+    failure = "ASR unreachable"
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                answer = json.loads(response.read())
+            return str(answer.get("text") or "")
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read().decode(errors="replace")[:300]
+            failure = f"ASR refused the file: {error.code} {detail}"
+            if error.code not in RETRYABLE:
+                raise SystemExit(failure)
+        except (urllib.error.URLError, TimeoutError) as error:
+            failure = f"ASR unreachable: {error}"
+        if attempt == attempts:
+            raise SystemExit(f"{failure} (after {attempts} tries)")
+        time.sleep(RETRY_S * attempt)
+    raise SystemExit(failure)
+
+
+# One audio.cpp request has to hold the whole meeting in the model's context:
+# MOSS spends ~795 tokens a minute on the prompt and its capacity is ~32k, so a
+# 38-minute meeting (30365 tokens) leaves no room for the transcript and the
+# model answers "reached max_tokens before EOS" with nothing to show. Fifteen
+# minutes leaves about 20k for the words.
+AUDIOCPP_MAX_S = 900
+
+
+def audiocpp_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dict]:
+    """One request to audio.cpp, which returns the speakers itself.
+
+    No diarizer and no clip cutting: the model hands back "[start][Sxx] words"
+    with the turns already separated, so nothing can be truncated and nobody has
+    to guess where one voice stops.
+    """
+    name = f"meeting-{uuid.uuid4().hex[:12]}.wav"
+    shared = Path(args.asr_dir) / name
+    normalize_wav(source, shared)
+    remote = Path(args.asr_remote_dir or args.asr_dir) / name
+    seconds = wav_seconds(shared) or 0.0
+    if seconds > AUDIOCPP_MAX_S:
+        shared.unlink(missing_ok=True)
+        raise SystemExit(
+            f"{seconds / 60:.0f} min is more than one audio.cpp request can hold "
+            f"({AUDIOCPP_MAX_S / 60:.0f} min): the prompt would eat the model's context and "
+            "the transcript would come back empty. Split the file, or use another --asr-mode.")
+    # Speech is 3-5 tokens a second; the cap has to clear the whole meeting,
+    # because hitting it loses the answer instead of truncating it.
+    cap = max(args.max_tokens, int(seconds * 8), 4096)
+    # One request for the whole file means one silence as long as the meeting:
+    # the answer arrives when the model is done, not a word at a time.
+    wait = max(args.asr_timeout, seconds * 0.6 + 300)
+    try:
+        text = transcribe_diarized(args.asr.rstrip("/") + "/v1/audio/transcriptions",
+                                   remote, args.model, wait, cap)
+    finally:
+        # The duration is read back from the normalized WAV, so it moves into
+        # this track's workdir instead of staying in the shared directory.
+        if shared.exists():
+            shutil.move(str(shared), str(workdir / "audio.wav"))
+    turns = parse_diarized(text)
+    if not turns:
+        if lenient:
+            return []
+        raise SystemExit("ASR returned no turns")
+    print(f"asr: {len(turns)} turns in one request", file=sys.stderr)
+    return turns
+
+
 def transcribe_full(url: str, audio: Path, model: str, language: str | None,
                     prompt: str | None, timeout: float,
                     attempts: int = ATTEMPTS) -> list[dict]:
@@ -760,6 +882,8 @@ def track_turns(args, url: str, source: Path, workdir: Path, hotwords: str,
     of failing the job; it is for a microphone track that may be silent.
     """
     workdir.mkdir(parents=True, exist_ok=True)
+    if args.asr_mode == "audiocpp":
+        return audiocpp_turns(args, source, workdir, lenient)
     if diarize_it:
         segments = diarize(args.diarizer, source, workdir, args.speakers, args.threshold,
                            args.diarizer_timeout, args.min_speakers, args.max_speakers)
@@ -817,11 +941,20 @@ def main() -> None:
     parser.add_argument("--diarizer", default=DEFAULT_DIARIZER,
                         choices=("sherpa", "pyannote-rocm", "nemotron"),
                         help=f"diarizer backend (default {DEFAULT_DIARIZER})")
-    parser.add_argument("--asr-mode", default="full", choices=("segments", "full"),
+    parser.add_argument("--asr-dir", type=Path, default=None,
+                        help="with --asr-mode audiocpp: a directory this process writes and "
+                             "the ASR server reads, because audio.cpp takes a path, not an upload")
+    parser.add_argument("--asr-remote-dir", default=None,
+                        help="how --asr-dir is seen by the ASR server, when the two differ "
+                             "(default: the same path)")
+    parser.add_argument("--asr-mode", default="full",
+                        choices=("segments", "full", "audiocpp"),
                         help="full: one request for the whole normalized file plus segment-level "
                              "fusion with the diarizer (the default; needs an OpenAI-compatible "
                              "verbose_json endpoint, e.g. Lemonade on :8731 with Whisper); "
-                             "segments: one ASR request per turn clip, the gufo-safe path")
+                             "segments: one ASR request per turn clip, the gufo-safe path; "
+                             "audiocpp: one request to audio.cpp, which diarizes itself and "
+                             "returns the turns, so no diarizer runs at all (needs --asr-dir)")
     parser.add_argument("--speakers", type=int, default=-1,
                         help="known speaker count; -1 lets clustering decide (default)")
     parser.add_argument("--min-speakers", type=int, default=-1,
@@ -884,6 +1017,9 @@ def main() -> None:
     hotwords = ", ".join(part for part in (args.hotwords, ", ".join(names.values())) if part)
     prefix = args.output or source.with_suffix("")
     url = args.asr.rstrip("/") + "/v1/audio/transcriptions"
+    if args.asr_mode == "audiocpp" and not args.asr_dir:
+        raise SystemExit("--asr-mode audiocpp needs --asr-dir: audio.cpp reads the audio from "
+                         "a path, so the normalized WAV must sit where it can open it")
     if args.asr_mode == "full" and args.model == "qwen3-asr-1.7b":
         print("note: --asr-mode full needs a verbose_json endpoint; gufo's qwen3-asr-1.7b "
               "returns text only. Use --asr-mode segments with it.", file=sys.stderr)

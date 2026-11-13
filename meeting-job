@@ -74,6 +74,7 @@ OPTION_FLAGS = (("speakers", "--speakers"), ("min_speakers", "--min-speakers"),
                 ("max_segment", "--max-segment"), ("max_tokens", "--max-tokens"),
                 ("diarizer", "--diarizer"), ("model", "--model"),
                 ("asr_mode", "--asr-mode"), ("second_name", "--second-name"),
+                ("asr_dir", "--asr-dir"), ("asr_remote_dir", "--asr-remote-dir"),
                 ("second_offset", "--second-offset"),
                 ("diarization", "--diarization"))
 # Booleans: the flag is passed alone, so any truthy value turns it on.
@@ -301,6 +302,7 @@ class Jobs:
                  timeout: float = 14400, asr: str = "http://127.0.0.1:8731",
                  parallel: int = 4, diarizer: str = "nemotron",
                  model: str = "Whisper-Large-v3-Turbo", asr_mode: str = "full",
+                 asr_dir: str | None = None, asr_remote_dir: str | None = None,
                  lock_path: Path = Path("/run/user/1000/halogen-gpu.lock"),
                  lock_wait: float = 600, pair_wait: float = 900,
                  retain_days: float = 30) -> None:
@@ -310,6 +312,8 @@ class Jobs:
         self.diarizer = diarizer
         self.model = model
         self.asr_mode = asr_mode
+        self.asr_dir = asr_dir
+        self.asr_remote_dir = asr_remote_dir
         self.lock = Lock(lock_path)
         self.lock_wait = lock_wait
         self.pair_wait = pair_wait
@@ -551,6 +555,10 @@ class Jobs:
                    "--asr", self.asr, "--parallel", str(self.parallel),
                    "--diarizer", self.diarizer, "--model", self.model,
                    "--asr-mode", self.asr_mode]
+        if self.asr_dir:
+            command += ["--asr-dir", self.asr_dir]
+        if self.asr_remote_dir:
+            command += ["--asr-remote-dir", self.asr_remote_dir]
         if job.second is not None:
             command += ["--second", str(job.second)]
         # A per-job option appended below wins: argparse keeps the last value.
@@ -1232,9 +1240,10 @@ def tools() -> list[dict]:
                           "description": "diarizer backend; nemotron labels far-field German audio best"},
              "model": {"type": "string",
                        "description": "ASR model the endpoint serves (Whisper-Large-v3-Turbo when asr_mode is full)"},
-             "asr_mode": {"type": "string", "enum": ["segments", "full"],
+             "asr_mode": {"type": "string", "enum": ["segments", "full", "audiocpp"],
                           "description": "segments: one ASR request per turn clip (gufo); full: one pass "
-                                         "over the whole file, needs a verbose_json endpoint"}},
+                                         "over the whole file, needs a verbose_json endpoint; audiocpp: one "
+                                         "request to audio.cpp, which diarizes itself (needs asr_dir)"}},
              "required": ["audio_base64"]}},
         {"name": "meeting_status",
          "description": "Status of a transcription job by id.",
@@ -1567,9 +1576,16 @@ def main() -> None:
                         help="diarizer backend (default nemotron)")
     parser.add_argument("--model", default="Whisper-Large-v3-Turbo",
                         help="ASR model the endpoint serves (default Whisper-Large-v3-Turbo)")
-    parser.add_argument("--asr-mode", default="full", choices=("segments", "full"),
+    parser.add_argument("--asr-mode", default="full",
+                        choices=("segments", "full", "audiocpp"),
                         help="segments: one ASR request per turn clip (default); full: one pass over "
-                             "the whole file, needs a verbose_json endpoint such as Lemonade")
+                             "the whole file, needs a verbose_json endpoint such as Lemonade; "
+                             "audiocpp: one request to audio.cpp, which diarizes itself")
+    parser.add_argument("--asr-dir", default=None,
+                        help="with --asr-mode audiocpp: directory the ASR server can read, where "
+                             "the normalized WAV is written (audio.cpp takes a path, not an upload)")
+    parser.add_argument("--asr-remote-dir", default=None,
+                        help="how --asr-dir is seen by the ASR server (default: the same path)")
     parser.add_argument("--lock", type=Path, default=Path("/run/user/1000/halogen-gpu.lock"),
                         help="exclusive lock held while a job runs, shared with image-guard")
     parser.add_argument("--lock-wait", type=float, default=600,
@@ -1620,6 +1636,7 @@ def main() -> None:
 
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
                 args.asr, args.parallel, args.diarizer, args.model, args.asr_mode,
+                args.asr_dir, args.asr_remote_dir,
                 args.lock, args.lock_wait, pair_wait=args.pair_wait,
                 retain_days=args.retain_audio_days)
     hooks = Hooks(args.dir.expanduser() / "hooks.json")

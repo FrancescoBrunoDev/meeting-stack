@@ -208,6 +208,17 @@ class Defaults(unittest.TestCase):
     def test_diarizer_is_nemotron(self):
         self.assertEqual(meeting.DEFAULT_DIARIZER, "nemotron")
 
+    def test_audio_cpp_answers_are_split_on_their_own_markers(self):
+        turns = meeting.parse_diarized(
+            "[1.74][S01] Hallo zusammen.[2.61][3.06][S02] Hallo.[3.51][11.10][S02] Morgen.[12.01]")
+        self.assertEqual([(turn["speaker"], turn["start"], turn["end"], turn["text"])
+                          for turn in turns],
+                         [(1, 1.74, 2.61, "Hallo zusammen."), (2, 3.06, 3.51, "Hallo."),
+                          (2, 11.1, 12.01, "Morgen.")])
+
+    def test_an_empty_audio_cpp_answer_is_no_turns(self):
+        self.assertEqual(meeting.parse_diarized(""), [])
+
     def test_asr_mode_defaults_to_full(self):
         source = (HERE / "meeting-transcribe").read_text(encoding="utf-8")
         self.assertIn('"--asr-mode", default="full"', source)
