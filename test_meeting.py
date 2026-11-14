@@ -976,6 +976,14 @@ class LiveLines(unittest.TestCase):
                           "Bei der Bundeswehr gibt es mehr Gewalt."])
         self.assertEqual(len(calls), 2, "the first line was closed by the voice change")
 
+    def test_the_model_markers_never_reach_the_page(self):
+        self.assertEqual(
+            meeting_job.clean_live_text("[0.00][S01] Das sind ja dann die drei Tage.[2.48]"),
+            "Das sind ja dann die drei Tage.")
+        self.assertEqual(
+            meeting_job.clean_live_text(" \n Speaker 0:Das sind ja dann die drei Tage."),
+            "Das sind ja dann die drei Tage.")
+
     def test_the_same_voice_keeps_one_line(self):
         calls = []
         fake = types.SimpleNamespace(

@@ -56,7 +56,8 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --asr-mode audiocpp --asr-dir /asr-share --asr-remote-dir /opt/audiocpp \
   --keep-audio \
   --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
-  --live-embedder localhost/halogen-diarizer
+  --live-embedder localhost/halogen-diarizer \
+  --live-asr http://127.0.0.1:8090 --live-model vibevoice_asr_streaming_7b_q8_0
 # The batch ASR is MOSS-Transcribe-Diarize through audio.cpp on :8090: one request
 # for the whole meeting, and it answers the speaker labels and the timestamps
 # itself, so no diarizer container runs any more. Two consequences: audio.cpp

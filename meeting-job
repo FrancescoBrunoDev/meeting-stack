@@ -767,6 +767,17 @@ def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
 # Queued after a clip when the pause outlasted LIVE_LINE: close the line now.
 CLOSE = object()
 
+# The models put their own bookkeeping in the words: MOSS answers
+# "[0.00][S01] Hallo zusammen.[2.48]" and VibeVoice "\n Speaker 0:Hallo". On the
+# live page those are not labels, they are noise in the middle of the sentence.
+LIVE_MARKER = re.compile(r"\[(?:\d+(?:\.\d+)?|S\d+)\]")
+LIVE_SPEAKER_LABEL = re.compile(r"Speaker\s+\d+\s*:", re.IGNORECASE)
+
+
+def clean_live_text(text: str) -> str:
+    """The words alone, whatever markers the ASR wrapped them in."""
+    return " ".join(LIVE_MARKER.sub(" ", LIVE_SPEAKER_LABEL.sub(" ", text)).split())
+
 
 class LiveSession:
     """One stream: audio chunks in, transcribed and translated rows out."""
@@ -1090,7 +1101,7 @@ class Live:
             self.asr + "/v1/audio/transcriptions", data=body,
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(request, timeout=60) as response:
-            return str(json.loads(response.read()).get("text", "")).strip()
+            return clean_live_text(str(json.loads(response.read()).get("text", "")))
 
     def embed(self, pcm: bytes) -> list[float] | None:
         """One speaker embedding for one clip, through a process that stays open.
