@@ -28,6 +28,39 @@ const TARGETS = ["it", "en", "de", "fr"]
 const CHUNK = 8000 // samples: half a second of 16 kHz audio per request
 
 /**
+ * The characters that just arrived, revealed one by one.
+ *
+ * Only the part that changed is animated: the text that was already there is
+ * rendered as plain text, so a re-translated line does not type itself out again
+ * from the first letter.
+ */
+function Typing({ text }: { text: string }) {
+  const shown = useRef("")
+  const [parts, setParts] = useState({ stable: text, fresh: "" })
+  useEffect(() => {
+    let common = 0
+    const limit = Math.min(shown.current.length, text.length)
+    while (common < limit && shown.current[common] === text[common]) common++
+    shown.current = text
+    setParts({ stable: text.slice(0, common), fresh: text.slice(common) })
+  }, [text])
+  return (
+    <>
+      {parts.stable}
+      {Array.from(parts.fresh).map((char, index) => (
+        <span
+          key={`${index}-${char}`}
+          className="animate-in fade-in duration-150"
+          style={{ animationDelay: `${Math.min(index * 14, 600)}ms` }}
+        >
+          {char}
+        </span>
+      ))}
+    </>
+  )
+}
+
+/**
  * The microphone's samples as 16 kHz, whatever rate the browser gave us.
  *
  * Asking for `new AudioContext({ sampleRate: 16000 })` is not portable: Gecko
@@ -550,14 +583,16 @@ export default function Live() {
                     className="whitespace-pre-wrap text-sm text-muted-foreground"
                     style={{ opacity: fade(rows.length - 1 - row.i) }}
                   >
-                    {row.src}
+                    <Typing text={row.src} />
                     {!row.done && <span className="animate-pulse">▌</span>}
                   </p>
                   <p className="whitespace-pre-wrap text-base leading-snug text-foreground">
                     {row.error ? (
                       <span className="text-destructive">{row.error}</span>
+                    ) : row.mt ? (
+                      <Typing text={row.mt} />
                     ) : (
-                      row.mt || "…"
+                      "…"
                     )}
                   </p>
                 </div>
