@@ -540,13 +540,21 @@ export default function Live() {
               {(expanded ? rows : rows.slice(-3)).map((row) => (
                 <div
                   key={row.i}
-                  className="grid snap-start gap-1 border-b px-6 py-4 last:border-b-0 sm:grid-cols-2 sm:gap-6"
+                  className="grid snap-start gap-1 border-b px-6 py-4 last:border-b-0"
                   style={{ opacity: fade(rows.length - 1 - row.i) }}
                 >
-                  <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+                  {/* The line being spoken reads like a caption: bigger, and
+                      with the caret after it, so the growth is visible. */}
+                  <p
+                    className={cn(
+                      "whitespace-pre-wrap text-muted-foreground",
+                      row.done ? "text-sm" : "text-base text-foreground"
+                    )}
+                  >
                     {row.src}
+                    {!row.done && <span className="animate-pulse">▌</span>}
                   </p>
-                  <p className="whitespace-pre-wrap text-sm">
+                  <p className="whitespace-pre-wrap text-sm text-muted-foreground">
                     {row.error ? (
                       <span className="text-destructive">{row.error}</span>
                     ) : (
@@ -560,8 +568,8 @@ export default function Live() {
         </Card>
       ) : (
         <p className="text-sm text-muted-foreground">
-          Nothing yet. A line appears as soon as the speaker pauses — or someone else starts
-          talking, which the voice embedding also catches.
+          Nothing yet. The words appear while the speaker talks and grow into a line; the
+          line ends when they pause, or when someone else starts.
         </p>
       )}
     </div>

@@ -40,6 +40,7 @@ import base64
 import binascii
 import collections
 import hashlib
+import http.client
 import io
 import json
 import math
@@ -50,6 +51,7 @@ import re
 import select
 import signal
 import struct
+import socket
 import subprocess
 import threading
 import time
@@ -85,20 +87,16 @@ PAIR_NAME = re.compile(r"^(?P<key>.+?)-(system|mic)(-16k)?\.[a-z0-9]{1,5}$", re.
 # meeting-transcribe wants ints for these; every other flag takes a float or a string.
 INT_OPTIONS = ("speakers", "min_speakers", "max_speakers", "max_tokens")
 
-
 def job_id(audio: bytes) -> str:
     return hashlib.sha256(audio).hexdigest()[:16]
 
-
 JOB_ID = re.compile(r"^[0-9a-f]{16}$")
-
 
 def write_atomic(path: Path, text: str) -> None:
     """Replace a small file in one step: the service is restarted mid-write."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
-
 
 def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     """Parse a single `Range: bytes=a-b` against a file of `size` bytes.
@@ -123,7 +121,6 @@ def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
         return None
     return first, min(last, size - 1)
 
-
 def track_and_pair(filename: str | None, options: dict) -> tuple[str, str | None]:
     """Which track this upload is, and which recording it belongs to.
 
@@ -142,14 +139,11 @@ def track_and_pair(filename: str | None, options: dict) -> tuple[str, str | None
     return ("second" if track in ("second", "mic") else "main"), (
         str(pair) if pair else None)
 
-
 def safe_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if SUFFIX.fullmatch(suffix) else ".bin"
 
-
 RECORDING_STAMP = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})/(?P<time>\d{2}-\d{2}-\d{2})$")
-
 
 def recording_pair(day: str, recording: str) -> str | None:
     """('<2026-10-20>', '<12-35-09>') -> 'zoom-20261020-123509'.
@@ -162,7 +156,6 @@ def recording_pair(day: str, recording: str) -> str | None:
     if not match:
         return None
     return "zoom-" + match.group("day").replace("-", "") + "-" + match.group("time").replace("-", "")
-
 
 class Hooks:
     """Recordings the recorder announced as complete (POST /hook).
@@ -226,7 +219,6 @@ class Hooks:
         with self._lock:
             return [dict(entry) for entry in self._items.values()]
 
-
 def hook_view(hooks: Hooks, jobs: Jobs, pair: str | None = None) -> list[dict]:
     """Every announcement joined with the job its audio produced, if any."""
     entries = [hooks.get(pair)] if pair else hooks.list()
@@ -243,7 +235,6 @@ def hook_view(hooks: Hooks, jobs: Jobs, pair: str | None = None) -> list[dict]:
             state = job["status"]
         views.append({**entry, "job": job["id"] if job else None, "status": state})
     return views
-
 
 class Job:
     def __init__(self, identity: str, options: dict) -> None:
@@ -293,7 +284,6 @@ class Job:
                 "duration": self.duration,
                 # False once the audio is gone (deleted after a job, or --keep-audio off)
                 "audio": bool(audio and audio.is_file())}
-
 
 class Jobs:
     """A single-worker FIFO queue of transcription jobs, kept in memory."""
@@ -637,7 +627,6 @@ class Jobs:
         if process is not None and process.poll() is None:
             self._terminate(process)
 
-
 # --- live: audio in, source line and translation out -------------------------
 # A browser streams 16 kHz mono PCM16; a pause in the speech ends an utterance,
 # the utterance goes to the ASR endpoint as one clip, and the line comes back
@@ -681,7 +670,6 @@ def translate_prompt(target: str) -> str:
     """The system prompt, with the language *name*: a bare code gets misread."""
     return TRANSLATE_PROMPT.format(target=LANG_NAMES.get(target.lower(), target or "English"))
 
-
 def sentence_head(text: str, minimum: int) -> tuple[str, str]:
     """The first complete sentence past `minimum` characters, and what is left.
 
@@ -701,14 +689,12 @@ def sentence_head(text: str, minimum: int) -> tuple[str, str]:
             return text[:end].strip(), text[end:].strip()
     return "", text
 
-
 def frame_rms(pcm: bytes) -> list[int]:
     """The level of every 20 ms frame, so speech and room noise can be told apart."""
     step = int(LIVE_RATE * LIVE_FRAME) * 2
     return [int(math.sqrt(sum(sample * sample for sample in array.array("h", pcm[i:i + step]))
                           / (step // 2)))
             for i in range(0, len(pcm) - step + 1, step)]
-
 
 def vad_cut(pcm: bytes, threshold: int,
             silence: float = LIVE_CUT) -> tuple[int, bool] | None:
@@ -748,7 +734,6 @@ def vad_cut(pcm: bytes, threshold: int,
     at = quietest + min(range(span - quietest), key=lambda i: frames[quietest + i])
     return max(at, 1) * step, any(spoken[:at])
 
-
 def wav_bytes(pcm: bytes) -> bytes:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as handle:
@@ -757,7 +742,6 @@ def wav_bytes(pcm: bytes) -> bytes:
         handle.setframerate(LIVE_RATE)
         handle.writeframes(pcm)
     return buffer.getvalue()
-
 
 def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
     """A multipart/form-data body with text fields and one file part."""
@@ -771,7 +755,6 @@ def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
     body += data + f"\r\n--{boundary}--\r\n".encode()
     return bytes(body), boundary
 
-
 # Queued after a clip when the pause outlasted LIVE_LINE: close the line now.
 CLOSE = object()
 
@@ -784,11 +767,72 @@ CLOSE = object()
 LIVE_MARKER = re.compile(r"\[[^\]]{0,40}\]")
 LIVE_SPEAKER_LABEL = re.compile(r"Speaker\s+\d+\s*:", re.IGNORECASE)
 
-
 def clean_live_text(text: str) -> str:
     """The words alone, whatever markers the ASR wrapped them in."""
     return " ".join(LIVE_MARKER.sub(" ", LIVE_SPEAKER_LABEL.sub(" ", text)).split())
 
+class StreamingASR:
+    """One chunked POST held open for the whole session; deltas arrive as SSE.
+
+    This is the only way to see words while someone is still speaking: the
+    per-clip path sends nothing until a pause (or LIVE_MAX), so a line can only
+    appear whole. Measured on the 7B, deltas land every ~3 s of speech.
+
+    A raw socket, not http.client: that one refuses to read the response while
+    the chunked body is still being written, which is exactly this request.
+    """
+
+    def __init__(self, base: str, model: str, on_text) -> None:
+        parsed = urllib.parse.urlsplit(base)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        path = (parsed.path or "").rstrip("/") + "/v1/audio/transcriptions/live?" + \
+            urllib.parse.urlencode({"model": model})
+        self.sock = socket.create_connection((host, port), timeout=900)
+        self.sock.sendall(
+            (f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+             "Content-Type: audio/pcm\r\nTransfer-Encoding: chunked\r\n"
+             "Connection: close\r\n\r\n").encode())
+        self.on_text = on_text
+        self.dead = False
+        self._lock = threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        try:
+            for raw in self.sock.makefile("rb"):
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "transcript.text.delta":
+                    self.on_text(str(event.get("delta") or ""))
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.dead = True
+
+    def feed(self, pcm: bytes) -> None:
+        if self.dead:
+            return
+        with self._lock:
+            try:
+                self.sock.sendall(b"%x\r\n" % len(pcm) + pcm + b"\r\n")
+            except OSError:
+                self.dead = True
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self.sock.sendall(b"0\r\n\r\n")
+            except OSError:
+                pass
 
 class LiveSession:
     """One stream: audio chunks in, transcribed and translated rows out."""
@@ -819,6 +863,7 @@ class LiveSession:
         self._state = "idle"
         self._voice: list[float] | None = None   # mean of the line's clips
         self._closing = False                    # a close is already queued
+        self.stream: StreamingASR | None = None  # only with --live-stream
         self._queue: queue.Queue = queue.Queue()
         self._lock = threading.RLock()
         threading.Thread(target=self._work, daemon=True).start()
@@ -834,6 +879,17 @@ class LiveSession:
                 # The room's own level: a noisy room must not look like speech.
                 floor = sorted(self._history)[len(self._history) // 5]
                 self._noise = max(LIVE_FLOOR, int(floor * 2.5))
+            if getattr(self.live, "stream_asr", False):
+                # Nothing is cut: the model segments as it listens, and its
+                # deltas grow the row while the speaker is still talking. Only
+                # the tail is kept, for the pause that ends the line.
+                if self.stream is None:
+                    self.stream = StreamingASR(self.live.asr, self.live.model,
+                                               self._streamed)
+                self.stream.feed(pcm)
+                self._pcm = self._pcm[-int(self.silence * 4 * LIVE_BYTES_PER_S):]
+                self._close_on_pause()
+                return
             while True:
                 cut = vad_cut(self._pcm, self._noise)
                 if cut is None:
@@ -842,20 +898,26 @@ class LiveSession:
                 clip, self._pcm = self._pcm[:at], self._pcm[at:]
                 if speech and len(clip) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S:
                     self._queue.put(clip)
-            # The clip is queued but the line is not over: silence that keeps
-            # going past LIVE_LINE closes it, without waiting for the ASR. This
-            # is what lets clips stay short (0.45 s) while lines stay whole, and
-            # what lets a voice change be seen between two short clips.
-            if self._pending and not self._closing and len(self._pcm) >= 640:
-                tail = self._pcm[-int(self.silence * 3 * LIVE_BYTES_PER_S):]
-                quiet = 0
-                for value in reversed(frame_rms(tail)):
-                    if value >= self._noise:
-                        break
-                    quiet += 1
-                if quiet * LIVE_FRAME >= self.silence:
-                    self._closing = True
-                    self._queue.put(CLOSE)
+            self._close_on_pause()
+
+    def _close_on_pause(self) -> None:
+        """End the line when the room has been quiet for LIVE_LINE.
+
+        The clip may be queued but the line is not over: silence that keeps
+        going past LIVE_LINE closes it, without waiting for the ASR. This is what
+        lets clips stay short (0.45 s) while lines stay whole, and what lets a
+        voice change be seen between two short clips.
+        """
+        if self._pending and not self._closing and len(self._pcm) >= 640:
+            tail = self._pcm[-int(self.silence * 3 * LIVE_BYTES_PER_S):]
+            quiet = 0
+            for value in reversed(frame_rms(tail)):
+                if value >= self._noise:
+                    break
+                quiet += 1
+            if quiet * LIVE_FRAME >= self.silence:
+                self._closing = True
+                self._queue.put(CLOSE)
 
     def close(self) -> None:
         with self._lock:
@@ -863,6 +925,8 @@ class LiveSession:
                 return
             self.closed = True
             self.last = time.monotonic()
+            if self.stream is not None:
+                self.stream.close()
             tail, self._pcm = self._pcm, b""
             # Only if someone is still talking: Whisper invents words on silence.
             if (len(tail) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S
@@ -935,6 +999,20 @@ class LiveSession:
                 self._flush()
             if src:
                 self._hear(src, closed=other, voice=voice)
+
+    def _streamed(self, delta: str) -> None:
+        """A piece of the line, while the speaker is still talking."""
+        text = clean_live_text(delta)
+        if not text:
+            return
+        with self._lock:
+            if self._pending and self._pending_row >= 0:
+                self._pending = f"{self._pending} {text}".strip()
+                self.rows[self._pending_row]["src"] = self._pending
+            else:
+                self.rows.append({"src": text, "mt": "", "done": False})
+                self._pending, self._pending_row = text, len(self.rows) - 1
+                self._pending_at = time.monotonic()
 
     def _set_state(self, state: str) -> None:
         with self._lock:
@@ -1037,7 +1115,6 @@ class LiveSession:
                 # was said, the pair tells it how we said it before.
                 self._sources.append(f"{text} -> {translated}")
 
-
 class Live:
     """The live sessions, and the GPU lock they share with the job queue."""
 
@@ -1045,12 +1122,15 @@ class Live:
                  lock_path: Path, idle: float = 120, glossary: str = "",
                  silence: float = LIVE_LINE, embedder: str = "",
                  speaker: float = LIVE_SPEAKER, live_asr: str = "",
-                 live_model: str = "") -> None:
+                 live_model: str = "", stream_asr: bool = False) -> None:
         # The live path can use its own endpoint: a clip every half second makes
         # the fixed cost of a request the whole budget (gufo 0.78 s, Whisper
         # through Lemonade 0.24 s, measured), and the jobs keep their own choice.
         self.asr = (live_asr or asr).rstrip("/")
         self.model = live_model or model
+        # One long request per session instead of one per clip: the model's
+        # deltas grow the line while the speaker is still talking.
+        self.stream_asr = stream_asr
         self.llm = llm.rstrip("/")
         self.translate_model = translate_model
         self.glossary = glossary
@@ -1095,7 +1175,8 @@ class Live:
 
     def get(self, identity: str) -> LiveSession | None:
         with self._lock:
-            return self.sessions.get(identity)
+            found = self.sessions.get(identity)
+            return found
 
     def close(self, identity: str) -> LiveSession | None:
         session = self.get(identity)
@@ -1238,10 +1319,8 @@ class Live:
                         # still be collected; then forgotten.
                         del self.sessions[identity]
 
-
 class ToolError(Exception):
     pass
-
 
 def tools() -> list[dict]:
     return [
@@ -1279,7 +1358,6 @@ def tools() -> list[dict]:
              "required": ["id"]}},
     ]
 
-
 def call_tool(jobs: Jobs, name: str, arguments: dict) -> str:
     if name == "transcribe_meeting":
         encoded = arguments.get("audio_base64")
@@ -1301,7 +1379,6 @@ def call_tool(jobs: Jobs, name: str, arguments: dict) -> str:
             return f"job {job['id']} is {job['status']}" + (f": {job['error']}" if job["error"] else "")
         return json.dumps(job["json"]) if arguments.get("format") == "json" else job["markdown"]
     raise ToolError(f"unknown tool {name!r}")
-
 
 def mcp_response(jobs: Jobs, message: dict) -> dict | None:
     """JSON-RPC reply for one message; None for a notification."""
@@ -1331,7 +1408,6 @@ def mcp_response(jobs: Jobs, message: dict) -> dict | None:
     if identity is None:
         return None
     return {"jsonrpc": "2.0", "id": identity, "result": result}
-
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1567,7 +1643,6 @@ class Handler(BaseHTTPRequestHandler):
                                           "started", "finished", "options", "progress",
                                           "tracks", "duration", "audio")}
 
-
 class Server(ThreadingHTTPServer):
     def __init__(self, address, jobs: Jobs, hooks: Hooks, token: str,
                  max_upload: int, live: Live) -> None:
@@ -1577,7 +1652,6 @@ class Server(ThreadingHTTPServer):
         self.max_upload = max_upload
         self.live = live
         super().__init__(address, Handler)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Async transcription jobs with a REST and MCP endpoint.")
@@ -1651,6 +1725,10 @@ def main() -> None:
     parser.add_argument("--live-speaker", type=float, default=LIVE_SPEAKER,
                         help="cosine below which two clips are different speakers "
                              f"(default {LIVE_SPEAKER})")
+    parser.add_argument("--live-stream", action="store_true",
+                        help="feed the live audio to audio.cpp's streaming endpoint "
+                             "(/v1/audio/transcriptions/live) instead of sending one clip "
+                             "per utterance: the text grows while the speaker talks")
     parser.add_argument("--live-glossary", default="",
                         help="names and terms the live translation must leave unchanged, "
                              "comma separated (default: none)")
@@ -1664,13 +1742,15 @@ def main() -> None:
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
     live = Live(args.asr, args.model, args.translate_url, args.translate_model,
                 args.lock, args.live_idle, args.live_glossary, args.live_silence,
-                args.live_embedder, args.live_speaker, args.live_asr, args.live_model)
+                args.live_embedder, args.live_speaker, args.live_asr, args.live_model,
+                args.live_stream)
     server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload, live)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     translate = args.translate_model or "no translation (--translate-model is empty)"
     print(f"live: speech embedding {'via ' + args.live_embedder if args.live_embedder else 'off'}"
           f", line closes at {args.live_silence:g}s of pause"
-          f", asr {live.asr} ({live.model})", flush=True)
+          f", asr {live.asr} ({live.model})"
+          f"{' streaming' if live.stream_asr else ' per clip'}", flush=True)
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)
     print(f"live translation: {translate}", flush=True)
 
@@ -1681,7 +1761,6 @@ def main() -> None:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     server.serve_forever()
-
 
 if __name__ == "__main__":
     main()
