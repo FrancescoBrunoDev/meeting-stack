@@ -636,7 +636,13 @@ LIVE_RATE = 16000
 LIVE_FRAME = 0.02                       # seconds of audio per energy frame
 LIVE_BYTES_PER_S = LIVE_RATE * 2
 LIVE_CUT = 0.6                          # a pause this long ends an ASR clip
-LIVE_LINE = 0.8                         # a pause this long ends the line
+LIVE_LINE = 1.5                         # a pause this long ends the line
+# A new paragraph starts at a full stop, not at a breath: a pause closes the
+# line only when the sentence is over, unless the silence runs much longer or
+# the line is already long. Cutting mid-sentence is the one thing that must not
+# happen — the translation of half a clause reads as a mistake.
+LIVE_SENTENCE_END = ".!?…"
+LIVE_LINE_HARD = 3.0                    # a pause this many times longer closes anyway
 LIVE_MIN_SPEECH = 0.6                   # a shorter cut is dropped, not transcribed
 # No pause at all: cut here, at the quietest frame. Measured from the page with
 # continuous speech, 20 s meant the first text appeared after ten seconds and
@@ -931,9 +937,15 @@ class LiveSession:
                 if value >= self._noise:
                     break
                 quiet += 1
-            if quiet * LIVE_FRAME >= self.silence:
-                self._closing = True
-                self._queue.put(CLOSE)
+            paused = quiet * LIVE_FRAME
+            if paused < self.silence:
+                return
+            sentence = self._pending.rstrip().endswith(tuple(LIVE_SENTENCE_END))
+            if not sentence and paused < self.silence * LIVE_LINE_HARD \
+                    and len(self._pending) < LIVE_PENDING_CHARS:
+                return                      # keep the line open until the sentence ends
+            self._closing = True
+            self._queue.put(CLOSE)
 
     def close(self) -> None:
         with self._lock:
@@ -1771,10 +1783,10 @@ def main() -> None:
     parser.add_argument("--live-idle", type=float, default=120,
                         help="seconds a live session may go without audio before it closes "
                              "(default 120)")
-    parser.add_argument("--live-silence", type=float, default=0.8,
-                        help="a pause this long ends a live line (default 0.8; 0.5 is "
-                             "chattier and splits more, 1.2 merges more); clips are cut "
-                             f"at {LIVE_CUT:g}s whatever this says")
+    parser.add_argument("--live-silence", type=float, default=LIVE_LINE,
+                        help="a pause this long ends a live line (default "
+                             f"{LIVE_LINE:g}); a line also needs to end on a full stop, "
+                             "unless the silence runs three times longer")
     parser.add_argument("--live-embedder", default="",
                         help="diarizer image used for speaker embeddings, so a line also "
                              "ends when the voice changes (e.g. localhost/halogen-diarizer); "
