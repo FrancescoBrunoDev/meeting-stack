@@ -544,7 +544,7 @@ export default function Live() {
         </CardContent>
       </Card>
 
-      {rows.length > 0 ? (
+      {rows.length > 0 || started ? (
         <Card
           className={cn(
             "flex min-h-0 flex-col overflow-hidden",
@@ -599,6 +599,16 @@ export default function Live() {
                   </p>
                 </div>
               ))}
+              {rows.length === 0 && (
+                // The box is there from the first second: dictating into an empty
+                // page that says "nothing yet" reads as if it were not listening.
+                <div className="grid gap-1 border-b px-6 py-4 last:border-b-0">
+                  <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+                    <span className="animate-pulse">▌</span>
+                  </p>
+                  <p className="whitespace-pre-wrap text-base leading-snug text-foreground">…</p>
+                </div>
+              )}
             </div>
           </div>
         </Card>
