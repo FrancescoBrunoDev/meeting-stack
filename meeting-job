@@ -638,11 +638,11 @@ LIVE_BYTES_PER_S = LIVE_RATE * 2
 LIVE_CUT = 0.6                          # a pause this long ends an ASR clip
 LIVE_LINE = 1.5                         # a pause this long ends the line
 # A new paragraph starts at a full stop, not at a breath: a pause closes the
-# line only when the sentence is over, unless the silence runs much longer or
-# the line is already long. Cutting mid-sentence is the one thing that must not
-# happen — the translation of half a clause reads as a mistake.
+# line only when the sentence is over, however long the pause was. Cutting
+# mid-sentence is the one thing that must not happen — the translation of half a
+# clause reads as a mistake, and a five-second silence in the middle of a
+# sentence is still the middle of a sentence.
 LIVE_SENTENCE_END = ".!?…"
-LIVE_LINE_HARD = 3.0                    # a pause this many times longer closes anyway
 LIVE_MIN_SPEECH = 0.6                   # a shorter cut is dropped, not transcribed
 # No pause at all: cut here, at the quietest frame. Measured from the page with
 # continuous speech, 20 s meant the first text appeared after ten seconds and
@@ -959,13 +959,10 @@ class LiveSession:
                 if value >= self._noise:
                     break
                 quiet += 1
-            paused = quiet * LIVE_FRAME
-            if paused < self.silence:
+            if quiet * LIVE_FRAME < self.silence:
                 return
-            sentence = self._pending.rstrip().endswith(tuple(LIVE_SENTENCE_END))
-            if not sentence and paused < self.silence * LIVE_LINE_HARD \
-                    and len(self._pending) < LIVE_PENDING_CHARS:
-                return                      # keep the line open until the sentence ends
+            if not self._pending.rstrip().endswith(tuple(LIVE_SENTENCE_END)):
+                return                      # the sentence is not over: same paragraph
             self._closing = True
             self._queue.put(CLOSE)
 
@@ -1067,6 +1064,13 @@ class LiveSession:
                     return                  # the model said it again: not new words
                 self._pending = f"{self._pending} {fresh}".strip()
                 self.rows[self._pending_row]["src"] = self._pending
+                if (len(self._pending) >= LIVE_PENDING_CHARS and not self._closing
+                        and self._pending.rstrip().endswith(tuple(LIVE_SENTENCE_END))):
+                    # Too long to keep growing: close it, but only where a
+                    # sentence ends — the length is the trigger, the stop is the
+                    # place.
+                    self._closing = True
+                    self._queue.put(CLOSE)
                 if (not self._partial_busy
                         and len(self._pending) - self._translated >= LIVE_TRANSLATE_EVERY):
                     # Do not wait for the pause: translate what is there, and

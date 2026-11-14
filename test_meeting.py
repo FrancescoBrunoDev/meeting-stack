@@ -216,6 +216,23 @@ class Defaults(unittest.TestCase):
                          [(1, 1.74, 2.61, "Hallo zusammen."), (2, 3.06, 3.51, "Hallo."),
                           (2, 11.1, 12.01, "Morgen.")])
 
+    def test_a_long_pause_does_not_end_a_half_sentence(self):
+        fake = types.SimpleNamespace(
+            transcribe=lambda pcm, language: "", translate=lambda *a, **k: "",
+            embed=lambda pcm: None, settled=lambda session: None,
+            embedder="", speaker=meeting_job.LIVE_SPEAKER)
+        session = meeting_job.LiveSession(fake, "de", "it")
+        session._pending, session._pending_row = "die drei Tage sind", 0
+        session.rows.append({"src": session._pending, "mt": "", "done": False})
+        # ten seconds of silence: longer than any threshold the old rule had
+        session._pcm = b"\x00\x00" * int(meeting_job.LIVE_RATE * 10)
+        session._noise = meeting_job.LIVE_FLOOR
+        session._close_on_pause()
+        self.assertTrue(session._queue.empty(), "a half sentence must stay open")
+        session._pending = "die drei Tage sind vorbei."
+        session._close_on_pause()
+        self.assertFalse(session._queue.empty(), "a full stop ends the line")
+
     def test_a_repeated_delta_is_not_appended_twice(self):
         line = ("Allora, quando una pausa viene fatta si inizia un nuovo paragrafo. "
                 "E invece no, ecco che siamo inculati subito.")
