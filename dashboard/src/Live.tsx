@@ -28,36 +28,38 @@ const TARGETS = ["it", "en", "de", "fr"]
 const CHUNK = 8000 // samples: half a second of 16 kHz audio per request
 
 /**
- * The characters that just arrived, revealed one by one.
+ * The characters that just arrived, added one at a time.
  *
- * Only the part that changed is animated: the text that was already there is
- * rendered as plain text, so a re-translated line does not type itself out again
- * from the first letter.
+ * Not a fade: the text is actually revealed a character at a time, so the line
+ * grows the way someone types it. Only the part that changed is typed — the text
+ * that was already there is shown as it is, so a re-translated line does not
+ * type itself out again from the first letter.
  */
 function Typing({ text }: { text: string }) {
-  const shown = useRef("")
-  const [parts, setParts] = useState({ stable: text, fresh: "" })
+  const [shown, setShown] = useState(text)
+  const visible = useRef(text)
   useEffect(() => {
     let common = 0
-    const limit = Math.min(shown.current.length, text.length)
-    while (common < limit && shown.current[common] === text[common]) common++
-    shown.current = text
-    setParts({ stable: text.slice(0, common), fresh: text.slice(common) })
+    const limit = Math.min(visible.current.length, text.length)
+    while (common < limit && visible.current[common] === text[common]) common++
+    // The stable part is never re-typed; if it changed, it changes at once.
+    visible.current = text.slice(0, common)
+    setShown(visible.current)
+    let at = common
+    let timer = 0
+    const step = () => {
+      // One character at a time, and only a long chunk goes two at a time so a
+      // whole sentence does not take two seconds to appear.
+      const take = text.length - at > 80 ? 2 : 1
+      at = Math.min(at + take, text.length)
+      visible.current = text.slice(0, at)
+      setShown(visible.current)
+      if (at < text.length) timer = window.setTimeout(step, 18)
+    }
+    if (common < text.length) timer = window.setTimeout(step, 18)
+    return () => window.clearTimeout(timer)
   }, [text])
-  return (
-    <>
-      {parts.stable}
-      {Array.from(parts.fresh).map((char, index) => (
-        <span
-          key={`${index}-${char}`}
-          className="animate-in fade-in duration-150"
-          style={{ animationDelay: `${Math.min(index * 14, 600)}ms` }}
-        >
-          {char}
-        </span>
-      ))}
-    </>
-  )
+  return <>{shown}</>
 }
 
 /**
