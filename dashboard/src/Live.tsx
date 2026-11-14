@@ -541,20 +541,19 @@ export default function Live() {
                 <div
                   key={row.i}
                   className="grid snap-start gap-1 border-b px-6 py-4 last:border-b-0"
-                  style={{ opacity: fade(rows.length - 1 - row.i) }}
                 >
-                  {/* The line being spoken reads like a caption: bigger, and
-                      with the caret after it, so the growth is visible. */}
+                  {/* The translation is what is read: bigger, in the foreground,
+                      and it does not fade as the line ages. The source is the
+                      evidence underneath, small and quiet — the caret follows
+                      the words arriving, not the reading. */}
                   <p
-                    className={cn(
-                      "whitespace-pre-wrap text-muted-foreground",
-                      row.done ? "text-sm" : "text-base text-foreground"
-                    )}
+                    className="whitespace-pre-wrap text-sm text-muted-foreground"
+                    style={{ opacity: fade(rows.length - 1 - row.i) }}
                   >
                     {row.src}
                     {!row.done && <span className="animate-pulse">▌</span>}
                   </p>
-                  <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+                  <p className="whitespace-pre-wrap text-base leading-snug text-foreground">
                     {row.error ? (
                       <span className="text-destructive">{row.error}</span>
                     ) : (
