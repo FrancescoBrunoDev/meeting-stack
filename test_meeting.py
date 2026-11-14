@@ -983,6 +983,9 @@ class LiveLines(unittest.TestCase):
         self.assertEqual(
             meeting_job.clean_live_text(" \n Speaker 0:Das sind ja dann die drei Tage."),
             "Das sind ja dann die drei Tage.")
+        self.assertEqual(
+            meeting_job.clean_live_text("Okay. [Noise] Ja, natürlich [Laughter] weiter."),
+            "Okay. Ja, natürlich weiter.")
 
     def test_the_same_voice_keeps_one_line(self):
         calls = []
