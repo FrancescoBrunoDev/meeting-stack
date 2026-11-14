@@ -649,7 +649,12 @@ LIVE_BYTES_PER_S = LIVE_RATE * 2
 LIVE_CUT = 0.6                          # a pause this long ends an ASR clip
 LIVE_LINE = 0.8                         # a pause this long ends the line
 LIVE_MIN_SPEECH = 0.6                   # a shorter cut is dropped, not transcribed
-LIVE_MAX = 20.0                         # no pause at all: cut here, at the quietest frame
+# No pause at all: cut here, at the quietest frame. Measured from the page with
+# continuous speech, 20 s meant the first text appeared after ten seconds and
+# then nothing until the next pause — "everyone keeps talking" is exactly the
+# case that produced no text. A meeting pauses rarely, so this is the real
+# granularity of the page, not LIVE_CUT.
+LIVE_MAX = 4.0
 LIVE_FLOOR = 200                        # RMS below this is silence in any room
 TRANSLATE_PROMPT = (
     "You translate one line at a time from a live meeting into {target}. Keep the "
@@ -735,9 +740,12 @@ def vad_cut(pcm: bytes, threshold: int,
             return max(index + 1 - run, 1) * step, True
     if len(frames) * LIVE_FRAME < LIVE_MAX:
         return None
-    quietest = int(len(frames) * 0.6)
-    window = frames[quietest:]
-    at = quietest + min(range(len(window)), key=window.__getitem__)
+    # The quietest frame inside the allowed span, not inside the whole buffer:
+    # the buffer is a chunk longer than LIVE_MAX, so the old last-40% could cut
+    # at 5.4 s with LIVE_MAX at 4.
+    span = min(int(LIVE_MAX / LIVE_FRAME), len(frames))
+    quietest = int(span * 0.6)
+    at = quietest + min(range(span - quietest), key=lambda i: frames[quietest + i])
     return max(at, 1) * step, any(spoken[:at])
 
 
@@ -770,7 +778,10 @@ CLOSE = object()
 # The models put their own bookkeeping in the words: MOSS answers
 # "[0.00][S01] Hallo zusammen.[2.48]" and VibeVoice "\n Speaker 0:Hallo". On the
 # live page those are not labels, they are noise in the middle of the sentence.
-LIVE_MARKER = re.compile(r"\[(?:\d+(?:\.\d+)?|S\d+)\]")
+# Any bracketed tag: timestamps and speakers from MOSS, and VibeVoice's own
+# "[Noise]", "[Laughter]", "[Unintelligible Speech]". Capped in length so a long
+# bracketed sentence the speaker actually said is not swallowed.
+LIVE_MARKER = re.compile(r"\[[^\]]{0,40}\]")
 LIVE_SPEAKER_LABEL = re.compile(r"Speaker\s+\d+\s*:", re.IGNORECASE)
 
 
