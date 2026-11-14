@@ -27,6 +27,36 @@ const LANGUAGES = ["auto", "de", "it", "en", "fr", "es"]
 const TARGETS = ["it", "en", "de", "fr"]
 const CHUNK = 8000 // samples: half a second of 16 kHz audio per request
 
+/**
+ * The microphone's samples as 16 kHz, whatever rate the browser gave us.
+ *
+ * Asking for `new AudioContext({ sampleRate: 16000 })` is not portable: Gecko
+ * often hands back the device rate (48 kHz) instead, and refusing to run in that
+ * case left Firefox and Zen with an open microphone and no text at all. Down
+ * sampling averages the samples of each output step, which is a crude low-pass —
+ * enough for speech, and it keeps the pitch right.
+ */
+function toSixteen(input: Float32Array, rate: number): Int16Array {
+  const step = rate / 16000
+  const length = Math.max(1, Math.floor(input.length / step))
+  const pcm = new Int16Array(length)
+  for (let index = 0; index < length; index++) {
+    let value: number
+    if (step <= 1) {
+      value = input[Math.min(index, input.length - 1)]
+    } else {
+      const from = Math.floor(index * step)
+      const to = Math.min(Math.floor((index + 1) * step), input.length)
+      let sum = 0
+      for (let at = from; at < to; at++) sum += input[at]
+      value = sum / Math.max(1, to - from)
+    }
+    value = Math.max(-1, Math.min(1, value))
+    pcm[index] = value < 0 ? value * 0x8000 : value * 0x7fff
+  }
+  return pcm
+}
+
 /** A setting the page remembers: the next meeting starts where this one ended. */
 function useStored<T>(key: string, initial: T) {
   const name = `live-${key}`
@@ -171,27 +201,19 @@ export default function Live() {
 
   function graph(): boolean {
     if (context.current) return true
-    const created = new AudioContext({ sampleRate: 16000 })
-    if (created.sampleRate !== 16000) {
-      created.close().catch(() => {})
-      setError(
-        "This browser will not give a 16 kHz AudioContext: use Chrome or Firefox, or the line would be pitched."
-      )
-      return false
-    }
+    const created = new AudioContext()
     const gain = created.createGain()
     const node = created.createScriptProcessor(1024, 1, 1) // 64 ms: a meter that moves
     node.onaudioprocess = (event) => {
       const input = event.inputBuffer.getChannelData(0)
       event.outputBuffer.getChannelData(0).fill(0) // this node is only a tap
-      const pcm = new Int16Array(input.length)
       let peak = 0
       for (let index = 0; index < input.length; index++) {
-        const value = Math.max(-1, Math.min(1, input[index]))
-        pcm[index] = value < 0 ? value * 0x8000 : value * 0x7fff
-        if (Math.abs(pcm[index]) > peak) peak = Math.abs(pcm[index])
+        const value = Math.abs(input[index])
+        if (value > peak) peak = value
       }
-      level.current = Math.min(1, peak / 8000) // speech peaks around 1000-8000
+      level.current = Math.min(1, peak * 0x7fff / 8000) // speech peaks around 1000-8000
+      const pcm = toSixteen(input, created.sampleRate)
       samples.current.push(pcm)
       queued.current += pcm.length
       if (queued.current >= CHUNK) flush()
