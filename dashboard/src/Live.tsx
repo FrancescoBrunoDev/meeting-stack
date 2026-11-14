@@ -249,7 +249,23 @@ export default function Live() {
     setError(null)
   }
 
+  // Plain http:// to another host is not a secure context, and there
+  // navigator.mediaDevices does not exist at all — the failure would otherwise
+  // read "can't access property getUserMedia", which says nothing about why.
+  // Both capture paths need it: getUserMedia and getDisplayMedia alike.
+  function noCapture(): boolean {
+    if (navigator.mediaDevices) return false
+    setError(
+      `${window.location.origin} is not a secure context, so this browser exposes no ` +
+        "microphone and no screen capture. Open the page as http://127.0.0.1:8099/live " +
+        "on the box, through an SSH tunnel, or behind https: plain http:// to another " +
+        "host never works, in any browser."
+    )
+    return true
+  }
+
   async function startMicrophone() {
+    if (noCapture()) return
     if (!graph()) return
     try {
       begin()
@@ -274,6 +290,7 @@ export default function Live() {
   }
 
   async function startSystem() {
+    if (noCapture()) return
     if (/Firefox\//.test(navigator.userAgent)) {
       setError(
         "This browser (Firefox, and Zen on top of it) has no audio in screen sharing: " +
