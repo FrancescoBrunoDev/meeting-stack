@@ -787,6 +787,28 @@ class Partial:
 LIVE_MARKER = re.compile(r"\[[^\]]{0,40}\]")
 LIVE_SPEAKER_LABEL = re.compile(r"Speaker\s+\d+\s*:", re.IGNORECASE)
 
+def repeated_tail(pending: str, addition: str, window: int = 240) -> str:
+    """The part of `addition` that the line does not already say.
+
+    The streaming model loops on long audio: a phrase it has just said arrives
+    again, sometimes with something else in between, and appending it makes the
+    line claim the speaker repeated themselves. Measured on both VibeVoice sizes.
+    This only hides the symptom; the words after a loop are still the model's.
+    """
+    addition = addition.strip()
+    if not addition or not pending:
+        return addition
+    tail = pending[-window:].lower()
+    low = addition.lower()
+    if low in tail:
+        return ""
+    # A delta that starts by repeating the end of the line: keep what is new.
+    for size in range(min(len(low), 80), 3, -1):
+        if tail.endswith(low[:size]):
+            return addition[size:].strip()
+    return addition
+
+
 def clean_live_text(text: str) -> str:
     """The words alone, whatever markers the ASR wrapped them in."""
     return " ".join(LIVE_MARKER.sub(" ", LIVE_SPEAKER_LABEL.sub(" ", text)).split())
@@ -1040,7 +1062,10 @@ class LiveSession:
             return
         with self._lock:
             if self._pending and self._pending_row >= 0:
-                self._pending = f"{self._pending} {text}".strip()
+                fresh = repeated_tail(self._pending, text)
+                if not fresh:
+                    return                  # the model said it again: not new words
+                self._pending = f"{self._pending} {fresh}".strip()
                 self.rows[self._pending_row]["src"] = self._pending
                 if (not self._partial_busy
                         and len(self._pending) - self._translated >= LIVE_TRANSLATE_EVERY):

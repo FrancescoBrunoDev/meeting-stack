@@ -216,6 +216,16 @@ class Defaults(unittest.TestCase):
                          [(1, 1.74, 2.61, "Hallo zusammen."), (2, 3.06, 3.51, "Hallo."),
                           (2, 11.1, 12.01, "Morgen.")])
 
+    def test_a_repeated_delta_is_not_appended_twice(self):
+        line = ("Allora, quando una pausa viene fatta si inizia un nuovo paragrafo. "
+                "E invece no, ecco che siamo inculati subito.")
+        self.assertEqual(
+            meeting_job.repeated_tail(line, "E invece no, ecco che siamo inculati subito."),
+            "")
+        self.assertEqual(
+            meeting_job.repeated_tail(line, "inculati subito. Conosco questo paragrafo."),
+            "Conosco questo paragrafo.")
+
     def test_an_empty_audio_cpp_answer_is_no_turns(self):
         self.assertEqual(meeting.parse_diarized(""), [])
 
