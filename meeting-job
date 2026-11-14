@@ -656,6 +656,7 @@ LIVE_CONTEXT = 2                        # translated lines handed back as contex
 # box with different texts: 0.888-0.954 within one voice, 0.144-0.408 across), so
 # a line also ends where the voice changes, which a pause cannot tell you.
 LIVE_SPEAKER = 0.6
+LIVE_TRANSLATE_EVERY = 60               # source characters between partial translations
 LIVE_PENDING_CHARS = 220                # a longer line is closed at a full stop
 SENTENCE_END = ".!?\u2026"
 CLOSERS = "\"'\u00bb\u201c\u201d\u2019)]"  # may follow the full stop: "«…»"
@@ -758,6 +759,19 @@ def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
 # Queued after a clip when the pause outlasted LIVE_LINE: close the line now.
 CLOSE = object()
 
+
+class Partial:
+    """Translate the row that is still open, and leave it open.
+
+    Not a tuple: the queue already carries clips, and the tests queue those as
+    (pcm, final) pairs.
+    """
+
+    __slots__ = ("row", "text")
+
+    def __init__(self, row: int, text: str) -> None:
+        self.row, self.text = row, text
+
 # The models put their own bookkeeping in the words: MOSS answers
 # "[0.00][S01] Hallo zusammen.[2.48]" and VibeVoice "\n Speaker 0:Hallo". On the
 # live page those are not labels, they are noise in the middle of the sentence.
@@ -858,6 +872,8 @@ class LiveSession:
         self._pending = ""
         self._pending_row = 0
         self._pending_at = 0.0
+        self._translated = 0                     # source length at the last partial translation
+        self._partial_busy = False                # a partial translation is in flight
         # What the worker is doing right now, for the page: silence on screen
         # while a 10 s stretch waits for a pause reads as "the thing is broken".
         self._state = "idle"
@@ -964,6 +980,11 @@ class LiveSession:
                 self.done = True
                 self.live.settled(self)     # the GPU is free: a new session may start
                 return
+            if isinstance(item, Partial):
+                self._say_partial(item.text, item.row)
+                with self._lock:
+                    self._partial_busy = False
+                continue
             clip = item
             box: dict = {}
             listener = None
@@ -1009,10 +1030,20 @@ class LiveSession:
             if self._pending and self._pending_row >= 0:
                 self._pending = f"{self._pending} {text}".strip()
                 self.rows[self._pending_row]["src"] = self._pending
+                if (not self._partial_busy
+                        and len(self._pending) - self._translated >= LIVE_TRANSLATE_EVERY):
+                    # Do not wait for the pause: translate what is there, and
+                    # translate again when the line has grown some more. One at
+                    # a time, or the queue fills with stale versions of a line
+                    # nobody will read.
+                    self._partial_busy = True
+                    self._translated = len(self._pending)
+                    self._queue.put(Partial(self._pending_row, self._pending))
             else:
                 self.rows.append({"src": text, "mt": "", "done": False})
                 self._pending, self._pending_row = text, len(self.rows) - 1
                 self._pending_at = time.monotonic()
+                self._translated = 0
 
     def _set_state(self, state: str) -> None:
         with self._lock:
@@ -1059,6 +1090,8 @@ class LiveSession:
                 return
             text, row = self._pending, self._pending_row
             self._pending = ""
+            self._translated = 0
+            self._partial_busy = False
             self._voice = None              # the next clip opens a new line
             if overlong and not closed and not held:
                 # Cut the line at a full stop and let the rest keep growing.
@@ -1081,6 +1114,34 @@ class LiveSession:
             self._voice = None
             self._closing = False
         self._say(text, row)
+
+    def _say_partial(self, text: str, row: int) -> None:
+        """Translate the line as far as it goes, and leave it open.
+
+        The row keeps growing after this: the source is the truth, and the
+        translation is replaced by a fresher one at the next threshold or by the
+        final one when the line closes.
+        """
+        with self._lock:
+            context = list(self._sources)
+            if row >= len(self.rows) or self.rows[row].get("done"):
+                return
+
+        def grew(partial: str) -> None:
+            with self._lock:
+                if not self.rows[row].get("done"):
+                    self.rows[row]["mt"] = partial
+
+        self._set_state("mt")
+        try:
+            translated = self.live.translate(text, self.target, context, grew)
+        except (OSError, ValueError):
+            self._set_state("idle")
+            return
+        with self._lock:
+            if not self.rows[row].get("done") and translated:
+                self.rows[row]["mt"] = translated
+            self._state = "idle"
 
     def _say(self, text: str, row: int) -> None:
         """Translate the whole sentence into its row, filling it token by token."""
