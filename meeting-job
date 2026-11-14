@@ -874,6 +874,7 @@ class LiveSession:
         self._pending_at = 0.0
         self._translated = 0                     # source length at the last partial translation
         self._partial_busy = False                # a partial translation is in flight
+        self._mt_src = ""                         # source already reflected in the row's mt
         # What the worker is doing right now, for the page: silence on screen
         # while a 10 s stretch waits for a pause reads as "the thing is broken".
         self._state = "idle"
@@ -1044,6 +1045,7 @@ class LiveSession:
                 self._pending, self._pending_row = text, len(self.rows) - 1
                 self._pending_at = time.monotonic()
                 self._translated = 0
+                self._mt_src = ""
 
     def _set_state(self, state: str) -> None:
         with self._lock:
@@ -1092,6 +1094,7 @@ class LiveSession:
             self._pending = ""
             self._translated = 0
             self._partial_busy = False
+            self._mt_src = ""
             self._voice = None              # the next clip opens a new line
             if overlong and not closed and not held:
                 # Cut the line at a full stop and let the rest keep growing.
@@ -1104,6 +1107,82 @@ class LiveSession:
                     self._pending_at = time.monotonic()
                     self._voice = voice      # the tail is the same speaker
         self._say(text, row)
+
+    def _flush(self) -> None:
+        with self._lock:
+            if not self._pending:
+                return
+            text, row = self._pending, self._pending_row
+            self._pending = ""
+            self._voice = None
+            self._closing = False
+        self._say(text, row)
+
+    def _say_partial(self, text: str, row: int) -> None:
+        """Translate what the line has gained, and leave the rest as it was.
+
+        The stable part of the translation must not be rewritten: re-translating
+        the whole line changed words the speaker had not changed, which read as
+        flicker. Only the tail past the last translated source is sent, with the
+        pair already produced as context so the wording stays continuous.
+        """
+        self._translate_into(text, row, done=False)
+
+    def _say(self, text: str, row: int) -> None:
+        """Translate the rest of the line into its row, and close it."""
+        self._translate_into(text, row, done=True)
+
+    def _translate_into(self, text: str, row: int, done: bool) -> None:
+        with self._lock:
+            if row >= len(self.rows) or self.rows[row].get("done"):
+                return
+            already = self._mt_src
+            previous = self.rows[row].get("mt", "")
+            context = list(self._sources)
+        tail = text[len(already):].strip() if already else text
+        if not tail:
+            if done:
+                with self._lock:
+                    self.rows[row]["done"] = True
+                    self._state = "idle"
+            return
+        if already and previous:
+            context.append(f"{already} -> {previous}")
+
+        def grew(partial: str) -> None:
+            with self._lock:
+                self.rows[row]["mt"] = (f"{previous} {partial}".strip()
+                                        if previous else partial)
+
+        self._set_state("mt")
+        try:
+            translated = self.live.translate(tail, self.target, context, grew)
+            if not translated and context:
+                # An empty answer is not an answer: try once without the context.
+                translated = self.live.translate(tail, self.target, [], None)
+        except (OSError, ValueError) as error:
+            with self._lock:
+                self._state = "idle"
+                if done:
+                    self.rows[row]["error"] = str(error)[:300]
+                    self.rows[row]["done"] = True
+            return
+        with self._lock:
+            merged = f"{previous} {translated}".strip() if previous else translated
+            self.rows[row]["mt"] = merged
+            self._mt_src = text
+            if not done:
+                self._state = "idle"
+                return
+            self.rows[row]["done"] = True
+            self._state = "idle"
+            if not merged:
+                # Say it, instead of leaving the page on "…" for ever.
+                self.rows[row]["error"] = "the model returned no translation"
+            else:
+                # Both sides of the line: the source alone tells the model what
+                # was said, the pair tells it how we said it before.
+                self._sources.append(f"{text} -> {merged}")
 
     def _flush(self) -> None:
         with self._lock:
