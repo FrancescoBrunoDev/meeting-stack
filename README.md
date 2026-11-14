@@ -70,6 +70,10 @@ reference on this box, so the two transcripts only give their disagreement with
 each other: **33.8% of words** (35.4% without `--language de`). That is not an
 accuracy verdict for either model.
 
+The HTTP API (batch jobs, live sessions, MCP) is written up in
+[API.md](API.md), which is the file to hand to anything that has to talk to this
+service.
+
 ## Requirements
 
 - an OpenAI-compatible ASR: gufo on `http://127.0.0.1:8097` serving
