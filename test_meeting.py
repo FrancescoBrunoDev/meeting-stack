@@ -273,6 +273,47 @@ class RecordingLength(unittest.TestCase):
             self.assertIsNone(meeting.wav_seconds(path))
 
 
+class MergeParagraphs(unittest.TestCase):
+    """The model draws a line every five seconds; most of them are not breaks."""
+
+    def test_a_sentence_cut_in_the_middle_is_one_paragraph(self):
+        turns = [{"speaker": 1, "start": 7.8, "end": 13.2, "text": "perché è proprio"},
+                 {"speaker": 1, "start": 13.2, "end": 18.5, "text": "istintivo."}]
+        merged = meeting.merge_paragraphs(turns)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["text"], "perché è proprio istintivo.")
+        self.assertEqual((merged[0]["start"], merged[0]["end"]), (7.8, 18.5))
+
+    def test_a_finished_sentence_stays_its_own_paragraph(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 3.0, "text": "Non capisco."},
+                 {"speaker": 1, "start": 3.0, "end": 6.0, "text": "Sta funzionando?"}]
+        self.assertEqual(len(meeting.merge_paragraphs(turns)), 2)
+
+    def test_a_change_of_speaker_is_never_joined(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 3.0, "text": "perché è proprio"},
+                 {"speaker": 2, "start": 3.0, "end": 6.0, "text": "istintivo."}]
+        merged = meeting.merge_paragraphs(turns)
+        self.assertEqual([turn["speaker"] for turn in merged], [1, 2])
+
+    def test_a_silence_is_a_break(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 3.0, "text": "perché è proprio"},
+                 {"speaker": 1, "start": 5.0, "end": 8.0, "text": "istintivo."}]
+        self.assertEqual(len(meeting.merge_paragraphs(turns)), 2)
+
+    def test_a_monologue_is_cut_at_the_length_cap(self):
+        turns = [{"speaker": 1, "start": 0.0, "end": 3.0, "text": "a" * 300},
+                 {"speaker": 1, "start": 3.0, "end": 6.0, "text": "b" * 200}]
+        merged = meeting.merge_paragraphs(turns)
+        self.assertEqual(len(merged), 2)
+        self.assertTrue(all(len(turn["text"]) <= meeting.PARAGRAPH_CHARS for turn in merged))
+
+    def test_overlapping_tracks_are_not_joined(self):
+        # Two tracks can carry the same speaker at the same moment.
+        turns = [{"speaker": 1, "start": 0.0, "end": 5.0, "text": "perché è proprio"},
+                 {"speaker": 1, "start": 2.0, "end": 6.0, "text": "istintivo."}]
+        self.assertEqual(len(meeting.merge_paragraphs(turns)), 2)
+
+
 class TwoTracks(unittest.TestCase):
     """System track + microphone track: one conversation, two files."""
 

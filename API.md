@@ -68,8 +68,14 @@ percentage. When `done`, the job carries `json` and `markdown`:
 ```
 
 `duration` is the length of the recording, not how long the job took. Turns are
-sorted and non-overlapping; `speaker` is an integer, and `name` appears when
-`names` was given.
+sorted; `speaker` is an integer, and `name` appears when `names` was given. Two
+tracks can overlap on purpose (two people talking at once are two lines).
+
+A turn is **a paragraph, not the model's segment**. MOSS closes a segment every
+~5 seconds whatever is being said, so consecutive segments of the same speaker
+with a small gap and a sentence still unfinished are joined, up to 400
+characters. Do not assume one turn per utterance, and do not assume a turn
+boundary is a pause.
 
 ### MCP
 

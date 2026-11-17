@@ -852,6 +852,40 @@ def merge_tracks(first: list[dict], second: list[dict], offset: float = 0.0) -> 
     return sorted(first + shifted, key=lambda turn: (turn["start"], turn["end"]))
 
 
+PARAGRAPH_CHARS = 400   # a merged turn stays a paragraph, not a wall of text
+PARAGRAPH_GAP = 1.0     # a longer silence is a break the speaker made
+
+
+def merge_paragraphs(turns: list[dict], cap: float = PARAGRAPH_CHARS,
+                     gap: float = PARAGRAPH_GAP) -> list[dict]:
+    """Join the segments the model cut in the middle of a sentence.
+
+    MOSS closes a segment every ~5 seconds whatever is being said, and its segment
+    ends are rarely sentence ends: 34 of 44 turns on a real meeting stopped in the
+    middle of a phrase, the speaker unchanged. Same speaker, a small gap and a
+    sentence not finished yet means the model drew a line, not the speaker.
+
+    Runs on the finished timeline, after the tracks are merged: a longer first-track
+    turn would otherwise cover more of the microphone and duplicate_turn would drop
+    words that are not duplicates.
+    """
+    out: list[dict] = []
+    for turn in turns:
+        last = out[-1] if out else None
+        joined = f'{last["text"]} {turn["text"]}' if last else ""
+        if (last and last["speaker"] == turn["speaker"]
+                and 0 <= turn["start"] - last["end"] <= gap
+                and not last["text"].rstrip().endswith(tuple(".!?…"))
+                and len(joined) <= cap):
+            last["end"] = max(last["end"], turn["end"])
+            last["text"] = joined
+            if turn.get("name") and not last.get("name"):
+                last["name"] = turn["name"]
+            continue
+        out.append(dict(turn))
+    return out
+
+
 def mic_is_diarized(asr_mode: str, diarize_second: bool) -> bool:
     """Whether the microphone track needs the diarizer for its turn boundaries.
 
@@ -1061,6 +1095,12 @@ def main() -> None:
               f"{len({turn['speaker'] for turn in labelled})} speakers", file=sys.stderr)
     labelled = dedupe_turns(labelled)
     print(f"{len(labelled)} turns after removing repeated cuts", file=sys.stderr)
+    if args.asr_mode == "audiocpp":
+        before = len(labelled)
+        labelled = merge_paragraphs(labelled)
+        if len(labelled) < before:
+            print(f"{len(labelled)} paragraphs after joining what the model split",
+                  file=sys.stderr)
 
     result = []
     for turn in labelled:
