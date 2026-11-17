@@ -915,10 +915,13 @@ class LiveSession:
     """One stream: audio chunks in, transcribed and translated rows out."""
 
     def __init__(self, live: "Live", language: str, target: str,
-                 silence: float = LIVE_LINE) -> None:
+                 silence: float = LIVE_LINE, model: str = "") -> None:
         self.live = live
         self.language = language
         self.target = target
+        # The page can pick the translator per session; empty means the service's
+        # --translate-model. Cheap to allow: it is one field on the request.
+        self.mt_model = model
         self.silence = silence
         self.rows: list[dict] = []
         self.closed = False
@@ -1246,10 +1249,11 @@ class LiveSession:
         self._set_state("mt")
         try:
             translated = self.live.translate(text, self.target, context,
-                                             None if previous else grew)
+                                             None if previous else grew, self.mt_model)
             if not translated and context:
                 # An empty answer is not an answer: try once without the context.
-                translated = self.live.translate(text, self.target, [], None)
+                translated = self.live.translate(text, self.target, [], None,
+                                                 self.mt_model)
         except (OSError, ValueError) as error:
             with self._lock:
                 self._state = "idle"
@@ -1305,7 +1309,8 @@ class Live:
         self._lock = threading.Lock()
         threading.Thread(target=self._reap, daemon=True).start()
 
-    def feed(self, identity: str, pcm: bytes, language: str, target: str) -> LiveSession | None:
+    def feed(self, identity: str, pcm: bytes, language: str, target: str,
+             model: str = "") -> LiveSession | None:
         """Add audio, opening the session on the first chunk. None means GPU busy."""
         with self._lock:
             session = self.sessions.get(identity)
@@ -1313,10 +1318,28 @@ class Live:
                 if not self.gpu.acquire(0):
                     return None
                 session = self.sessions[identity] = LiveSession(self, language, target,
-                                                                self.silence)
+                                                                self.silence, model)
                 session.locked = True
         session.feed(pcm)
         return session
+
+    def models(self) -> list[dict]:
+        """The translators this box actually has, asked of Lemonade.
+
+        Listed rather than hardcoded: a name in the page that the box does not
+        serve is a setting that fails silently. Lemonade labels what a model can
+        do, so "chat" is the filter — not the recipe, which is the runtime and
+        would offer the embedder and the rerankers too.
+        """
+        try:
+            with urllib.request.urlopen(f"{self.llm}/api/v1/models", timeout=10) as response:
+                answer = json.loads(response.read())
+        except Exception:
+            return []
+        found = answer.get("data") or answer.get("models") or []
+        return [{"id": model.get("id"), "recipe": model.get("recipe")}
+                for model in found
+                if isinstance(model, dict) and "chat" in (model.get("labels") or [])]
 
     def settled(self, session: LiveSession) -> None:
         """The worker drained: free the GPU now, but let the page read the tail.
@@ -1417,13 +1440,15 @@ class Live:
             process.kill()
 
     def translate(self, src: str, target: str, context: list[str],
-                  on_token=None) -> str:
+                  on_token=None, model: str = "") -> str:
         """The line in the target language; `on_token` gets every partial text.
 
         Streaming is what makes the page feel live: the generation is 0.4-0.5 s
         for a short line, and showing it grow beats waiting for the whole thing.
+        `model` is the session's choice; empty means --translate-model.
         """
-        if not src or not self.translate_model:
+        model = model or self.translate_model
+        if not src or not model:
             return ""
         content = "".join(f"Context line: {line}\n" for line in context)
         content += f"\nTranslate this line:\n{src}"
@@ -1431,7 +1456,7 @@ class Live:
         if self.glossary:
             system += f" Keep these spellings unchanged: {self.glossary}."
         payload = {
-            "model": self.translate_model,
+            "model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": content}],
             "max_tokens": 400, "temperature": 0,
@@ -1667,6 +1692,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, job)
         elif path == "/mcp":
             self._text(405, "the MCP endpoint accepts POST\n")
+        elif path == "/live/models":
+            self._json(200, {"models": self.server.live.models(),
+                             "default": self.server.live.translate_model})
         elif path.startswith("/live/"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -1783,7 +1811,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             query = urllib.parse.parse_qs(parsed.query)
             session = self.server.live.feed(identity, body, query.get("language", [""])[0],
-                                            query.get("to", [""])[0])
+                                            query.get("to", [""])[0],
+                                            query.get("mt_model", [""])[0])
             if session is None:
                 self._json(409, {"error": "the GPU is busy: a transcription job is running"})
             else:

@@ -25,6 +25,8 @@ type Row = { i: number; src: string; mt: string; done?: boolean; error?: string 
 
 const LANGUAGES = ["auto", "de", "it", "en", "fr", "es"]
 const TARGETS = ["it", "en", "de", "fr"]
+// Radix refuses an empty value in a Select, so "no choice" needs a name.
+const DEFAULT_TRANSLATOR = "__default__"
 const CHUNK = 8000 // samples: half a second of 16 kHz audio per request
 
 /**
@@ -124,6 +126,8 @@ export default function Live() {
   )
   const [language, setLanguage] = useStored("language", "de")
   const [target, setTarget] = useStored("target", "it")
+  const [mtModel, setMtModel] = useStored("mtModel", "")
+  const [mtModels, setMtModels] = useState<{ id: string; recipe?: string }[]>([])
   const [device, setDevice] = useStored("device", "")
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
   const [processing, setProcessing] = useStored("processing", true)
@@ -153,6 +157,19 @@ export default function Live() {
     () => ({ Authorization: `Bearer ${token}` }),
     [token]
   )
+
+  // The translators are asked of the server, which asks Lemonade: a name typed
+  // into the page that the box does not serve fails silently on the first line.
+  useEffect(() => {
+    let alive = true
+    fetch("/live/models", { headers: auth() })
+      .then((response) => (response.ok ? response.json() : { models: [] }))
+      .then((answer) => alive && setMtModels(answer.models ?? []))
+      .catch(() => alive && setMtModels([]))
+    return () => {
+      alive = false
+    }
+  }, [auth])
 
   // Inputs are listed once the page has the microphone permission: before that
   // the labels are empty, and an empty list is not a choice anybody can make.
@@ -272,6 +289,9 @@ export default function Live() {
     samples.current = []
     queued.current = 0
     const query = new URLSearchParams({ language, to: target })
+    // Empty means the service's --translate-model: the page does not need to know
+    // which one that is to use it.
+    if (mtModel) query.set("mt_model", mtModel)
     chain.current = chain.current
       .then(() =>
         fetch(`/live/${current}/audio?${query}`, {
@@ -510,6 +530,33 @@ export default function Live() {
                   {TARGETS.map((code) => (
                     <SelectItem key={code} value={code}>
                       {code}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="grid gap-1.5">
+              <Label htmlFor="mtModel" className="text-xs">
+                Translator
+              </Label>
+              <Select
+                value={mtModel || DEFAULT_TRANSLATOR}
+                onValueChange={(value) =>
+                  setMtModel(value === DEFAULT_TRANSLATOR ? "" : value)
+                }
+                disabled={started}
+              >
+                <SelectTrigger id="mtModel" className="w-56">
+                  <SelectValue>
+                    {mtModel || "service default"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={DEFAULT_TRANSLATOR}>service default</SelectItem>
+                  {mtModels.map((model) => (
+                    <SelectItem key={model.id} value={model.id}>
+                      {model.id}
                     </SelectItem>
                   ))}
                 </SelectContent>

@@ -100,7 +100,12 @@ curl -X POST http://host:8099/live/<id>/close
 ```
 
 `?language=` is what the speaker talks (a hint), `?to=` is what to translate
-into. Chunks of any size: the page sends 0.5 s.
+into, `?mt_model=` overrides the translator for this session (omit for the
+service's `--translate-model`). Chunks of any size: the page sends 0.5 s.
+
+`GET /live/models` lists what the box can translate with, asked of Lemonade
+(`{"models": [{"id", "recipe"}], "default": "..."}`, chat models only), so a
+client can offer the choice without hardcoding names.
 
 The poll answers:
 
