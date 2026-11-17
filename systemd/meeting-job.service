@@ -15,11 +15,11 @@
 # host's podman through its socket, so they still get the GPU devices and the
 # images already on the host. Paths passed to `podman run` are host paths: the
 # cache dirs below are mounted at the same absolute path inside the container.
-# The service only starts jobs; each job needs the ASR endpoint up and the
-# diarizer image built. Defaults (2026-10-27): Qwen3-ASR-1.7B through gufo on
-# 8097 (host network), one request per diarizer turn (--asr-mode segments; gufo's
-# verbose_json has no usable segments), and the Nemotron diarizer
-# (diarizer-nemotron/). --keep-audio keeps the upload so the dashboard can play
+# The service only starts jobs; each job needs the ASR endpoint up. Defaults
+# (2026-11-17): MOSS-Transcribe-Diarize through audio.cpp on 8090
+# (--asr-mode audiocpp: one request for the whole meeting, audio.cpp answers the
+# speaker labels itself), and the halogen-diarizer image as --live-embedder.
+# --keep-audio keeps the upload so the dashboard can play
 # the recording next to the transcript; the files live in
 # ~/.cache/mcp-meeting-transcribe/inbox/ and are pruned after
 # --retain-audio-days (default 30; 0 keeps them). Send language=de:
@@ -70,15 +70,11 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
 # "options" — at 24000 the model ends in "reached max_tokens before EOS" and the
 # transcript is lost, not truncated; at 65536 (what the UI used) it finishes.
 # That cap is memory: the decode cache is prompt + max_tokens.
-# The old chain (gufo :8097 + nemotron, --asr-mode segments) is still there:
-#   --asr http://127.0.0.1:8097 --model qwen3-asr-1.7b --diarizer nemotron \
-#   --asr-mode segments
 # --live-asr http://127.0.0.1:8731 --live-model Whisper-Large-v3-Turbo  is one
 # flag away, but on this box it puts a second model on the iGPU next to the 27B
 # that does the translating: measured 20 t/s with it resident against 35.7 t/s
 # earlier without it (cause not isolated: that whisper-server belongs to a
 # root-run Lemonade service and ignores both the unload API and kill as my user).
-# gufo is already resident and costs 0.78 s per clip instead of 0.24 s.
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
