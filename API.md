@@ -103,6 +103,9 @@ curl -X POST http://host:8099/live/<id>/close
 into, `?mt_model=` overrides the translator for this session (omit for the
 service's `--translate-model`). Chunks of any size: the page sends 0.5 s.
 
+The poll answers `mt_model`: the translator the session is really using, so a
+client that asked for one can see whether it got it.
+
 `GET /live/models` lists what the box can translate with, asked of Lemonade
 (`{"models": [{"id", "recipe"}], "default": "..."}`, chat models only), so a
 client can offer the choice without hardcoding names.
