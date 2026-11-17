@@ -883,6 +883,11 @@ class StreamingASR:
                     continue
                 if event.get("type") == "transcript.text.delta":
                     self.on_text(str(event.get("delta") or ""))
+                elif event.get("type") == "error":
+                    # audio.cpp caps a live request (live_ingest.total_timeout_ms,
+                    # 600 s by default) and says so in an event before closing.
+                    detail = event.get("error") or event.get("message") or event
+                    self.reason = f"the service ended the stream: {detail}"
         except (OSError, ValueError) as exc:
             self.reason = f"{type(exc).__name__}: {exc}"
         finally:
