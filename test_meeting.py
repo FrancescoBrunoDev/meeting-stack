@@ -251,10 +251,6 @@ class Defaults(unittest.TestCase):
         self.assertIn('"--asr-mode", default="full"', source)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RecordingLength(unittest.TestCase):
     def test_the_length_comes_from_the_file_not_the_last_word(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -835,6 +831,41 @@ class LiveSession(unittest.TestCase):
         self.assertEqual(translations[0][2], [])
         self.assertEqual(translations[1][2], ["Guten Tag. -> Buongiorno"])
 
+    def test_a_dead_asr_stream_is_opened_again(self):
+        # audio.cpp unloads a model it thinks is idle after two minutes, which
+        # kills the stream it is serving. The old session went on feeding the
+        # dead socket: no rows for the rest of the call, no error anywhere.
+        opened = []
+
+        class DeadStream:
+            def __init__(self, base, model, on_text):
+                self.dead = False
+                self.reason = ""
+                opened.append(self)
+
+            def feed(self, pcm):
+                self.dead = True          # the model went away under us
+                self.reason = "the service closed the stream"
+
+            def close(self):
+                pass
+
+        original = meeting_job.StreamingASR
+        meeting_job.StreamingASR = DeadStream
+        try:
+            fake = types.SimpleNamespace(
+                transcribe=lambda pcm, language: "", translate=lambda *a, **k: "",
+                settled=lambda session: None, embedder="",
+                speaker=meeting_job.LIVE_SPEAKER, stream_asr=True,
+                asr="http://127.0.0.1:8090", model="m")
+            session = meeting_job.LiveSession(fake, "de", "it")
+            session.feed(self.speech())
+            session.feed(self.speech())
+            self.assertEqual(len(opened), 2)
+            self.assertEqual(session._stream_restarts, 1)
+        finally:
+            meeting_job.StreamingASR = original
+
     def test_a_half_sentence_is_translated_when_the_stream_stops(self):
         calls = []
         session = meeting_job.LiveSession(self.fake(calls, text="und dann"), "de", "it")
@@ -1094,3 +1125,7 @@ class LiveLines(unittest.TestCase):
         self.assertEqual(calls, ["Guten Abend."], "the pause did not close the line")
         session.close()
         self.drain(session)
+
+
+if __name__ == "__main__":
+    unittest.main()

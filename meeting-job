@@ -864,6 +864,7 @@ class StreamingASR:
              "Connection: close\r\n\r\n").encode())
         self.on_text = on_text
         self.dead = False
+        self.reason = ""
         self._lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -882,9 +883,10 @@ class StreamingASR:
                     continue
                 if event.get("type") == "transcript.text.delta":
                     self.on_text(str(event.get("delta") or ""))
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as exc:
+            self.reason = f"{type(exc).__name__}: {exc}"
         finally:
+            self.reason = self.reason or "the service closed the stream"
             self.dead = True
 
     def feed(self, pcm: bytes) -> None:
@@ -893,7 +895,8 @@ class StreamingASR:
         with self._lock:
             try:
                 self.sock.sendall(b"%x\r\n" % len(pcm) + pcm + b"\r\n")
-            except OSError:
+            except OSError as exc:
+                self.reason = f"send failed: {type(exc).__name__}: {exc}"
                 self.dead = True
 
     def close(self) -> None:
@@ -935,6 +938,7 @@ class LiveSession:
         self._voice: list[float] | None = None   # mean of the line's clips
         self._closing = False                    # a close is already queued
         self.stream: StreamingASR | None = None  # only with --live-stream
+        self._stream_restarts = 0
         self._queue: queue.Queue = queue.Queue()
         self._lock = threading.RLock()
         threading.Thread(target=self._work, daemon=True).start()
@@ -954,7 +958,15 @@ class LiveSession:
                 # Nothing is cut: the model segments as it listens, and its
                 # deltas grow the row while the speaker is still talking. Only
                 # the tail is kept, for the pause that ends the line.
-                if self.stream is None:
+                if self.stream is None or self.stream.dead:
+                    if self.stream is not None:
+                        # audio.cpp unloads a model it believes idle, or the
+                        # socket drops: the call outlives any one stream, so
+                        # open another instead of feeding a dead one until the
+                        # meeting ends (that is the frozen panel).
+                        self._stream_restarts += 1
+                        print(f"live: the ASR stream ended ({self.stream.reason}); "
+                              f"opening a new one ({self._stream_restarts})", flush=True)
                     self.stream = StreamingASR(self.live.asr, self.live.model,
                                                self._streamed)
                 self.stream.feed(pcm)
