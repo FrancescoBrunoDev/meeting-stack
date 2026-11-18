@@ -319,6 +319,7 @@ class Jobs:
         # RLock: a state change is persisted while the submitter holds the lock.
         self._lock = threading.RLock()
         self._current: subprocess.Popen | None = None
+        self._current_job: Job | None = None
         self._current_lock = threading.Lock()
         self._queue: queue.Queue[Job] = queue.Queue()
         self._load()
@@ -422,7 +423,7 @@ class Jobs:
             job.status = "error"
             job.error = "the service restarted while this job was running"
             job.finished = time.time()
-        elif job.status not in ("waiting", "queued"):
+        elif job.status not in ("waiting", "queued", "cancelled"):
             job.status, job.error = "error", f"unknown job status {job.status!r}"
         if job.status != "done" and not any(path.is_file() for path in job.tracks.values()):
             job.status, job.error = "error", "the uploaded audio is gone"
@@ -498,7 +499,7 @@ class Jobs:
             job = self._jobs.get(identity or "")
             if job is None:
                 return None
-            if job.status not in ("done", "error"):
+            if job.status not in ("done", "error", "cancelled"):
                 return job.snapshot()
             if not all(path.is_file() for path in job.tracks.values()):
                 return job.snapshot()
@@ -509,21 +510,70 @@ class Jobs:
             self._persist()
             return job.snapshot()
 
+    def cancel(self, identity: str | None) -> dict | None:
+        """Stop a job: drop it from the queue, or kill the worker running it.
+
+        A cancelled job keeps its upload, so `retry` can run it again; the
+        worker is told through the status, so a cancel that lands while the job
+        is still waiting for the GPU lock is not lost.
+        """
+        with self._lock:
+            job = self._jobs.get(identity or "")
+            if job is None:
+                return None
+            if job.status in ("done", "error", "cancelled"):
+                return job.snapshot()
+            # A stopped job is not a failed one: an old message would lie.
+            job.status, job.error, job.progress = "cancelled", None, None
+            with self._current_lock:
+                process = self._current if self._current_job is job else None
+            if process is None:
+                job.finished = time.time()
+            self._persist()
+        if process is not None and process.poll() is None:
+            self._terminate(process)
+        return job.snapshot()
+
+    def delete(self, identity: str | None) -> dict | None:
+        """Forget a job and remove what it left: its transcript and its upload."""
+        job = self.get(identity)
+        if job is None:
+            return None
+        if job["status"] in ("waiting", "queued", "running"):
+            self.cancel(identity)
+        with self._lock:
+            job = self._jobs.pop(identity or "", None)
+            self._persist()
+        if job is None:
+            return None
+        for path in list(job.tracks.values()) + list(self.out.glob(f"{job.id}.*")):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return job.snapshot()
+
     def queued(self) -> int:
         return self._queue.qsize()
 
     def _work(self) -> None:
         while True:
             job = self._queue.get()
-            self._run(job)
+            # Cancelled while it waited: there is nothing left to run.
+            if job.status != "cancelled":
+                self._run(job)
             self._queue.task_done()
 
     def _run(self, job: Job) -> None:
+        with self._current_lock:
+            self._current_job = job
         job.status, job.started = "running", time.time()
         self._persist()
         try:
             self._transcribe(job)
         finally:
+            with self._current_lock:
+                self._current_job = None
             self._persist()
 
     def _transcribe(self, job: Job) -> None:
@@ -538,6 +588,11 @@ class Jobs:
         if audio is None:
             job.status = "error"
             job.error = "no audio for this job"
+            job.finished = time.time()
+            self.lock.release()
+            return
+        if job.status == "cancelled":
+            # Stopped while it waited for the lock: nothing was run.
             job.finished = time.time()
             self.lock.release()
             return
@@ -585,7 +640,9 @@ class Jobs:
                 raise
             finally:
                 reader.join(timeout=5)
-            if process.returncode != 0:
+            if job.status == "cancelled":
+                pass  # killed on purpose: keep it cancelled, not an error
+            elif process.returncode != 0:
                 job.status = "error"
                 job.error = "\n".join(tail).strip()[-600:]
             else:
@@ -1811,6 +1868,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(404, {"error": "no such job"})
             else:
                 self._json(202, self._summary(job))
+        elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/stop"):
+            job = self.server.jobs.cancel(parsed.path[len("/jobs/"):-len("/stop")])
+            if job is None:
+                self._json(404, {"error": "no such job"})
+            else:
+                self._json(200, self._summary(job))
         elif parsed.path == "/mcp":
             try:
                 message = json.loads(body or b"null")
@@ -1849,6 +1912,20 @@ class Handler(BaseHTTPRequestHandler):
                                  "open": view["open"]})
         else:
             self._json(404, {"error": "not found"})
+
+    def do_DELETE(self) -> None:
+        if not self._authorized():
+            self._json(401, {"error": "missing or wrong bearer token"})
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith("/jobs/"):
+            self._json(404, {"error": "no such route"})
+            return
+        job = self.server.jobs.delete(path.removeprefix("/jobs/"))
+        if job is None:
+            self._json(404, {"error": "no such job"})
+        else:
+            self._json(200, self._summary(job))
 
     @staticmethod
     def _summary(job: dict) -> dict:

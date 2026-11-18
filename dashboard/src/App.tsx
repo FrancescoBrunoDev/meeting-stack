@@ -10,7 +10,9 @@ import {
   Moon,
   RefreshCw,
   RotateCcw,
+  Square,
   Sun,
+  Trash2,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -53,7 +55,7 @@ import Live from "@/Live"
 
 type JobSummary = {
   id: string
-  status: "waiting" | "queued" | "running" | "done" | "error"
+  status: "waiting" | "queued" | "running" | "done" | "error" | "cancelled"
   error: string | null
   created: number
   started: number | null
@@ -167,6 +169,13 @@ function StatusBadge({ status }: { status: JobSummary["status"] }) {
       <Badge variant="destructive">
         <AlertCircle className="size-3" />
         error
+      </Badge>
+    )
+  if (status === "cancelled")
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        <Square className="size-3" />
+        stopped
       </Badge>
     )
   if (status === "waiting")
@@ -290,6 +299,26 @@ function Jobs() {
   async function retry(id: string) {
     try {
       await api(`/jobs/${id}/retry`, { method: "POST" })
+      await refresh()
+    } catch (error) {
+      setAuthError((error as Error).message)
+    }
+  }
+
+  async function stop(id: string) {
+    try {
+      await api(`/jobs/${id}/stop`, { method: "POST" })
+      await refresh()
+    } catch (error) {
+      setAuthError((error as Error).message)
+    }
+  }
+
+  async function remove(id: string) {
+    if (!window.confirm("Delete this job, its transcript and the audio it uploaded?")) return
+    try {
+      await api(`/jobs/${id}`, { method: "DELETE" })
+      if (selectedId === id) closeJob()
       await refresh()
     } catch (error) {
       setAuthError((error as Error).message)
@@ -527,19 +556,48 @@ function Jobs() {
                                 ? `took ${took(job, now)}`
                                 : job.progress ?? "—")}
                           </div>
-                          {job.status === "error" && job.audio && (
+                          <div className="flex items-center">
+                            {(job.status === "running" ||
+                              job.status === "queued" ||
+                              job.status === "waiting") && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title="Stop this job; the upload is kept for a restart"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  stop(job.id)
+                                }}
+                              >
+                                <Square />
+                              </Button>
+                            )}
+                            {(job.status === "error" || job.status === "cancelled") &&
+                              job.audio && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title="Run this job again on the upload it kept"
+                                  onClick={(event) => {
+                                    event.stopPropagation()
+                                    retry(job.id)
+                                  }}
+                                >
+                                  <RotateCcw />
+                                </Button>
+                              )}
                             <Button
                               variant="ghost"
                               size="icon"
-                              title="Run this job again on the upload it kept"
+                              title="Delete this job and its transcript"
                               onClick={(event) => {
                                 event.stopPropagation()
-                                retry(job.id)
+                                remove(job.id)
                               }}
                             >
-                              <RotateCcw />
+                              <Trash2 />
                             </Button>
-                          )}
+                          </div>
                         </div>
                       </TableCell>
                     </TableRow>

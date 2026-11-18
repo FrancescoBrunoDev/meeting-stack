@@ -58,8 +58,8 @@ curl http://host:8099/jobs/<id>/audio    # the kept upload, range requests work
 curl -X POST http://host:8099/jobs/<id>/retry
 ```
 
-`status` is `running`, `done` or `error`; `progress` is a human line, not a
-percentage. When `done`, the job carries `json` and `markdown`:
+`status` is `waiting` (one of two tracks has arrived), `queued`, `running`,
+`done`, `error` or `cancelled`; `progress` is a human line, not a percentage. When `done`, the job carries `json` and `markdown`:
 
 ```json
 {"source": "...", "model": "moss-transcribe-diarize", "language": "de",
@@ -76,6 +76,22 @@ A turn is **a paragraph, not the model's segment**. MOSS closes a segment every
 with a small gap and a sentence still unfinished are joined, up to 400
 characters. Do not assume one turn per utterance, and do not assume a turn
 boundary is a pause.
+
+### Stop, restart, delete
+
+```sh
+curl -X POST http://host:8099/jobs/<id>/stop      # stop it
+curl -X POST http://host:8099/jobs/<id>/retry     # run it again
+curl -X DELETE http://host:8099/jobs/<id>         # forget it
+```
+
+`stop` takes a job out of the queue, or kills the worker running it, and leaves
+it `cancelled` — not `error`, because nothing went wrong. The upload is kept, so
+`retry` can start it again; that also works for a `done` or an `error` job. A job
+that is queued, waiting or running is returned unchanged by `retry`, so a double
+click cannot queue it twice. `DELETE` removes the job, its transcript **and its
+uploaded copy** — the file you sent is yours and is not touched. All three answer
+`404` for an unknown id.
 
 ### MCP
 

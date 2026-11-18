@@ -12,9 +12,11 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -539,6 +541,138 @@ class Retry(unittest.TestCase):
 
     def test_an_unknown_job_is_none(self):
         self.assertIsNone(self.jobs.retry("nope"))
+
+
+class Stopping(unittest.TestCase):
+    """Stop, restart and delete: the three things a queue needs to be usable."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+        self.worker = self.root / "fake-worker"
+        self.worker.write_text("#!/bin/sh\nsleep 30\n")
+        self.worker.chmod(0o755)
+        self.jobs = meeting_job.Jobs(self.worker, self.root, lock_path=self.root / "lock",
+                                     pair_wait=10000)
+        self.addCleanup(self.jobs.stop)
+
+    def wait_for(self, predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def submit(self):
+        return self.jobs.submit(b"audio", {}, "meeting.wav")["id"]
+
+    def test_a_running_job_is_killed_and_stays_cancelled(self):
+        identity = self.submit()
+        self.assertTrue(self.wait_for(lambda: self.jobs._current is not None),
+                        "the worker never started")
+        self.assertEqual(self.jobs.cancel(identity)["status"], "cancelled")
+        self.assertTrue(self.wait_for(lambda: self.jobs._current_job is None))
+        job = self.jobs.get(identity)
+        self.assertEqual(job["status"], "cancelled", "a killed worker is not a failure")
+        self.assertIsNone(job["error"])
+
+    def test_a_cancelled_job_in_the_queue_never_runs(self):
+        audio = self.root / "inbox" / "meeting.wav"
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.tracks, job.status = {"main": audio}, "cancelled"
+        self.jobs._jobs[job.id] = job
+        self.jobs._queue.put(job)
+        time.sleep(0.4)
+        self.assertIsNone(job.started, "the worker picked up a cancelled job")
+        self.assertEqual(job.status, "cancelled")
+
+    def test_a_finished_job_is_not_cancelled_any_more(self):
+        audio = self.root / "inbox" / "meeting.wav"
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.tracks, job.status = {"main": audio}, "done"
+        self.jobs._jobs[job.id] = job
+        self.assertEqual(self.jobs.cancel(job.id)["status"], "done")
+
+    def test_a_cancelled_job_can_be_run_again(self):
+        audio = self.root / "inbox" / "meeting.wav"
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.tracks, job.status = {"main": audio}, "cancelled"
+        self.jobs._jobs[job.id] = job
+        self.assertIn(self.jobs.retry(job.id)["status"], ("queued", "running", "done"))
+
+    def test_delete_takes_the_transcript_and_the_upload_with_it(self):
+        audio = self.root / "inbox" / "meeting.wav"
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.tracks, job.status = {"main": audio}, "error"
+        self.jobs._jobs[job.id] = job
+        transcript = self.jobs.out / f"{job.id}.md"
+        transcript.write_text("# a transcript")
+        self.assertIsNotNone(self.jobs.delete(job.id))
+        self.assertIsNone(self.jobs.get(job.id))
+        self.assertFalse(transcript.exists())
+        self.assertFalse(audio.exists())
+        self.assertFalse(any(self.jobs.out.glob(f"{job.id}.*")))
+
+    def test_an_unknown_job_cannot_be_stopped_or_deleted(self):
+        self.assertIsNone(self.jobs.cancel("nope"))
+        self.assertIsNone(self.jobs.delete("nope"))
+
+
+class JobRoutes(unittest.TestCase):
+    """The HTTP layer itself: a decorator on the wrong method breaks every route."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+        self.jobs = meeting_job.Jobs(Path("/bin/true"), self.root,
+                                     lock_path=self.root / "lock", pair_wait=10000)
+        self.addCleanup(self.jobs.stop)
+        self.server = meeting_job.Server(
+            ("127.0.0.1", 0), self.jobs,
+            meeting_job.Hooks(self.root / "hooks.json"), "", 10 * 1024 * 1024, None)
+        self.addCleanup(self.server.server_close)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def call(self, path, method="GET", body=b""):
+        request = urllib.request.Request(self.base + path, data=body or None, method=method)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+
+    def add_job(self, status):
+        audio = self.root / "inbox" / "meeting.wav"
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.tracks, job.status = {"main": audio}, status
+        self.jobs._jobs[job.id] = job
+        return job
+
+    def test_the_list_and_one_job_answer(self):
+        self.add_job("done")
+        self.assertEqual(len(self.call("/jobs")["jobs"]), 1)
+        self.assertEqual(self.call("/jobs/0123456789abcdef")["status"], "done")
+
+    def test_a_job_can_be_stopped_over_http(self):
+        job = self.add_job("waiting")
+        self.assertEqual(self.call(f"/jobs/{job.id}/stop", "POST")["status"], "cancelled")
+
+    def test_a_job_can_be_deleted_over_http(self):
+        job = self.add_job("error")
+        self.assertEqual(self.call(f"/jobs/{job.id}", "DELETE")["status"], "error")
+        self.assertIsNone(self.jobs.get(job.id))
+
+    def test_an_unknown_job_is_404(self):
+        for path, method in (("/jobs/nope/stop", "POST"), ("/jobs/nope", "DELETE")):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.call(path, method)
+            self.assertEqual(caught.exception.code, 404)
 
 
 class Persistence(unittest.TestCase):
