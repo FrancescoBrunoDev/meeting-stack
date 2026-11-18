@@ -1355,6 +1355,10 @@ class Live:
         self.stream_asr = stream_asr
         self.llm = llm.rstrip("/")
         self.translate_model = translate_model
+        # Cloud models refuse a request that does not say which session it
+        # belongs to ("cannot be routed efficiently"); one id per process is
+        # enough, and a local backend ignores the header.
+        self.session = uuid.uuid4().hex
         self.glossary = glossary
         self.idle = idle
         self.silence = silence
@@ -1521,9 +1525,12 @@ class Live:
             "model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": content}],
-            "max_tokens": 400, "temperature": 0,
+            # A thinking model spends the budget on its reasoning first, and a
+            # cloud one then answers with a null message — which Lemonade turns
+            # into a 500. Ask it not to think, and leave room in case it does.
+            "max_tokens": 1200, "temperature": 0,
+            "reasoning_effort": "none",
             "stream": on_token is not None,
-            # A thinking model spends the whole budget before it answers.
             "chat_template_kwargs": {"enable_thinking": False}}
         try:
             return self._ask(payload, on_token)
@@ -1540,7 +1547,8 @@ class Live:
     def _ask(self, payload: dict, on_token=None) -> str:
         request = urllib.request.Request(
             self.llm + "/v1/chat/completions", data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json",
+                     "x-opencode-session": self.session})
         with urllib.request.urlopen(request, timeout=60) as response:
             if on_token is None:
                 answer = json.loads(response.read())

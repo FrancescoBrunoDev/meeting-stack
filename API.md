@@ -126,6 +126,13 @@ client that asked for one can see whether it got it.
 (`{"models": [{"id", "recipe"}], "default": "..."}`, chat models only), so a
 client can offer the choice without hardcoding names.
 
+Cloud models (`recipe: cloud`, e.g. `opencode-go.*`) work too, and the service
+sends what they need: an `x-opencode-session` header, which those providers
+require before they route a request, and `reasoning_effort: "none"`. The second
+one matters — a thinking model spends its token budget on the reasoning and then
+answers with a null message, which Lemonade reports as a `500`. Local backends
+ignore both.
+
 The `id` there is what Lemonade lists, which for a model registered by hand is
 **not** what its backend serves: those answer to `user.<id>`. The service tries
 the listed name and, on a `404 model_not_found`, once more with the prefix, so
