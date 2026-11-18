@@ -110,6 +110,12 @@ client that asked for one can see whether it got it.
 (`{"models": [{"id", "recipe"}], "default": "..."}`, chat models only), so a
 client can offer the choice without hardcoding names.
 
+The `id` there is what Lemonade lists, which for a model registered by hand is
+**not** what its backend serves: those answer to `user.<id>`. The service tries
+the listed name and, on a `404 model_not_found`, once more with the prefix, so
+either spelling works. A streamed request reports that 404 inside a 200 stream,
+which is why the check is in the stream reader and not only around the call.
+
 The poll answers:
 
 ```json

@@ -1468,6 +1468,19 @@ class Live:
             "stream": on_token is not None,
             # A thinking model spends the whole budget before it answers.
             "chat_template_kwargs": {"enable_thinking": False}}
+        try:
+            return self._ask(payload, on_token)
+        except urllib.error.HTTPError as error:
+            # A model registered by hand is served as "user.<id>", while Lemonade
+            # lists it without the prefix: asking for the listed name is a 404
+            # from the backend, and that 404 is the only place the difference
+            # shows. Nothing was streamed yet, so trying again is safe.
+            if error.code != 404 or model.startswith(("user.", "builtin.")):
+                raise
+            payload["model"] = f"user.{model}"
+            return self._ask(payload, on_token)
+
+    def _ask(self, payload: dict, on_token=None) -> str:
         request = urllib.request.Request(
             self.llm + "/v1/chat/completions", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
@@ -1484,8 +1497,18 @@ class Live:
                 if line.startswith(b"[DONE]"):
                     break
                 try:
-                    piece = json.loads(line)["choices"][0]["delta"].get("content") or ""
-                except (ValueError, KeyError, IndexError):
+                    chunk = json.loads(line)
+                except ValueError:
+                    continue
+                if chunk.get("error"):
+                    # A backend refusal arrives inside a 200 stream, so nothing
+                    # raised it and the caller could not retry the name.
+                    raise urllib.error.HTTPError(
+                        self.llm, int(chunk["error"].get("status_code") or 404),
+                        str(chunk["error"].get("message") or "the backend refused"), None, None)
+                try:
+                    piece = chunk["choices"][0]["delta"].get("content") or ""
+                except (KeyError, IndexError, TypeError):
                     continue
                 if piece:
                     text += piece
