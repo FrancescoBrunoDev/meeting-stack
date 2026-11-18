@@ -720,6 +720,10 @@ LIVE_CONTEXT = 2                        # translated lines handed back as contex
 # a line also ends where the voice changes, which a pause cannot tell you.
 LIVE_SPEAKER = 0.6
 LIVE_TRANSLATE_EVERY = 60               # source characters between partial translations
+# The first translation of a line is not worth waiting for: measured with a cloud
+# model, the worker sat idle for 14.8 s while the page showed a source line with
+# nothing under it, because the line had not reached 60 characters yet.
+LIVE_TRANSLATE_FIRST = 20
 LIVE_PENDING_CHARS = 140                # a longer line is split at a full stop
                                         # (two or three lines on the page)
 SENTENCE_END = ".!?\u2026"
@@ -998,6 +1002,9 @@ class LiveSession:
         self._pending_at = 0.0
         self._translated = 0                     # source length at the last partial translation
         self._partial_busy = False                # a partial translation is in flight
+        # The newest text of the line being built, waiting for a free worker: a
+        # queued translation of a line that has moved on is work nobody reads.
+        self._dirty: tuple[int, str] | None = None
         # What the worker is doing right now, for the page: silence on screen
         # while a 10 s stretch waits for a pause reads as "the thing is broken".
         self._state = "idle"
@@ -1125,11 +1132,17 @@ class LiveSession:
                 self.live.settled(self)     # the GPU is free: a new session may start
                 return
             if isinstance(item, Close):
+                with self._lock:
+                    if self._dirty is not None and self._dirty[0] == item.row:
+                        self._dirty = None
                 self._translate_into(item.text, item.row, done=True)
                 self._closing = False
                 continue
             if isinstance(item, Partial):
-                self._say_partial(item.text, item.row)
+                with self._lock:
+                    row, text = self._dirty or (item.row, item.text)
+                    self._dirty = None
+                self._say_partial(text, row)
                 with self._lock:
                     self._partial_busy = False
                 continue
@@ -1194,20 +1207,31 @@ class LiveSession:
                             self.rows.append({"src": tail, "mt": "", "done": False})
                             self._pending_row = len(self.rows) - 1
                         self._queue.put(Close(row, head))
-                if (not self._partial_busy
-                        and len(self._pending) - self._translated >= LIVE_TRANSLATE_EVERY):
-                    # Do not wait for the pause: translate what is there, and
-                    # translate again when the line has grown some more. One at
-                    # a time, or the queue fills with stale versions of a line
-                    # nobody will read.
-                    self._partial_busy = True
-                    self._translated = len(self._pending)
-                    self._queue.put(Partial(self._pending_row, self._pending))
+                self._maybe_partial()
             else:
                 self.rows.append({"src": text, "mt": "", "done": False})
                 self._pending, self._pending_row = text, len(self.rows) - 1
                 self._pending_at = time.monotonic()
                 self._translated = 0
+
+    def _maybe_partial(self) -> None:
+        """Translate the line so far, without waiting for it to end.
+
+        Do not wait for the pause: translate what is there, and translate again
+        when the line has grown some more. One at a time, or the queue fills
+        with stale versions of a line nobody will read.
+        """
+        with self._lock:
+            if self._partial_busy or self._pending_row < 0 or not self._pending:
+                return
+            threshold = (LIVE_TRANSLATE_EVERY if self.rows[self._pending_row]["mt"]
+                         else LIVE_TRANSLATE_FIRST)
+            if len(self._pending) - self._translated < threshold:
+                return
+            self._partial_busy = True
+            self._translated = len(self._pending)
+            self._dirty = (self._pending_row, self._pending)
+        self._queue.put(Partial(self._pending_row, self._pending))
 
     def _set_state(self, state: str) -> None:
         with self._lock:
@@ -1251,6 +1275,7 @@ class LiveSession:
             held = time.monotonic() - self._pending_at >= LIVE_PENDING_HOLD
             overlong = len(self._pending) >= LIVE_PENDING_CHARS
             if not closed and not held and not overlong:
+                self._maybe_partial()
                 return
             text, row = self._pending, self._pending_row
             self._pending = ""

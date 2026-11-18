@@ -942,6 +942,33 @@ class LiveSession(unittest.TestCase):
         self.drain(session)
         self.assertEqual(chosen, ["translategemma-4b-FLM"])
 
+    def open_line(self, text):
+        """A line being built, with nothing translated yet."""
+        session = meeting_job.LiveSession(self.fake([]), "de", "it")
+        session._pending, session._pending_row = text, 0
+        session.rows.append({"src": text, "mt": "", "done": False})
+        return session
+
+    def test_a_short_line_is_translated_without_waiting_for_the_pause(self):
+        """The worker used to sit idle while the page showed a line with nothing under it."""
+        session = self.open_line("die drei Tage sind weg")      # 23 characters
+        session._maybe_partial()
+        self.assertFalse(session._queue.empty(),
+                         "the first translation of a line must not wait for 60 characters")
+
+    def test_a_line_too_short_to_translate_is_left_alone(self):
+        session = self.open_line("die drei")                    # 8 characters
+        session._maybe_partial()
+        self.assertTrue(session._queue.empty())
+
+    def test_a_second_partial_waits_for_the_line_to_grow(self):
+        session = self.open_line("die drei Tage sind vorbei")   # 26 characters
+        session._maybe_partial()
+        session._partial_busy = False                            # the worker is free again
+        session._maybe_partial()
+        self.assertEqual(session._queue.qsize(), 1,
+                         "the same text twice is a request nobody will read")
+
     def test_a_cut_clip_becomes_one_translated_row(self):
         calls = []
         session = meeting_job.LiveSession(self.fake(calls), "de", "it")

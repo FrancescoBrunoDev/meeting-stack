@@ -178,6 +178,20 @@ This matters to any client that renders it:
   are stripped, as are `[Noise]`/`[Laughter]` tags. A delta that only repeats
   what the line already says is dropped (the model loops on long audio).
 
+### When a line gets translated
+
+The first translation of a line is asked for as soon as it has ~20 characters,
+not when the line ends: waiting for a pause left the translator idle while the
+page showed a source line with nothing under it (measured: 14.8 s of idle in one
+minute of continuous speech). After that a line is translated again every ~60 new
+characters, and once more when it closes. Only one partial translation is in
+flight at a time, and a queued one always carries the **newest** text of the
+line, so a slow translator does not fall behind by translating text that has
+already moved on.
+
+Expect a delay between the source and its translation of one translation
+request: under a second for a local model, two to three seconds for a cloud one.
+
 ### What live is not
 
 - **No speaker labels.** Live attribution would need online clustering; the
