@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { AlertCircle, ChevronDown, ChevronUp, KeyRound, Mic, Monitor, Square } from "lucide-react"
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  Download,
+  KeyRound,
+  Mic,
+  Monitor,
+  Square,
+} from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import {
   Card,
@@ -27,6 +38,17 @@ function speakerLabel(raw?: string) {
   if (!raw) return ""
   const match = /^speaker_(\d+)$/i.exec(raw)
   return match ? `Speaker ${match[1]}` : raw
+}
+
+function liveMarkdown(rows: Row[]): string {
+  return rows
+    .filter((row) => row && (row.src || row.mt))
+    .map((row) => {
+      const prefix = row.speaker ? `**${speakerLabel(row.speaker)}:** ` : ""
+      const main = `${prefix}${row.mt || row.src}`
+      return row.mt && row.src ? `${main}\n> ${row.src}` : main
+    })
+    .join("\n\n")
 }
 
 const LANGUAGES = ["auto", "de", "it", "en", "fr", "es"]
@@ -136,6 +158,8 @@ export default function Live() {
   const [asrModels, setAsrModels] = useState<{ id: string; recipe?: string; diarize?: boolean }[]>([])
   const [mtModel, setMtModel] = useStored("mtModel", "")
   const [mtModels, setMtModels] = useState<{ id: string; recipe?: string }[]>([])
+  const [glossary, setGlossary] = useStored("glossary", "")
+  const [copied, setCopied] = useState(false)
   const [device, setDevice] = useStored("device", "")
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
   const [processing, setProcessing] = useStored("processing", true)
@@ -309,6 +333,7 @@ export default function Live() {
     // ones those are to use them.
     if (asrModel) query.set("asr_model", asrModel)
     if (mtModel) query.set("mt_model", mtModel)
+    if (glossary.trim()) query.set("glossary", glossary.trim())
     chain.current = chain.current
       .then(() =>
         fetch(`/live/${current}/audio?${query}`, {
@@ -434,6 +459,39 @@ export default function Live() {
       .then(() => fetch(`/live/${current}/close`, { method: "POST", headers: auth() }))
       .catch(() => {})
     setTimeout(() => setSessionId((id) => (id === current ? null : id)), 20000)
+  }
+
+  async function copyLive() {
+    const text = liveMarkdown(rows)
+    try {
+      if (navigator.clipboard) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        throw new Error("no clipboard")
+      }
+    } catch {
+      const area = document.createElement("textarea")
+      area.value = text
+      area.style.position = "fixed"
+      area.style.opacity = "0"
+      document.body.append(area)
+      area.select()
+      document.execCommand("copy")
+      area.remove()
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  function downloadLive() {
+    const url = URL.createObjectURL(new Blob([liveMarkdown(rows)], { type: "text/markdown" }))
+    const link = document.createElement("a")
+    link.href = url
+    link.download = "live-transcript.md"
+    document.body.append(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
   }
 
   return (
@@ -607,6 +665,20 @@ export default function Live() {
               </Select>
             </div>
 
+            <div className="grid gap-1.5">
+              <Label htmlFor="glossary" className="text-xs">
+                Glossary / names
+              </Label>
+              <Input
+                id="glossary"
+                className="w-48"
+                placeholder="Andreas, Kita, …"
+                value={glossary}
+                onChange={(e) => setGlossary(e.target.value)}
+                disabled={started}
+              />
+            </div>
+
             <div className="grid min-w-[220px] flex-1 gap-1.5">
               <Label htmlFor="token" className="flex items-center gap-2 text-xs">
                 <KeyRound className="size-3.5 text-muted-foreground" />
@@ -644,10 +716,20 @@ export default function Live() {
         >
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
             <CardTitle className="text-base">Transcript</CardTitle>
-            <Button variant="ghost" size="sm" onClick={() => setExpanded((value) => !value)}>
-              {expanded ? <ChevronUp /> : <ChevronDown />}
-              {expanded ? "Collapse" : "Expand"}
-            </Button>
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="sm" onClick={copyLive} disabled={rows.length === 0}>
+                {copied ? <Check /> : <Copy />}
+                {copied ? "Copied" : "Copy"}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={downloadLive} disabled={rows.length === 0}>
+                <Download />
+                Download .md
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setExpanded((value) => !value)}>
+                {expanded ? <ChevronUp /> : <ChevronDown />}
+                {expanded ? "Collapse" : "Expand"}
+              </Button>
+            </div>
           </CardHeader>
           {/* Three lines are the tail you read while listening; Expand opens the
               whole thing. The newest line is full, the ones above step back. */}

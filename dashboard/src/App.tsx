@@ -345,6 +345,7 @@ function Jobs() {
     const speakers = String(form.get("speakers") ?? "")
     const language = String(form.get("language") ?? "auto")
     const model = String(form.get("model") ?? DEFAULT_MODEL)
+    const hotwords = String(form.get("hotwords") ?? "").trim()
     // Two files are the two tracks of one call: same pair key, so the server
     // queues a single job instead of two unrelated transcripts.
     const pair = files.length > 1 ? `ui-${Date.now()}` : null
@@ -360,6 +361,7 @@ function Jobs() {
         if (speakers) query.set("speakers", speakers)
         if (language !== "auto") query.set("language", language)
         if (model && model !== DEFAULT_MODEL) query.set("model", model)
+        if (hotwords) query.set("hotwords", hotwords)
         if (pair) {
           query.set("pair", pair)
           // The recorder names its tracks; anything else is system first.
@@ -463,6 +465,11 @@ function Jobs() {
                 )}
                 {uploading ? "Uploading…" : "Transcribe"}
               </Button>
+            </div>
+
+            <div className="grid gap-2">
+              <Label htmlFor="hotwords">Names / hotwords</Label>
+              <Input id="hotwords" name="hotwords" placeholder="Andreas, Kita, …" />
             </div>
 
             {sent && (

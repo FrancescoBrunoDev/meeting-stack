@@ -1384,6 +1384,139 @@ class LiveLines(unittest.TestCase):
         self.assertNotIn("reasoning_effort", sent)
         self.assertNotIn("chat_template_kwargs", sent)
 
+    def test_cloud_live_session_and_batch_job_do_not_wait_for_gpu_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            lock_path = Path(root) / "gpu.lock"
+            holder = meeting_job.Lock(lock_path)
+            self.assertTrue(holder.acquire(0))
+            try:
+                live = meeting_job.Live("http://127.0.0.1:9", "m", "http://127.0.0.1:9",
+                                        "", lock_path)
+                live.mistral_key = ""
+                pcm = b"\x00\x00" * 1000
+                cloud = live.feed("s1", pcm, "de", "it",
+                                  asr_model="voxtral-mini-transcribe-realtime-3")
+                self.assertIsNotNone(cloud)
+                local = live.feed("s2", pcm, "de", "it",
+                                  asr_model="vibevoice_asr_streaming_7b_q8_0")
+                self.assertIsNone(local)
+                cloud.close()
+            finally:
+                holder.release()
+
+    def test_mistral_turns_chunks_recordings_over_limit(self):
+        calls = []
+        orig_max = meeting.MISTRAL_MAX_S
+        orig_norm = meeting.normalize_wav
+        orig_tx = meeting.transcribe_mistral
+        meeting.MISTRAL_MAX_S = 1.0
+        meeting.normalize_wav = lambda src, dst: dst.write_bytes(
+            meeting_job.wav_bytes(b"\x00\x00" * 32000))
+        meeting.transcribe_mistral = lambda *a, **k: (
+            calls.append(a),
+            [{"speaker": "speaker_1", "start": 0.2, "end": 0.8, "text": "Teil."}])[1]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                args = types.SimpleNamespace(
+                    model="voxtral-mini-transcribe-3", language="de",
+                    asr_timeout=10, mistral_key="secret")
+                turns = meeting.mistral_turns(
+                    args, Path(tmp) / "in.wav", Path(tmp), "", lenient=False)
+        finally:
+            meeting.MISTRAL_MAX_S = orig_max
+            meeting.normalize_wav = orig_norm
+            meeting.transcribe_mistral = orig_tx
+        self.assertEqual(len(calls), 2)
+        # number_speakers() relabels Mistral's "speaker_1" to 1
+        self.assertEqual(turns, [
+            {"speaker": 1, "start": 0.2, "end": 0.8, "text": "Teil."},
+            {"speaker": 1, "start": 1.2, "end": 1.8, "text": "Teil."},
+        ])
+
+    def test_mistral_second_track_is_matched_not_shifted(self):
+        """Voxtral diarizes each track separately; the mic track that hears the
+        same room must be matched to the system speakers, not become speaker 4."""
+        import subprocess
+        calls = []
+        real_run = subprocess.run
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            class R: returncode = 0; stderr = ""
+            return R()
+
+        main_turns = [
+            {"speaker": 1, "start": 0.0, "end": 25.0, "text": "Hallo zusammen."},
+            {"speaker": 2, "start": 10.0, "end": 20.0, "text": "Guten Morgen."},
+        ]
+        mic_turns = [
+            {"speaker": 1, "start": 0.5, "end": 24.0, "text": "Hallo zusammen."},  # same room
+            {"speaker": 2, "start": 30.0, "end": 40.0, "text": "Nur ich hier."},   # mic only
+        ]
+        orig_mt = meeting.mistral_turns
+        orig_norm = meeting.normalize_wav
+        orig_wavs = meeting.wav_seconds
+        state = {"n": 0}
+        def fake_mistral(args, source, workdir, hotwords, lenient):
+            state["n"] += 1
+            return [dict(t) for t in (main_turns if state["n"] == 1 else mic_turns)]
+        meeting.mistral_turns = fake_mistral
+        meeting.normalize_wav = lambda src, dst: None
+        meeting.wav_seconds = lambda p: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                args = types.SimpleNamespace(
+                    model="voxtral-mini-transcribe-3", asr_mode="mistral",
+                    language="de", diarize_second=False, second_name="Me",
+                    second_offset=0.0, merge_gap=2.0, output=Path(tmp) / "out",
+                    diarization=None, names=None, hotwords="")
+                # replicate the main() second-track branch
+                labelled = meeting.number_speakers(main_turns)
+                second = [dict(t) for t in mic_turns]
+                after = max(t["speaker"] for t in labelled)
+                voices = len({t["speaker"] for t in second})
+                if (meeting.is_mistral_asr(args.model, args.asr_mode)
+                        and meeting.redundant(labelled, second, args.second_offset)):
+                    second = meeting.match_speakers(labelled, second, args.second_offset)
+                elif voices > 1 and meeting.redundant(labelled, second, args.second_offset):
+                    second = meeting.match_speakers(labelled, second, args.second_offset)
+                elif voices > 1:
+                    second = meeting.second_track_turns(second, after, args.second_name, diarized=True)
+                else:
+                    second = meeting.second_track_turns(second, after, args.second_name)
+        finally:
+            meeting.mistral_turns = orig_mt
+            meeting.normalize_wav = orig_norm
+            meeting.wav_seconds = orig_wavs
+        speakers = sorted({t["speaker"] for t in second})
+        self.assertEqual(speakers, [1, 3],
+                         "mic voice heard on the system track must map to it, "
+                         "a mic-only voice gets a new number — not a blanket shift to 3,4")
+        by_speaker = {t["speaker"]: t["text"] for t in second}
+        self.assertEqual(by_speaker[1], "Hallo zusammen.")
+        self.assertEqual(by_speaker[3], "Nur ich hier.")
+
+    def test_live_session_forwards_per_session_glossary(self):
+        seen = []
+
+        def translate(src, target, context, on_token=None, model="", glossary=""):
+            seen.append(glossary)
+            return "Ciao Andreas."
+
+        live = types.SimpleNamespace(
+            transcribe=lambda pcm, language: "",
+            translate=translate,
+            settled=lambda session: None,
+            embedder="",
+            speaker=meeting_job.LIVE_SPEAKER,
+            glossary="Kita")
+        session = meeting_job.LiveSession(live, "de", "it", glossary="Andreas")
+        self.assertEqual(session.glossary, "Kita, Andreas")
+        session._hear("Hallo Andreas.", closed=True)
+        session.close()
+        self.drain(session)
+        self.assertEqual(seen, ["Kita, Andreas"])
+
 
 if __name__ == "__main__":
     unittest.main()

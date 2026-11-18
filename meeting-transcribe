@@ -475,6 +475,33 @@ def normalize_wav(source: Path, out: Path) -> None:
         raise SystemExit(f"ffmpeg could not convert {source}: {result.stderr.strip()[:300]}")
 
 
+AUDIOCPP_MODELS = {
+    "moss-transcribe-diarize": {
+        "id": "moss-transcribe-diarize",
+        "family": "moss_transcribe_diarize",
+        "path": "/opt/audiocpp/models/MOSS-Transcribe-Diarize-GGUF/moss-transcribe-diarize-bf16.gguf",
+        "task": "asr",
+        "mode": "offline",
+    },
+}
+
+
+def load_audiocpp_model(transcription_url: str, model: str) -> bool:
+    """Load an audio.cpp model on demand when the server unloaded it."""
+    spec = AUDIOCPP_MODELS.get(model)
+    if not spec:
+        return False
+    base = transcription_url.split("/v1/")[0]
+    request = urllib.request.Request(
+        f"{base}/v1/models/load", data=json.dumps(spec).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            return 200 <= getattr(response, "status", 200) < 300
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
 def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
                         max_tokens: int, attempts: int = ATTEMPTS) -> str:
     """audio.cpp transcribes a file it opens itself, and labels the speakers.
@@ -501,6 +528,8 @@ def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
             with error:
                 detail = error.read().decode(errors="replace")[:300]
             failure = f"ASR refused the file: {error.code} {detail}"
+            if error.code == 404 and load_audiocpp_model(url, model):
+                continue
             if error.code not in RETRYABLE:
                 raise SystemExit(failure)
         except (urllib.error.URLError, TimeoutError) as error:
@@ -518,6 +547,8 @@ def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
 # loses it.
 AUDIOCPP_MAX_TOKENS = 65536
 MISTRAL_URL = "https://api.mistral.ai"
+# Mistral's /v1/audio/transcriptions has a 65,536-token context window (~34 min).
+MISTRAL_MAX_S = 1500.0
 ISO_LANGS = {"german": "de", "italian": "it", "english": "en", "french": "fr",
              "spanish": "es", "portuguese": "pt", "dutch": "nl", "polish": "pl",
              "russian": "ru", "turkish": "tr", "swedish": "sv", "japanese": "ja",
@@ -604,21 +635,37 @@ def transcribe_mistral(url: str, audio: Path, model: str, language: str | None,
 
 def mistral_turns(args, source: Path, workdir: Path, hotwords: str,
                   lenient: bool) -> list[dict]:
-    """Normalize to 16 kHz mono WAV and diarize+transcribe in one Mistral request."""
+    """Normalize to 16 kHz mono WAV and diarize+transcribe via Mistral."""
     audio = workdir / "audio.wav"
     normalize_wav(source, audio)
     base = getattr(args, "mistral_url", MISTRAL_URL).rstrip("/")
+    url = f"{base}/v1/audio/transcriptions"
     key = getattr(args, "mistral_key", "") or os.environ.get("MISTRAL_API_KEY", "")
     seconds = wav_seconds(audio) or 0.0
     wait = max(args.asr_timeout, seconds * 0.5 + 120)
-    turns = transcribe_mistral(f"{base}/v1/audio/transcriptions", audio, args.model,
-                               args.language, hotwords, key, wait)
+    if seconds <= MISTRAL_MAX_S:
+        turns = transcribe_mistral(url, audio, args.model, args.language, hotwords, key, wait)
+    else:
+        turns = []
+        chunk_path = workdir / "chunk.wav"
+        offset = 0.0
+        while offset < seconds:
+            chunk_path.write_bytes(
+                slice_wav(audio, offset, min(offset + MISTRAL_MAX_S, seconds)))
+            for turn in transcribe_mistral(url, chunk_path, args.model,
+                                           args.language, hotwords, key, wait):
+                turns.append(dict(turn, start=round(turn["start"] + offset, 2),
+                                  end=round(turn["end"] + offset, 2)))
+            offset += MISTRAL_MAX_S
     if not turns:
         if lenient:
             return []
         raise SystemExit("ASR returned no turns")
     print(f"asr: {len(turns)} diarized segments from Mistral ({args.model})", file=sys.stderr)
-    return turns
+    # Mistral hands out speaker_1, speaker_2, ... per request; number_speakers()
+    # downstream relabels them 1..N in order of first appearance, which is what
+    # the rest of the pipeline expects.
+    return number_speakers(turns)
 
 
 def audiocpp_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dict]:
@@ -1184,6 +1231,16 @@ def main() -> None:
             voices = len({turn["speaker"] for turn in second})
             if args.diarize_second:
                 second = second_track_turns(second, after, args.second_name, diarized=True)
+            elif (is_mistral_asr(args.model, args.asr_mode)
+                    and redundant(labelled, second, args.second_offset)):
+                # Voxtral diarizes each track on its own, so the microphone
+                # track that hears the same room again gets its own speaker_1,
+                # speaker_2, ... — which would show up as extra speakers the
+                # system track never saw. The shared clock says which
+                # first-track speaker each mic voice is (49% of the mic track's
+                # speech overlapped the system track in the zoom-20261110
+                # recording), so match them instead of shifting the ids.
+                second = match_speakers(labelled, second, args.second_offset)
             elif voices > 1 and redundant(labelled, second, args.second_offset):
                 # The same room recorded twice, with several voices in it:
                 # calling all of them "Me" would be a lie, and the shared clock

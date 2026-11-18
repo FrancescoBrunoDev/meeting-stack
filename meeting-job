@@ -588,7 +588,10 @@ class Jobs:
 
     def _transcribe(self, job: Job) -> None:
         # One GPU/NPU user at a time: wait for any image generation to finish.
-        if not self.lock.acquire(self.lock_wait):
+        chosen_model = str(job.options.get("model") or self.model)
+        chosen_mode = str(job.options.get("asr_mode") or self.asr_mode)
+        needs_gpu = not is_mistral_asr(chosen_model, chosen_mode)
+        if needs_gpu and not self.lock.acquire(self.lock_wait):
             job.status = "error"
             job.error = f"waited {self.lock_wait:g}s for the GPU lock (an image is generating?)"
             job.finished = time.time()
@@ -599,12 +602,14 @@ class Jobs:
             job.status = "error"
             job.error = "no audio for this job"
             job.finished = time.time()
-            self.lock.release()
+            if needs_gpu:
+                self.lock.release()
             return
         if job.status == "cancelled":
             # Stopped while it waited for the lock: nothing was run.
             job.finished = time.time()
-            self.lock.release()
+            if needs_gpu:
+                self.lock.release()
             return
         command = [str(self.meeting), str(audio), "--output", str(prefix),
                    "--asr", self.asr, "--parallel", str(self.parallel),
@@ -666,7 +671,8 @@ class Jobs:
             job.status = "error"
             job.error = str(error)
         finally:
-            self.lock.release()
+            if needs_gpu:
+                self.lock.release()
             with self._current_lock:
                 self._current = None
             job.finished = time.time()
@@ -750,6 +756,37 @@ MISTRAL_HOST = "api.mistral.ai"
 MISTRAL_URL = f"https://{MISTRAL_HOST}"
 MISTRAL_BATCH_MODELS = ("voxtral-mini-transcribe-3", "voxtral-small-transcribe-3")
 MISTRAL_LIVE_MODELS = ("voxtral-mini-transcribe-realtime-3", *MISTRAL_BATCH_MODELS)
+AUDIOCPP_MODELS = {
+    "vibevoice_asr_streaming_7b_q8_0": {
+        "id": "vibevoice_asr_streaming_7b_q8_0",
+        "family": "vibevoice_asr_streaming",
+        "path": "/opt/audiocpp/models/VibeVoice-ASR-Streaming-7B-GGUF",
+        "task": "asr",
+        "mode": "streaming",
+    },
+    "moss-transcribe-diarize": {
+        "id": "moss-transcribe-diarize",
+        "family": "moss_transcribe_diarize",
+        "path": "/opt/audiocpp/models/MOSS-Transcribe-Diarize-GGUF/moss-transcribe-diarize-bf16.gguf",
+        "task": "asr",
+        "mode": "offline",
+    },
+}
+
+
+def ensure_audiocpp_model(base: str, model: str) -> None:
+    """Load an audio.cpp model on demand if it was unloaded while idle."""
+    spec = AUDIOCPP_MODELS.get(model)
+    if not spec or not base:
+        return
+    request = urllib.request.Request(
+        f"{base.rstrip('/')}/v1/models/load", data=json.dumps(spec).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=180):
+            pass
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
 
 
 def iso_language(language: str | None) -> str:
@@ -1177,7 +1214,7 @@ class LiveSession:
 
     def __init__(self, live: "Live", language: str, target: str,
                  silence: float = LIVE_LINE, model: str = "",
-                 asr_model: str = "") -> None:
+                 asr_model: str = "", glossary: str = "") -> None:
         self.live = live
         self.language = language
         self.target = target
@@ -1186,6 +1223,9 @@ class LiveSession:
         # reports is what it uses.
         self.mt_model = model or getattr(live, "translate_model", "")
         self.asr_model = asr_model or getattr(live, "model", "")
+        self.glossary = ", ".join(
+            part.strip() for part in (getattr(live, "glossary", ""), glossary)
+            if part and part.strip())
         self.silence = silence
         self.rows: list[dict] = []
         self.closed = False
@@ -1229,7 +1269,7 @@ class LiveSession:
     def _open_stream(self) -> StreamingASR | MistralRealtimeASR:
         if is_mistral_realtime(self.asr_model):
             return MistralRealtimeASR(
-                self.asr_model, self.language, getattr(self.live, "glossary", ""),
+                self.asr_model, self.language, self.glossary,
                 getattr(self.live, "mistral_key", ""), self._streamed)
         return StreamingASR(self.live.asr, self.asr_model, self._streamed)
 
@@ -1257,6 +1297,8 @@ class LiveSession:
                         self._stream_restarts += 1
                         print(f"live: the ASR stream ended ({self.stream.reason}); "
                               f"opening a new one ({self._stream_restarts})", flush=True)
+                    if self._stream_restarts > 0:
+                        ensure_audiocpp_model(self.live.asr, self.asr_model)
                     try:
                         self.stream = self._open_stream()
                     except (OSError, ValueError) as error:
@@ -1583,12 +1625,22 @@ class LiveSession:
 
         self._set_state("mt")
         try:
-            translated = self.live.translate(text, self.target, context,
-                                             None if previous else grew, self.mt_model)
+            try:
+                translated = self.live.translate(text, self.target, context,
+                                                 None if previous else grew,
+                                                 self.mt_model, self.glossary)
+            except TypeError:
+                translated = self.live.translate(text, self.target, context,
+                                                 None if previous else grew,
+                                                 self.mt_model)
             if not translated and context:
                 # An empty answer is not an answer: try once without the context.
-                translated = self.live.translate(text, self.target, [], None,
-                                                 self.mt_model)
+                try:
+                    translated = self.live.translate(text, self.target, [], None,
+                                                     self.mt_model, self.glossary)
+                except TypeError:
+                    translated = self.live.translate(text, self.target, [], None,
+                                                     self.mt_model)
         except (OSError, ValueError) as error:
             with self._lock:
                 self._state = "idle"
@@ -1651,16 +1703,18 @@ class Live:
         threading.Thread(target=self._reap, daemon=True).start()
 
     def feed(self, identity: str, pcm: bytes, language: str, target: str,
-             model: str = "", asr_model: str = "") -> LiveSession | None:
+             model: str = "", asr_model: str = "", glossary: str = "") -> LiveSession | None:
         """Add audio, opening the session on the first chunk. None means GPU busy."""
+        needs_gpu = not is_mistral_asr(asr_model or self.model)
         with self._lock:
             session = self.sessions.get(identity)
             if session is None:
-                if not self.gpu.acquire(0):
+                if needs_gpu and not self.gpu.acquire(0):
                     return None
                 session = self.sessions[identity] = LiveSession(
-                    self, language, target, self.silence, model, asr_model)
-                session.locked = True
+                    self, language, target, self.silence, model, asr_model, glossary)
+                if needs_gpu:
+                    session.locked = True
         session.feed(pcm)
         return session
 
@@ -1808,7 +1862,7 @@ class Live:
             process.kill()
 
     def translate(self, src: str, target: str, context: list[str],
-                  on_token=None, model: str = "") -> str:
+                  on_token=None, model: str = "", glossary: str = "") -> str:
         """The line in the target language; `on_token` gets every partial text.
 
         Streaming is what makes the page feel live: the generation is 0.4-0.5 s
@@ -1821,8 +1875,9 @@ class Live:
         content = "".join(f"Context line: {line}\n" for line in context)
         content += f"\nTranslate this line:\n{src}"
         system = translate_prompt(target)
-        if self.glossary:
-            system += f" Keep these spellings unchanged: {self.glossary}."
+        terms = glossary or self.glossary
+        if terms:
+            system += f" Keep these spellings unchanged: {terms}."
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system},
@@ -2228,11 +2283,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             query = urllib.parse.parse_qs(parsed.query)
             asr_choice = query.get("asr_model", [""])[0]
+            glossary = query.get("glossary", [""])[0]
             try:
                 session = self.server.live.feed(identity, body, query.get("language", [""])[0],
                                                 query.get("to", [""])[0],
                                                 query.get("mt_model", [""])[0],
-                                                asr_choice)
+                                                asr_choice, glossary)
             except TypeError:
                 session = self.server.live.feed(identity, body, query.get("language", [""])[0],
                                                 query.get("to", [""])[0],

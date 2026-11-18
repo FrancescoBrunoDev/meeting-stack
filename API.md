@@ -8,9 +8,11 @@ different jobs, and they behave differently:
 - **live** — you stream microphone audio as it happens, it answers with a growing
   transcript and its translation. Fast, approximate, **no speaker labels**.
 
-They share one GPU and one lock: a batch job and a live session never run at the
-same time. A live session holds the lock for its whole life, so a job submitted
-during one waits (and a second live session gets `409`).
+They share one GPU and one lock: a local batch job and a local live session
+never run at the same time. A local live session holds the lock for its whole
+life, so a job submitted during one waits (and a second local live session gets
+`409`). Mistral cloud transcription jobs and live sessions (`voxtral-*` /
+`asr_mode=mistral`) run off-box and bypass the local GPU lock.
 
 ## Auth
 
@@ -117,8 +119,11 @@ curl -X POST http://host:8099/live/<id>/close
 
 `?language=` is what the speaker talks (a hint), `?to=` is what to translate
 into, `?mt_model=` overrides the translator for this session (omit for the
-service's `--translate-model`), and `?asr_model=` overrides the transcriber
-(omit for `--live-model`). Chunks of any size: the page sends 0.5 s.
+service's `--translate-model`), `?asr_model=` overrides the transcriber
+(omit for `--live-model`), and `?glossary=` passes comma-separated names and
+terms for this session (combined with `--live-glossary`, kept unchanged in
+translation and forwarded as `context_bias` to Mistral Realtime). Chunks of any
+size: the page sends 0.5 s.
 
 The poll answers `mt_model` and `asr_model`: the translator and transcriber the
 session is really using, so a client that asked for one can see whether it got it.
