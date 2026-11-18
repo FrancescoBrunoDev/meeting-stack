@@ -77,6 +77,7 @@ type Job = JobSummary & {
 }
 
 const LANGUAGES = ["auto", "it", "de", "en", "fr", "es"]
+const DEFAULT_MODEL = "__default__"
 
 // XHR instead of fetch: only XHR reports upload progress.
 function upload(url: string, file: File, token: string, onProgress: (fraction: number) => void) {
@@ -245,6 +246,7 @@ function Jobs() {
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [selected, setSelected] = useState<Job | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [batchModels, setBatchModels] = useState<{ id: string; recipe?: string }[]>([])
   const fileInput = useRef<HTMLInputElement>(null)
 
   const api = useCallback(
@@ -281,6 +283,16 @@ function Jobs() {
     const timer = setInterval(refresh, 5000)
     return () => clearInterval(timer)
   }, [refresh])
+
+  useEffect(() => {
+    let alive = true
+    api("/live/models")
+      .then((answer) => alive && setBatchModels(answer.batch_models ?? []))
+      .catch(() => alive && setBatchModels([]))
+    return () => {
+      alive = false
+    }
+  }, [api])
 
   async function openJob(id: string) {
     setSelectedId(id)
@@ -332,6 +344,7 @@ function Jobs() {
     if (!files.length) return
     const speakers = String(form.get("speakers") ?? "")
     const language = String(form.get("language") ?? "auto")
+    const model = String(form.get("model") ?? DEFAULT_MODEL)
     // Two files are the two tracks of one call: same pair key, so the server
     // queues a single job instead of two unrelated transcripts.
     const pair = files.length > 1 ? `ui-${Date.now()}` : null
@@ -346,6 +359,7 @@ function Jobs() {
         const query = new URLSearchParams({ filename: file.name })
         if (speakers) query.set("speakers", speakers)
         if (language !== "auto") query.set("language", language)
+        if (model && model !== DEFAULT_MODEL) query.set("model", model)
         if (pair) {
           query.set("pair", pair)
           // The recorder names its tracks; anything else is system first.
@@ -420,6 +434,22 @@ function Jobs() {
                     {LANGUAGES.map((code) => (
                       <SelectItem key={code} value={code}>
                         {code === "auto" ? "Auto-detect" : code.toUpperCase()}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid w-full gap-2 sm:w-52">
+                <Label htmlFor="model">Model</Label>
+                <Select name="model" defaultValue={DEFAULT_MODEL}>
+                  <SelectTrigger id="model" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={DEFAULT_MODEL}>service default</SelectItem>
+                    {batchModels.map((entry) => (
+                      <SelectItem key={entry.id} value={entry.id}>
+                        {entry.id}
                       </SelectItem>
                     ))}
                   </SelectContent>

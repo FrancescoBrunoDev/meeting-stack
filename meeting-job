@@ -50,6 +50,7 @@ import queue
 import re
 import select
 import signal
+import ssl
 import struct
 import socket
 import subprocess
@@ -556,6 +557,15 @@ class Jobs:
     def queued(self) -> int:
         return self._queue.qsize()
 
+    def models(self, mistral_key: str = "") -> list[dict]:
+        """Batch transcription models: the configured local one, plus Mistral if a key is set."""
+        items = [{"id": self.model, "recipe": self.asr_mode}] if self.model else []
+        if mistral_key:
+            for name in MISTRAL_BATCH_MODELS:
+                if name != self.model:
+                    items.append({"id": name, "recipe": "mistral"})
+        return items
+
     def _work(self) -> None:
         while True:
             job = self._queue.get()
@@ -735,6 +745,31 @@ LANG_NAMES = {"it": "Italian", "en": "English", "de": "German", "fr": "French",
               "es": "Spanish", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish",
               "ru": "Russian", "tr": "Turkish", "sv": "Swedish", "ja": "Japanese",
               "zh": "Chinese", "ar": "Arabic"}
+ISO_LANGS = {name.lower(): code for code, name in LANG_NAMES.items()}
+MISTRAL_HOST = "api.mistral.ai"
+MISTRAL_URL = f"https://{MISTRAL_HOST}"
+MISTRAL_BATCH_MODELS = ("voxtral-mini-transcribe-3", "voxtral-small-transcribe-3")
+MISTRAL_LIVE_MODELS = ("voxtral-mini-transcribe-realtime-3", *MISTRAL_BATCH_MODELS)
+
+
+def iso_language(language: str | None) -> str:
+    """Two-letter ISO 639-1 code for endpoints that reject 'auto' or full names."""
+    raw = (language or "").strip().lower()
+    if not raw or raw == "auto":
+        return ""
+    if len(raw) == 2 and raw.isalpha():
+        return raw
+    return ISO_LANGS.get(raw, "")
+
+
+def is_mistral_asr(model: str, mode: str = "") -> bool:
+    name = (model or "").removeprefix("mistral.")
+    return mode == "mistral" or name.startswith("voxtral-")
+
+
+def is_mistral_realtime(model: str) -> bool:
+    name = (model or "").removeprefix("mistral.")
+    return name.startswith("voxtral-") and "realtime" in name
 def translate_prompt(target: str) -> str:
     """The system prompt, with the language *name*: a bare code gets misread."""
     return TRANSLATE_PROMPT.format(target=LANG_NAMES.get(target.lower(), target or "English"))
@@ -812,11 +847,12 @@ def wav_bytes(pcm: bytes) -> bytes:
         handle.writeframes(pcm)
     return buffer.getvalue()
 
-def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
+def multipart(fields: dict | list[tuple[str, str]], filename: str, data: bytes) -> tuple[bytes, str]:
     """A multipart/form-data body with text fields and one file part."""
     boundary = "----halogen" + uuid.uuid4().hex
     body = bytearray()
-    for name, value in fields.items():
+    items = fields.items() if isinstance(fields, dict) else fields
+    for name, value in items:
         body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
     body += (f"--{boundary}\r\n"
              f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
@@ -972,18 +1008,184 @@ class StreamingASR:
             except OSError:
                 pass
 
+
+class MistralRealtimeASR:
+    """Mistral Voxtral Realtime WebSocket with live speaker diarization.
+
+    The protocol is four steps in order: connect, wait for `session.created`,
+    send `session.update` (with `diarize: true` before any audio chunk, because
+    settings lock on the first `input_audio.append`), then stream base64 PCM16
+    chunks and read `transcription.segment` events carrying `text` and
+    `speaker_id`.
+    """
+
+    def __init__(self, model: str, language: str, glossary: str, key: str,
+                 on_text, host: str = MISTRAL_HOST) -> None:
+        if not key:
+            raise ValueError("MISTRAL_API_KEY is not set")
+        clean_model = model.removeprefix("mistral.")
+        path = "/v1/audio/transcriptions/realtime?" + urllib.parse.urlencode({"model": clean_model})
+        raw = socket.create_connection((host, 443), timeout=30)
+        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+             f"Connection: Upgrade\r\nSec-WebSocket-Key: {ws_key}\r\n"
+             f"Sec-WebSocket-Version: 13\r\nAuthorization: Bearer {key}\r\n"
+             "User-Agent: meeting-stack/1.0\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                self.sock.close()
+                raise OSError("Mistral WebSocket closed during handshake")
+            buf += chunk
+        header, self._rest = buf.split(b"\r\n\r\n", 1)
+        status = header.splitlines()[0].decode("utf-8", "replace")
+        if " 101 " not in status:
+            detail = self._rest.decode("utf-8", "replace")[:200]
+            self.sock.close()
+            raise ValueError(f"Mistral Realtime refused ({status}): {detail}")
+        self.on_text = on_text
+        self.dead = False
+        self.reason = ""
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        first = self._recv_frame()
+        if not first or first.get("type") == "error":
+            msg = (first or {}).get("error", {}).get("message") or "handshake failed"
+            self.sock.close()
+            raise ValueError(f"Mistral Realtime error: {msg}")
+        session_cfg: dict = {
+            "audio_format": {"encoding": "pcm_s16le", "sample_rate": LIVE_RATE},
+            "target_streaming_delay_ms": 480,
+            "diarize": True,
+        }
+        lang = iso_language(language)
+        if lang:
+            session_cfg["language"] = lang
+        bias = [part.strip() for part in (glossary or "").split(",") if part.strip()]
+        if bias:
+            session_cfg["context_bias"] = bias
+        self._send_json({"type": "session.update", "session": session_cfg})
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _send_json(self, obj: dict) -> None:
+        data = json.dumps(obj).encode()
+        mask = os.urandom(4)
+        size = len(data)
+        if size < 126:
+            header = bytes([0x81, 0x80 | size]) + mask
+        elif size < 65536:
+            header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", size) + mask
+        else:
+            header = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", size) + mask
+        masked = bytes(byte ^ mask[index & 3] for index, byte in enumerate(data))
+        with self._lock:
+            self.sock.sendall(header + masked)
+
+    def _recv_frame(self) -> dict | None:
+        def need(count: int) -> bool:
+            while len(self._rest) < count:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    return False
+                self._rest += chunk
+            return True
+
+        while True:
+            if not need(2):
+                return None
+            b0, b1 = self._rest[0], self._rest[1]
+            opcode, masked, length, idx = b0 & 0x0F, b1 & 0x80, b1 & 0x7F, 2
+            if length == 126:
+                if not need(4):
+                    return None
+                length, idx = struct.unpack("!H", self._rest[2:4])[0], 4
+            elif length == 127:
+                if not need(10):
+                    return None
+                length, idx = struct.unpack("!Q", self._rest[2:10])[0], 10
+            if masked:
+                if not need(idx + 4):
+                    return None
+                mask, idx = self._rest[idx:idx + 4], idx + 4
+            if not need(idx + length):
+                return None
+            payload, self._rest = self._rest[idx:idx + length], self._rest[idx + length:]
+            if masked:
+                payload = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
+            if opcode == 0x8:
+                return None
+            if opcode == 0x9:
+                with self._lock:
+                    self.sock.sendall(bytes([0x8A, 0x80]) + os.urandom(4))
+                continue
+            if opcode in (0x1, 0x2):
+                return json.loads(payload.decode("utf-8", "replace"))
+
+    def _read(self) -> None:
+        try:
+            while True:
+                event = self._recv_frame()
+                if event is None:
+                    break
+                kind = event.get("type")
+                if kind == "transcription.segment":
+                    self.on_text(str(event.get("text") or ""),
+                                 str(event.get("speaker_id") or ""), False)
+                elif kind == "transcription.text.delta":
+                    self.on_text(str(event.get("text") or ""), "", False)
+                elif kind == "transcription.done":
+                    break
+                elif kind == "error":
+                    err = event.get("error") or {}
+                    detail = err.get("message") if isinstance(err, dict) else err
+                    self.reason = f"Mistral Realtime error: {detail or event}"
+                    break
+        except (OSError, ValueError) as exc:
+            self.reason = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.reason = self.reason or "the service closed the stream"
+            self.dead = True
+            self._done.set()
+
+    def feed(self, pcm: bytes) -> None:
+        if self.dead:
+            return
+        try:
+            self._send_json({"type": "input_audio.append",
+                             "audio": base64.b64encode(pcm).decode()})
+        except OSError as exc:
+            self.reason = f"send failed: {type(exc).__name__}: {exc}"
+            self.dead = True
+
+    def close(self) -> None:
+        if not self.dead:
+            try:
+                self._send_json({"type": "input_audio.end"})
+                self._done.wait(timeout=3.0)
+            except OSError:
+                pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
 class LiveSession:
     """One stream: audio chunks in, transcribed and translated rows out."""
 
     def __init__(self, live: "Live", language: str, target: str,
-                 silence: float = LIVE_LINE, model: str = "") -> None:
+                 silence: float = LIVE_LINE, model: str = "",
+                 asr_model: str = "") -> None:
         self.live = live
         self.language = language
         self.target = target
-        # The page can pick the translator per session; empty means the service's
-        # --translate-model. Resolved once, so what the session reports is what it
-        # uses.
+        # The page can pick the translator and transcriber per session; empty
+        # means the service's default. Resolved once, so what the session
+        # reports is what it uses.
         self.mt_model = model or getattr(live, "translate_model", "")
+        self.asr_model = asr_model or getattr(live, "model", "")
         self.silence = silence
         self.rows: list[dict] = []
         self.closed = False
@@ -1000,6 +1202,7 @@ class LiveSession:
         self._pending = ""
         self._pending_row = 0
         self._pending_at = 0.0
+        self._speaker = ""                       # current speaker_id when live-diarized
         self._translated = 0                     # source length at the last partial translation
         self._partial_busy = False                # a partial translation is in flight
         # The newest text of the line being built, waiting for a free worker: a
@@ -1010,11 +1213,25 @@ class LiveSession:
         self._state = "idle"
         self._voice: list[float] | None = None   # mean of the line's clips
         self._closing = False                    # a close is already queued
-        self.stream: StreamingASR | None = None  # only with --live-stream
+        self.stream: StreamingASR | MistralRealtimeASR | None = None
         self._stream_restarts = 0
         self._queue: queue.Queue = queue.Queue()
         self._lock = threading.RLock()
         threading.Thread(target=self._work, daemon=True).start()
+
+    def _uses_stream(self) -> bool:
+        if is_mistral_realtime(self.asr_model):
+            return True
+        if is_mistral_asr(self.asr_model):
+            return False
+        return bool(getattr(self.live, "stream_asr", False))
+
+    def _open_stream(self) -> StreamingASR | MistralRealtimeASR:
+        if is_mistral_realtime(self.asr_model):
+            return MistralRealtimeASR(
+                self.asr_model, self.language, getattr(self.live, "glossary", ""),
+                getattr(self.live, "mistral_key", ""), self._streamed)
+        return StreamingASR(self.live.asr, self.asr_model, self._streamed)
 
     def feed(self, pcm: bytes) -> None:
         with self._lock:
@@ -1027,7 +1244,7 @@ class LiveSession:
                 # The room's own level: a noisy room must not look like speech.
                 floor = sorted(self._history)[len(self._history) // 5]
                 self._noise = max(LIVE_FLOOR, int(floor * 2.5))
-            if getattr(self.live, "stream_asr", False):
+            if self._uses_stream():
                 # Nothing is cut: the model segments as it listens, and its
                 # deltas grow the row while the speaker is still talking. Only
                 # the tail is kept, for the pause that ends the line.
@@ -1040,8 +1257,14 @@ class LiveSession:
                         self._stream_restarts += 1
                         print(f"live: the ASR stream ended ({self.stream.reason}); "
                               f"opening a new one ({self._stream_restarts})", flush=True)
-                    self.stream = StreamingASR(self.live.asr, self.live.model,
-                                               self._streamed)
+                    try:
+                        self.stream = self._open_stream()
+                    except (OSError, ValueError) as error:
+                        self.rows.append({"src": "", "mt": "", "error": str(error)[:300],
+                                          "done": True})
+                        self.closed = True
+                        self._queue.put(None)
+                        return
                 self.stream.feed(pcm)
                 self._pcm = self._pcm[-int(self.silence * 4 * LIVE_BYTES_PER_S):]
                 self._close_on_pause()
@@ -1088,14 +1311,14 @@ class LiveSession:
                 return
             self.closed = True
             self.last = time.monotonic()
-            if self.stream is not None:
-                self.stream.close()
-            tail, self._pcm = self._pcm, b""
+            stream, tail, self._pcm = self.stream, self._pcm, b""
+        if stream is not None:
+            stream.close()
+        elif (len(tail) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S
+                and any(value >= self._noise for value in frame_rms(tail))):
             # Only if someone is still talking: Whisper invents words on silence.
-            if (len(tail) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S
-                    and any(value >= self._noise for value in frame_rms(tail))):
-                self._queue.put(tail)
-            self._queue.put(None)
+            self._queue.put(tail)
+        self._queue.put(None)
 
     def view(self, since: int) -> dict:
         with self._lock:
@@ -1109,10 +1332,11 @@ class LiveSession:
                     "rows": [{"i": index, **row}
                              for index, row in enumerate(self.rows) if index >= since],
                     "language": self.language, "to": self.target,
-                    # Which translator this session is actually using: the page
-                    # choosing one and the server using another is invisible
-                    # otherwise, and both answer "fine".
+                    # Which translator and transcriber this session is actually
+                    # using: the page choosing one and the server using another
+                    # is invisible otherwise, and both answer "fine".
                     "mt_model": self.mt_model,
+                    "asr_model": self.asr_model,
                     # seconds of audio held back waiting for a pause, and what
                     # the worker is up to: the page has nothing else to show
                     "buffered": round(len(self._pcm) / LIVE_BYTES_PER_S, 1),
@@ -1149,7 +1373,7 @@ class LiveSession:
             clip = item
             box: dict = {}
             listener = None
-            if self.live.embedder:
+            if self.live.embedder and not is_mistral_asr(self.asr_model):
                 # The container start plus the model is 0.40 s: run it beside the
                 # ASR instead of after it, so a voice change costs no latency.
                 def listen() -> None:
@@ -1162,7 +1386,10 @@ class LiveSession:
                 listener.start()
             self._set_state("asr")
             try:
-                src = self.live.transcribe(clip, self.language)
+                try:
+                    src = self.live.transcribe(clip, self.language, self.asr_model)
+                except TypeError:
+                    src = self.live.transcribe(clip, self.language)
             except (OSError, ValueError) as error:
                 # One failed clip must not end the session: say so and go on.
                 with self._lock:
@@ -1182,18 +1409,31 @@ class LiveSession:
             if src:
                 self._hear(src, closed=other, voice=voice)
 
-    def _streamed(self, delta: str) -> None:
+    def _streamed(self, delta: str, speaker: str = "", dedupe: bool = True) -> None:
         """A piece of the line, while the speaker is still talking."""
         text = clean_live_text(delta)
         if not text:
             return
         with self._lock:
+            if (self._pending and self._pending_row >= 0
+                    and speaker and self._speaker and speaker != self._speaker):
+                # Live diarization reported a new speaker: close the previous
+                # speaker's line right away and start a fresh row for the new one.
+                row, head = self._pending_row, self._pending
+                self._pending = ""
+                self._translated = 0
+                self._partial_busy = False
+                self._closing = False
+                self._queue.put(Close(row, head))
             if self._pending and self._pending_row >= 0:
-                fresh = repeated_tail(self._pending, text)
+                fresh = repeated_tail(self._pending, text) if dedupe else text
                 if not fresh:
                     return                  # the model said it again: not new words
-                self._pending = f"{self._pending} {fresh}".strip()
+                glue = "" if fresh[0] in ".!?,;:…)]\"'»" else " "
+                self._pending = f"{self._pending}{glue}{fresh}".strip()
                 self.rows[self._pending_row]["src"] = self._pending
+                if speaker and not self.rows[self._pending_row].get("speaker"):
+                    self.rows[self._pending_row]["speaker"] = self._speaker = speaker
                 if len(self._pending) >= LIVE_PENDING_CHARS:
                     head, tail = sentence_split(self._pending, LIVE_PENDING_CHARS // 2)
                     if head:
@@ -1204,15 +1444,23 @@ class LiveSession:
                         self._pending, self._translated = tail, len(tail)
                         self._partial_busy = False
                         if tail:
-                            self.rows.append({"src": tail, "mt": "", "done": False})
+                            next_row: dict = {"src": tail, "mt": "", "done": False}
+                            if self._speaker:
+                                next_row["speaker"] = self._speaker
+                            self.rows.append(next_row)
                             self._pending_row = len(self.rows) - 1
                         self._queue.put(Close(row, head))
                 self._maybe_partial()
             else:
-                self.rows.append({"src": text, "mt": "", "done": False})
+                new_row: dict = {"src": text, "mt": "", "done": False}
+                if speaker:
+                    new_row["speaker"] = speaker
+                self.rows.append(new_row)
                 self._pending, self._pending_row = text, len(self.rows) - 1
+                self._speaker = speaker
                 self._pending_at = time.monotonic()
                 self._translated = 0
+                self._maybe_partial()
 
     def _maybe_partial(self) -> None:
         """Translate the line so far, without waiting for it to end.
@@ -1369,7 +1617,8 @@ class Live:
                  lock_path: Path, idle: float = 120, glossary: str = "",
                  silence: float = LIVE_LINE, embedder: str = "",
                  speaker: float = LIVE_SPEAKER, live_asr: str = "",
-                 live_model: str = "", stream_asr: bool = False) -> None:
+                 live_model: str = "", stream_asr: bool = False,
+                 mistral_key: str = "") -> None:
         # The live path can use its own endpoint: a clip every half second makes
         # the fixed cost of a request the whole budget (gufo 0.78 s, Whisper
         # through Lemonade 0.24 s, measured), and the jobs keep their own choice.
@@ -1378,6 +1627,7 @@ class Live:
         # One long request per session instead of one per clip: the model's
         # deltas grow the line while the speaker is still talking.
         self.stream_asr = stream_asr
+        self.mistral_key = mistral_key or os.environ.get("MISTRAL_API_KEY", "")
         self.llm = llm.rstrip("/")
         self.translate_model = translate_model
         # Cloud models refuse a request that does not say which session it
@@ -1401,18 +1651,28 @@ class Live:
         threading.Thread(target=self._reap, daemon=True).start()
 
     def feed(self, identity: str, pcm: bytes, language: str, target: str,
-             model: str = "") -> LiveSession | None:
+             model: str = "", asr_model: str = "") -> LiveSession | None:
         """Add audio, opening the session on the first chunk. None means GPU busy."""
         with self._lock:
             session = self.sessions.get(identity)
             if session is None:
                 if not self.gpu.acquire(0):
                     return None
-                session = self.sessions[identity] = LiveSession(self, language, target,
-                                                                self.silence, model)
+                session = self.sessions[identity] = LiveSession(
+                    self, language, target, self.silence, model, asr_model)
                 session.locked = True
         session.feed(pcm)
         return session
+
+    def asr_models(self) -> list[dict]:
+        """Live transcription models: the configured local one, plus Mistral if a key is set."""
+        items = [{"id": self.model, "recipe": "local"}] if self.model else []
+        if self.mistral_key:
+            for name in MISTRAL_LIVE_MODELS:
+                if name != self.model:
+                    items.append({"id": name, "recipe": "mistral",
+                                  "diarize": "realtime" in name})
+        return items
 
     def models(self) -> list[dict]:
         """The translators this box actually has, asked of Lemonade.
@@ -1454,8 +1714,25 @@ class Live:
             session.close()
         return session
 
-    def transcribe(self, pcm: bytes, language: str) -> str:
-        fields = {"model": self.model, "response_format": "json", "max_tokens": "512"}
+    def transcribe(self, pcm: bytes, language: str, model: str = "") -> str:
+        chosen = model or self.model
+        if is_mistral_asr(chosen):
+            if not self.mistral_key:
+                raise ValueError("MISTRAL_API_KEY is not set")
+            clean = chosen.removeprefix("mistral.")
+            fields: dict[str, str] = {"model": clean}
+            lang = iso_language(language)
+            if lang:
+                fields["language"] = lang
+            body, boundary = multipart(fields, "clip.wav", wav_bytes(pcm))
+            request = urllib.request.Request(
+                f"{MISTRAL_URL}/v1/audio/transcriptions", data=body,
+                headers={"Authorization": f"Bearer {self.mistral_key}",
+                         "Content-Type": f"multipart/form-data; boundary={boundary}",
+                         "User-Agent": "meeting-stack/1.0"})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return clean_live_text(str(json.loads(response.read()).get("text", "")))
+        fields = {"model": chosen, "response_format": "json", "max_tokens": "512"}
         if language:
             fields["language"] = language
         body, boundary = multipart(fields, "clip.wav", wav_bytes(pcm))
@@ -1550,16 +1827,21 @@ class Live:
             "model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": content}],
+            "max_tokens": 1200, "temperature": 0,
+            "stream": on_token is not None}
+        if not model.startswith("mistral."):
             # A thinking model spends the budget on its reasoning first, and a
             # cloud one then answers with a null message — which Lemonade turns
-            # into a 500. Ask it not to think, and leave room in case it does.
-            "max_tokens": 1200, "temperature": 0,
-            "reasoning_effort": "none",
-            "stream": on_token is not None,
-            "chat_template_kwargs": {"enable_thinking": False}}
+            # into a 500. Mistral's API rejects both fields with 400/422.
+            payload["reasoning_effort"] = "none"
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             return self._ask(payload, on_token)
         except urllib.error.HTTPError as error:
+            if error.code in (400, 422) and "reasoning_effort" in payload:
+                payload.pop("reasoning_effort", None)
+                payload.pop("chat_template_kwargs", None)
+                return self._ask(payload, on_token)
             # A model registered by hand is served as "user.<id>", while Lemonade
             # lists it without the prefix: asking for the listed name is a 404
             # from the backend, and that 404 is the only place the difference
@@ -1640,10 +1922,12 @@ def tools() -> list[dict]:
                           "description": "diarizer backend; nemotron labels far-field German audio best"},
              "model": {"type": "string",
                        "description": "ASR model the endpoint serves (Whisper-Large-v3-Turbo when asr_mode is full)"},
-             "asr_mode": {"type": "string", "enum": ["segments", "full", "audiocpp"],
+             "asr_mode": {"type": "string", "enum": ["segments", "full", "audiocpp", "mistral"],
                           "description": "segments: one ASR request per turn clip (gufo); full: one pass "
                                          "over the whole file, needs a verbose_json endpoint; audiocpp: one "
-                                         "request to audio.cpp, which diarizes itself (needs asr_dir)"}},
+                                         "request to audio.cpp, which diarizes itself (needs asr_dir); "
+                                         "mistral: one request to Mistral's /v1/audio/transcriptions with "
+                                         "diarize=true (auto-selected for voxtral-* models)"}},
              "required": ["audio_base64"]}},
         {"name": "meeting_status",
          "description": "Status of a transcription job by id.",
@@ -1811,8 +2095,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/mcp":
             self._text(405, "the MCP endpoint accepts POST\n")
         elif path == "/live/models":
+            key = getattr(self.server.live, "mistral_key", "")
+            asr_models = (self.server.live.asr_models()
+                          if hasattr(self.server.live, "asr_models") else [])
+            batch_models = (self.server.jobs.models(key)
+                            if hasattr(self.server.jobs, "models") else [])
             self._json(200, {"models": self.server.live.models(),
-                             "default": self.server.live.translate_model})
+                             "default": self.server.live.translate_model,
+                             "asr_models": asr_models,
+                             "asr_default": getattr(self.server.live, "model", ""),
+                             "batch_models": batch_models,
+                             "batch_default": getattr(self.server.jobs, "model", "")})
         elif path.startswith("/live/"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -1934,9 +2227,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "empty body: send PCM16 mono 16 kHz"})
                 return
             query = urllib.parse.parse_qs(parsed.query)
-            session = self.server.live.feed(identity, body, query.get("language", [""])[0],
-                                            query.get("to", [""])[0],
-                                            query.get("mt_model", [""])[0])
+            asr_choice = query.get("asr_model", [""])[0]
+            try:
+                session = self.server.live.feed(identity, body, query.get("language", [""])[0],
+                                                query.get("to", [""])[0],
+                                                query.get("mt_model", [""])[0],
+                                                asr_choice)
+            except TypeError:
+                session = self.server.live.feed(identity, body, query.get("language", [""])[0],
+                                                query.get("to", [""])[0],
+                                                query.get("mt_model", [""])[0])
             if session is None:
                 self._json(409, {"error": "the GPU is busy: a transcription job is running"})
             else:
@@ -1996,10 +2296,11 @@ def main() -> None:
     parser.add_argument("--model", default="Whisper-Large-v3-Turbo",
                         help="ASR model the endpoint serves (default Whisper-Large-v3-Turbo)")
     parser.add_argument("--asr-mode", default="full",
-                        choices=("segments", "full", "audiocpp"),
+                        choices=("segments", "full", "audiocpp", "mistral"),
                         help="segments: one ASR request per turn clip (default); full: one pass over "
                              "the whole file, needs a verbose_json endpoint such as Lemonade; "
-                             "audiocpp: one request to audio.cpp, which diarizes itself")
+                             "audiocpp: one request to audio.cpp, which diarizes itself; "
+                             "mistral: one request to Mistral's /v1/audio/transcriptions with diarize=true")
     parser.add_argument("--asr-dir", default=None,
                         help="with --asr-mode audiocpp: directory the ASR server can read, where "
                              "the normalized WAV is written (audio.cpp takes a path, not an upload)")

@@ -311,11 +311,12 @@ def slice_wav(path: Path, start: float, end: float) -> bytes:
     return buffer.getvalue()
 
 
-def multipart(fields: dict, filename: str, data: bytes) -> tuple[bytes, str]:
+def multipart(fields: dict | list[tuple[str, str]], filename: str, data: bytes) -> tuple[bytes, str]:
     """A multipart/form-data body with text fields and one file part."""
     boundary = "----halogen" + uuid.uuid4().hex
     body = bytearray()
-    for name, value in fields.items():
+    items = fields.items() if isinstance(fields, dict) else fields
+    for name, value in items:
         body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
     body += (f"--{boundary}\r\n"
              f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
@@ -516,6 +517,108 @@ def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
 # (decode cache 99900 steps). A tight cap does not truncate the transcript, it
 # loses it.
 AUDIOCPP_MAX_TOKENS = 65536
+MISTRAL_URL = "https://api.mistral.ai"
+ISO_LANGS = {"german": "de", "italian": "it", "english": "en", "french": "fr",
+             "spanish": "es", "portuguese": "pt", "dutch": "nl", "polish": "pl",
+             "russian": "ru", "turkish": "tr", "swedish": "sv", "japanese": "ja",
+             "chinese": "zh", "arabic": "ar"}
+
+
+def iso_language(language: str | None) -> str:
+    """Two-letter ISO 639-1 code for endpoints that reject 'auto' or full names."""
+    raw = (language or "").strip().lower()
+    if not raw or raw == "auto":
+        return ""
+    if len(raw) == 2 and raw.isalpha():
+        return raw
+    return ISO_LANGS.get(raw, "")
+
+
+def is_mistral_asr(model: str, mode: str = "") -> bool:
+    name = (model or "").removeprefix("mistral.")
+    return mode == "mistral" or name.startswith("voxtral-")
+
+
+def transcribe_mistral(url: str, audio: Path, model: str, language: str | None,
+                       hotwords: str, key: str, timeout: float,
+                       attempts: int = ATTEMPTS) -> list[dict]:
+    """One request to Mistral's /v1/audio/transcriptions with speaker diarization."""
+    if not key:
+        raise SystemExit("MISTRAL_API_KEY is required for Mistral transcription models")
+    clean_model = model.removeprefix("mistral.")
+    # If someone picked the realtime model id for a batch job, use the offline one.
+    if "realtime" in clean_model:
+        clean_model = "voxtral-mini-transcribe-3"
+    fields: list[tuple[str, str]] = [
+        ("model", clean_model),
+        ("diarize", "true"),
+        ("timestamp_granularities", "segment"),
+    ]
+    lang = iso_language(language)
+    if lang:
+        fields.append(("language", lang))
+    for term in (part.strip() for part in (hotwords or "").split(",")):
+        if term:
+            fields.append(("context_bias", term))
+    body, boundary = multipart(fields, audio.name, audio.read_bytes())
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "User-Agent": "meeting-stack/1.0",
+    }
+    failure = "Mistral ASR unreachable"
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(url, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read())
+            turns = []
+            for seg in payload.get("segments") or []:
+                spoken = unwrap(str(seg.get("text") or ""))
+                if not spoken:
+                    continue
+                start = float(seg.get("start") or 0.0)
+                end = max(float(seg.get("end") or start), start)
+                speaker = str(seg.get("speaker_id") or "speaker_1")
+                turns.append({"speaker": speaker, "start": round(start, 2),
+                              "end": round(end, 2), "text": spoken})
+            if not turns and payload.get("text"):
+                spoken = unwrap(str(payload["text"]))
+                if spoken:
+                    turns.append({"speaker": "speaker_1", "start": 0.0,
+                                  "end": round(wav_seconds(audio) or 0.0, 2), "text": spoken})
+            return turns
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read().decode(errors="replace")[:300]
+            failure = f"Mistral ASR refused the file: {error.code} {detail}"
+            if error.code not in RETRYABLE:
+                raise SystemExit(failure)
+        except (urllib.error.URLError, TimeoutError) as error:
+            failure = f"Mistral ASR unreachable: {error}"
+        if attempt == attempts:
+            raise SystemExit(f"{failure} (after {attempts} tries)")
+        time.sleep(RETRY_S * attempt)
+    raise SystemExit(failure)
+
+
+def mistral_turns(args, source: Path, workdir: Path, hotwords: str,
+                  lenient: bool) -> list[dict]:
+    """Normalize to 16 kHz mono WAV and diarize+transcribe in one Mistral request."""
+    audio = workdir / "audio.wav"
+    normalize_wav(source, audio)
+    base = getattr(args, "mistral_url", MISTRAL_URL).rstrip("/")
+    key = getattr(args, "mistral_key", "") or os.environ.get("MISTRAL_API_KEY", "")
+    seconds = wav_seconds(audio) or 0.0
+    wait = max(args.asr_timeout, seconds * 0.5 + 120)
+    turns = transcribe_mistral(f"{base}/v1/audio/transcriptions", audio, args.model,
+                               args.language, hotwords, key, wait)
+    if not turns:
+        if lenient:
+            return []
+        raise SystemExit("ASR returned no turns")
+    print(f"asr: {len(turns)} diarized segments from Mistral ({args.model})", file=sys.stderr)
+    return turns
 
 
 def audiocpp_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dict]:
@@ -912,6 +1015,8 @@ def track_turns(args, url: str, source: Path, workdir: Path, hotwords: str,
     of failing the job; it is for a microphone track that may be silent.
     """
     workdir.mkdir(parents=True, exist_ok=True)
+    if is_mistral_asr(args.model, args.asr_mode):
+        return mistral_turns(args, source, workdir, hotwords, lenient)
     if args.asr_mode == "audiocpp":
         return audiocpp_turns(args, source, workdir, lenient)
     if diarize_it:
@@ -978,13 +1083,19 @@ def main() -> None:
                         help="how --asr-dir is seen by the ASR server, when the two differ "
                              "(default: the same path)")
     parser.add_argument("--asr-mode", default="full",
-                        choices=("segments", "full", "audiocpp"),
+                        choices=("segments", "full", "audiocpp", "mistral"),
                         help="full: one request for the whole normalized file plus segment-level "
                              "fusion with the diarizer (the default; needs an OpenAI-compatible "
                              "verbose_json endpoint, e.g. Lemonade on :8731 with Whisper); "
                              "segments: one ASR request per turn clip, the gufo-safe path; "
                              "audiocpp: one request to audio.cpp, which diarizes itself and "
-                             "returns the turns, so no diarizer runs at all (needs --asr-dir)")
+                             "returns the turns, so no diarizer runs at all (needs --asr-dir); "
+                             "mistral: one request to Mistral's /v1/audio/transcriptions with "
+                             "diarize=true (auto-selected for voxtral-* models)")
+    parser.add_argument("--mistral-url", default=MISTRAL_URL,
+                        help=f"Mistral API base URL (default {MISTRAL_URL})")
+    parser.add_argument("--mistral-key", default=os.environ.get("MISTRAL_API_KEY", ""),
+                        help="Mistral API key (default $MISTRAL_API_KEY)")
     parser.add_argument("--speakers", type=int, default=-1,
                         help="known speaker count; -1 lets clustering decide (default)")
     parser.add_argument("--min-speakers", type=int, default=-1,
@@ -1047,7 +1158,7 @@ def main() -> None:
     hotwords = ", ".join(part for part in (args.hotwords, ", ".join(names.values())) if part)
     prefix = args.output or source.with_suffix("")
     url = args.asr.rstrip("/") + "/v1/audio/transcriptions"
-    if args.asr_mode == "audiocpp" and not args.asr_dir:
+    if args.asr_mode == "audiocpp" and not is_mistral_asr(args.model, args.asr_mode) and not args.asr_dir:
         raise SystemExit("--asr-mode audiocpp needs --asr-dir: audio.cpp reads the audio from "
                          "a path, so the normalized WAV must sit where it can open it")
     if args.asr_mode == "full" and args.model == "qwen3-asr-1.7b":
@@ -1095,7 +1206,7 @@ def main() -> None:
               f"{len({turn['speaker'] for turn in labelled})} speakers", file=sys.stderr)
     labelled = dedupe_turns(labelled)
     print(f"{len(labelled)} turns after removing repeated cuts", file=sys.stderr)
-    if args.asr_mode == "audiocpp":
+    if args.asr_mode == "audiocpp" or is_mistral_asr(args.model, args.asr_mode):
         before = len(labelled)
         labelled = merge_paragraphs(labelled)
         if len(labelled) < before:

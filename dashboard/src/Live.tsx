@@ -21,7 +21,13 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 
-type Row = { i: number; src: string; mt: string; done?: boolean; error?: string }
+type Row = { i: number; src: string; mt: string; speaker?: string; done?: boolean; error?: string }
+
+function speakerLabel(raw?: string) {
+  if (!raw) return ""
+  const match = /^speaker_(\d+)$/i.exec(raw)
+  return match ? `Speaker ${match[1]}` : raw
+}
 
 const LANGUAGES = ["auto", "de", "it", "en", "fr", "es"]
 const TARGETS = ["it", "en", "de", "fr"]
@@ -126,6 +132,8 @@ export default function Live() {
   )
   const [language, setLanguage] = useStored("language", "de")
   const [target, setTarget] = useStored("target", "it")
+  const [asrModel, setAsrModel] = useStored("asrModel", "")
+  const [asrModels, setAsrModels] = useState<{ id: string; recipe?: string; diarize?: boolean }[]>([])
   const [mtModel, setMtModel] = useStored("mtModel", "")
   const [mtModels, setMtModels] = useState<{ id: string; recipe?: string }[]>([])
   const [device, setDevice] = useStored("device", "")
@@ -163,9 +171,17 @@ export default function Live() {
   useEffect(() => {
     let alive = true
     fetch("/live/models", { headers: auth() })
-      .then((response) => (response.ok ? response.json() : { models: [] }))
-      .then((answer) => alive && setMtModels(answer.models ?? []))
-      .catch(() => alive && setMtModels([]))
+      .then((response) => (response.ok ? response.json() : { models: [], asr_models: [] }))
+      .then((answer) => {
+        if (!alive) return
+        setMtModels(answer.models ?? [])
+        setAsrModels(answer.asr_models ?? [])
+      })
+      .catch(() => {
+        if (!alive) return
+        setMtModels([])
+        setAsrModels([])
+      })
     return () => {
       alive = false
     }
@@ -289,8 +305,9 @@ export default function Live() {
     samples.current = []
     queued.current = 0
     const query = new URLSearchParams({ language, to: target })
-    // Empty means the service's --translate-model: the page does not need to know
-    // which one that is to use it.
+    // Empty means the service's defaults: the page does not need to know which
+    // ones those are to use them.
+    if (asrModel) query.set("asr_model", asrModel)
     if (mtModel) query.set("mt_model", mtModel)
     chain.current = chain.current
       .then(() =>
@@ -431,8 +448,8 @@ export default function Live() {
             <SessionBadge state={state} started={started} buffered={buffered} />
           </CardTitle>
           <CardDescription>
-            A line ends on a pause or when the voice changes. No speaker labels here: the
-            batch transcript is the labelled truth.
+            A line ends on a pause or when the voice changes; models with live diarization
+            also label the speaker.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -537,6 +554,33 @@ export default function Live() {
             </div>
 
             <div className="grid gap-1.5">
+              <Label htmlFor="asrModel" className="text-xs">
+                Transcriber
+              </Label>
+              <Select
+                value={asrModel || DEFAULT_TRANSLATOR}
+                onValueChange={(value) =>
+                  setAsrModel(value === DEFAULT_TRANSLATOR ? "" : value)
+                }
+                disabled={started}
+              >
+                <SelectTrigger id="asrModel" className="w-56">
+                  <SelectValue>
+                    {asrModel || "service default"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={DEFAULT_TRANSLATOR}>service default</SelectItem>
+                  {asrModels.map((model) => (
+                    <SelectItem key={model.id} value={model.id}>
+                      {model.id}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="grid gap-1.5">
               <Label htmlFor="mtModel" className="text-xs">
                 Translator
               </Label>
@@ -632,6 +676,11 @@ export default function Live() {
                     className="whitespace-pre-wrap text-sm text-muted-foreground"
                     style={{ opacity: fade(rows.length - 1 - row.i) }}
                   >
+                    {row.speaker && (
+                      <span className="mr-2 font-mono text-xs font-medium text-foreground/70">
+                        {speakerLabel(row.speaker)}:
+                      </span>
+                    )}
                     <Typing text={row.src} />
                     {!row.done && <span className="animate-pulse">▌</span>}
                   </p>

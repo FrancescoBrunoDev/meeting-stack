@@ -1306,6 +1306,84 @@ class LiveLines(unittest.TestCase):
         session.close()
         self.drain(session)
 
+    def test_live_diarization_splits_the_row_when_the_speaker_changes(self):
+        calls = []
+        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
+                                          asr_model="voxtral-mini-transcribe-realtime-3")
+        session._streamed("Guten Tag,", speaker="speaker_1", dedupe=False)
+        session._streamed("wie geht es?", speaker="speaker_1", dedupe=False)
+        session._streamed("Danke, sehr gut.", speaker="speaker_2", dedupe=False)
+        session._queue.put(None)
+        self.drain(session)
+        self.assertEqual(len(session.rows), 2)
+        self.assertEqual(session.rows[0]["src"], "Guten Tag, wie geht es?")
+        self.assertEqual(session.rows[0]["speaker"], "speaker_1")
+        self.assertTrue(session.rows[0]["done"])
+        self.assertEqual(session.rows[1]["src"], "Danke, sehr gut.")
+        self.assertEqual(session.rows[1]["speaker"], "speaker_2")
+        self.assertEqual(session.view(0)["asr_model"], "voxtral-mini-transcribe-realtime-3")
+
+    def test_mistral_batch_turns_keep_speakers_and_context_bias(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "segments": [
+                        {"text": " Hallo Andreas.", "start": 1.2, "end": 2.4,
+                         "speaker_id": "speaker_1"},
+                        {"text": " Guten Morgen.", "start": 2.8, "end": 3.9,
+                         "speaker_id": "speaker_2"},
+                    ]
+                }).encode()
+
+        def fake_open(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["auth"] = req.headers.get("Authorization")
+            captured["body"] = req.data.decode("utf-8", "replace")
+            return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = Path(tmp) / "clip.wav"
+            wav.write_bytes(meeting_job.wav_bytes(b"\x00\x00" * 1600))
+            original = meeting.urllib.request.urlopen
+            meeting.urllib.request.urlopen = fake_open
+            try:
+                turns = meeting.transcribe_mistral(
+                    "https://api.mistral.ai/v1/audio/transcriptions", wav,
+                    "mistral.voxtral-mini-transcribe-3", "German",
+                    "Andreas, Kita", "secret-key", 10)
+            finally:
+                meeting.urllib.request.urlopen = original
+        self.assertEqual(captured["auth"], "Bearer secret-key")
+        self.assertIn('name="model"\r\n\r\nvoxtral-mini-transcribe-3', captured["body"])
+        self.assertIn('name="diarize"\r\n\r\ntrue', captured["body"])
+        self.assertIn('name="language"\r\n\r\nde', captured["body"])
+        self.assertIn('name="context_bias"\r\n\r\nAndreas', captured["body"])
+        self.assertIn('name="context_bias"\r\n\r\nKita', captured["body"])
+        self.assertEqual(turns, [
+            {"speaker": "speaker_1", "start": 1.2, "end": 2.4, "text": "Hallo Andreas."},
+            {"speaker": "speaker_2", "start": 2.8, "end": 3.9, "text": "Guten Morgen."},
+        ])
+
+    def test_mistral_translator_omits_extra_fields_that_cause_422(self):
+        sent = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            live = meeting_job.Live(
+                "http://127.0.0.1:8090", "m", "http://127.0.0.1:8731",
+                "mistral.ministral-8b-latest", Path(tmp) / "gpu.lock")
+            live._ask = lambda payload, on_token=None: (sent.update(payload), "Ciao")[1]
+            result = live.translate("Hallo", "it", [], model="mistral.ministral-8b-latest")
+        self.assertEqual(result, "Ciao")
+        self.assertNotIn("reasoning_effort", sent)
+        self.assertNotIn("chat_template_kwargs", sent)
+
 
 if __name__ == "__main__":
     unittest.main()

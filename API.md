@@ -117,14 +117,23 @@ curl -X POST http://host:8099/live/<id>/close
 
 `?language=` is what the speaker talks (a hint), `?to=` is what to translate
 into, `?mt_model=` overrides the translator for this session (omit for the
-service's `--translate-model`). Chunks of any size: the page sends 0.5 s.
+service's `--translate-model`), and `?asr_model=` overrides the transcriber
+(omit for `--live-model`). Chunks of any size: the page sends 0.5 s.
 
-The poll answers `mt_model`: the translator the session is really using, so a
-client that asked for one can see whether it got it.
+The poll answers `mt_model` and `asr_model`: the translator and transcriber the
+session is really using, so a client that asked for one can see whether it got it.
 
-`GET /live/models` lists what the box can translate with, asked of Lemonade
-(`{"models": [{"id", "recipe"}], "default": "..."}`, chat models only), so a
-client can offer the choice without hardcoding names.
+`GET /live/models` lists what the box can translate and transcribe with:
+`{"models": [{"id", "recipe"}], "default": "...", "asr_models": [{"id", "recipe", "diarize"?}], "asr_default": "...", "batch_models": [{"id", "recipe"}], "batch_default": "..."}`.
+When `MISTRAL_API_KEY` is set, `asr_models` offers `voxtral-mini-transcribe-realtime-3`
+(WebSocket streaming with live diarization: `rows[].speaker` carries `speaker_1`,
+`speaker_2`, … and a speaker change closes the current row and starts a new one)
+alongside `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`;
+`batch_models` offers `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`
+for `POST /jobs?model=...` (file transcription with `diarize=true` and
+`timestamp_granularities=segment`). Lemonade does not proxy `/v1/audio/transcriptions`
+or WebSockets for cloud providers, so the service talks to `api.mistral.ai`
+directly.
 
 Cloud models (`recipe: cloud`, e.g. `opencode-go.*`) work too, and the service
 sends what they need: an `x-opencode-session` header, which those providers
