@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { ModelGroups } from "@/components/model-groups"
 import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
 import { Progress } from "@/components/ui/progress"
@@ -629,11 +630,7 @@ export default function Live() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={DEFAULT_TRANSLATOR}>service default</SelectItem>
-                  {asrModels.map((model) => (
-                    <SelectItem key={model.id} value={model.id}>
-                      {model.id}
-                    </SelectItem>
-                  ))}
+                  <ModelGroups models={asrModels} />
                 </SelectContent>
               </Select>
             </div>
@@ -656,11 +653,7 @@ export default function Live() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={DEFAULT_TRANSLATOR}>service default</SelectItem>
-                  {mtModels.map((model) => (
-                    <SelectItem key={model.id} value={model.id}>
-                      {model.id}
-                    </SelectItem>
-                  ))}
+                  <ModelGroups models={mtModels} />
                 </SelectContent>
               </Select>
             </div>

@@ -34,6 +34,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
 import { Label } from "@/components/ui/label"
+import { ModelGroups } from "@/components/model-groups"
 import {
   Select,
   SelectContent,
@@ -449,11 +450,7 @@ function Jobs() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value={DEFAULT_MODEL}>service default</SelectItem>
-                    {batchModels.map((entry) => (
-                      <SelectItem key={entry.id} value={entry.id}>
-                        {entry.id}
-                      </SelectItem>
-                    ))}
+                    <ModelGroups models={batchModels} />
                   </SelectContent>
                 </Select>
               </div>
