@@ -1670,7 +1670,7 @@ class Live:
                  silence: float = LIVE_LINE, embedder: str = "",
                  speaker: float = LIVE_SPEAKER, live_asr: str = "",
                  live_model: str = "", stream_asr: bool = False,
-                 mistral_key: str = "") -> None:
+                 mt_gateway: str = "", mistral_key: str = "") -> None:
         # The live path can use its own endpoint: a clip every half second makes
         # the fixed cost of a request the whole budget (gufo 0.78 s, Whisper
         # through Lemonade 0.24 s, measured), and the jobs keep their own choice.
@@ -1681,6 +1681,9 @@ class Live:
         self.stream_asr = stream_asr
         self.mistral_key = mistral_key or os.environ.get("MISTRAL_API_KEY", "")
         self.llm = llm.rstrip("/")
+        # The gateway that serves the cloud translators (Bifrost on :8080): its
+        # opencode models are announced as "opencode.<id>" and routed back to it.
+        self.gateway = mt_gateway.rstrip("/")
         self.translate_model = translate_model
         # Cloud models refuse a request that does not say which session it
         # belongs to ("cannot be routed efficiently"); one id per process is
@@ -1729,22 +1732,62 @@ class Live:
         return items
 
     def models(self) -> list[dict]:
-        """The translators this box actually has, asked of Lemonade.
+        """The translators this box actually has: Lemonade's, plus the cloud ones.
 
         Listed rather than hardcoded: a name in the page that the box does not
         serve is a setting that fails silently. Lemonade labels what a model can
         do, so "chat" is the filter — not the recipe, which is the runtime and
-        would offer the embedder and the rerankers too.
+        would offer the embedder and the rerankers too. On top of those, Mistral's
+        chat models when a key is set and the gateway's opencode models when
+        --mt-gateway is. A cloud id carries its provider as a prefix
+        ("mistral.ministral-8b-latest", "opencode.opencode-go/model_1"), which is
+        also how translate() routes it — away from --translate-url.
         """
+        items: list[dict] = []
         try:
             with urllib.request.urlopen(f"{self.llm}/api/v1/models", timeout=10) as response:
                 answer = json.loads(response.read())
+            found = answer.get("data") or answer.get("models") or []
+            items += [{"id": model.get("id"), "recipe": model.get("recipe")}
+                      for model in found
+                      if isinstance(model, dict) and "chat" in (model.get("labels") or [])]
+        except Exception:
+            pass
+        return items + self._mistral_translators() + self._opencode_translators()
+
+    def _mistral_translators(self) -> list[dict]:
+        """Mistral's chat models as "mistral.<id>", when MISTRAL_API_KEY is set."""
+        if not self.mistral_key:
+            return []
+        try:
+            request = urllib.request.Request(
+                f"{MISTRAL_URL}/v1/models",
+                headers={"Authorization": f"Bearer {self.mistral_key}",
+                         "User-Agent": "meeting-stack/1.0"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                found = json.loads(response.read()).get("data") or []
         except Exception:
             return []
-        found = answer.get("data") or answer.get("models") or []
-        return [{"id": model.get("id"), "recipe": model.get("recipe")}
+        return [{"id": f"mistral.{model.get('id')}", "recipe": "mistral"}
                 for model in found
-                if isinstance(model, dict) and "chat" in (model.get("labels") or [])]
+                if isinstance(model, dict)
+                and (model.get("capabilities") or {}).get("completion_chat")
+                and not model.get("deprecation")
+                # voxtral is the transcriber, already announced in asr_models
+                and not str(model.get("id") or "").startswith("voxtral-")]
+
+    def _opencode_translators(self) -> list[dict]:
+        """The gateway's opencode models as "opencode.<id>", when --mt-gateway is set."""
+        if not self.gateway:
+            return []
+        try:
+            with urllib.request.urlopen(f"{self.gateway}/v1/models", timeout=10) as response:
+                found = json.loads(response.read()).get("data") or []
+        except Exception:
+            return []
+        return [{"id": f"opencode.{model.get('id')}", "recipe": "opencode"}
+                for model in found
+                if isinstance(model, dict) and model.get("owned_by") == "opencode"]
 
     def settled(self, session: LiveSession) -> None:
         """The worker drained: free the GPU now, but let the page read the tail.
@@ -1900,17 +1943,36 @@ class Live:
             # A model registered by hand is served as "user.<id>", while Lemonade
             # lists it without the prefix: asking for the listed name is a 404
             # from the backend, and that 404 is the only place the difference
-            # shows. Nothing was streamed yet, so trying again is safe.
-            if error.code != 404 or model.startswith(("user.", "builtin.")):
+            # shows. Nothing was streamed yet, so trying again is safe. Only for
+            # the local endpoint — a provider-prefixed model is routed elsewhere.
+            if error.code != 404 or model.startswith(("user.", "builtin.",
+                                                     "mistral.", "opencode.")):
                 raise
             payload["model"] = f"user.{model}"
             return self._ask(payload, on_token)
 
     def _ask(self, payload: dict, on_token=None) -> str:
-        request = urllib.request.Request(
-            self.llm + "/v1/chat/completions", data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "x-opencode-session": self.session})
+        # A provider-prefixed model does not go to --translate-url: "mistral."
+        # is api.mistral.ai itself (the key rides in the Authorization header),
+        # "opencode." is the model at --mt-gateway with the prefix stripped.
+        model = str(payload.get("model") or "")
+        headers = {"Content-Type": "application/json",
+                   "x-opencode-session": self.session}
+        if model.startswith("mistral."):
+            if not self.mistral_key:
+                raise ValueError("MISTRAL_API_KEY is not set")
+            url = f"{MISTRAL_URL}/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {self.mistral_key}"
+            payload = dict(payload, model=model.removeprefix("mistral."))
+        elif model.startswith("opencode."):
+            if not self.gateway:
+                raise ValueError("no --mt-gateway configured for opencode.* models")
+            url = f"{self.gateway}/v1/chat/completions"
+            payload = dict(payload, model=model.removeprefix("opencode."))
+        else:
+            url = self.llm + "/v1/chat/completions"
+        request = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                         headers=headers)
         with urllib.request.urlopen(request, timeout=60) as response:
             if on_token is None:
                 answer = json.loads(response.read())
@@ -1931,7 +1993,7 @@ class Live:
                     # A backend refusal arrives inside a 200 stream, so nothing
                     # raised it and the caller could not retry the name.
                     raise urllib.error.HTTPError(
-                        self.llm, int(chunk["error"].get("status_code") or 404),
+                        url, int(chunk["error"].get("status_code") or 404),
                         str(chunk["error"].get("message") or "the backend refused"), None, None)
                 try:
                     piece = chunk["choices"][0]["delta"].get("content") or ""
@@ -2391,6 +2453,11 @@ def main() -> None:
     parser.add_argument("--translate-model", default="",
                         help="chat model that translates the live lines, e.g. "
                              "Qwen3.8-27B-GGUF; empty serves the live transcript untranslated")
+    parser.add_argument("--mt-gateway", default="",
+                        help="OpenAI-compatible gateway for the cloud translators (Bifrost on "
+                             "http://127.0.0.1:8080): its opencode models are listed in "
+                             "/live/models as opencode.<id>, and mt_model=opencode.<id> is "
+                             "routed there with the prefix stripped (empty disables them)")
     parser.add_argument("--live-idle", type=float, default=120,
                         help="seconds a live session may go without audio before it closes "
                              "(default 120)")
@@ -2423,7 +2490,7 @@ def main() -> None:
     live = Live(args.asr, args.model, args.translate_url, args.translate_model,
                 args.lock, args.live_idle, args.live_glossary, args.live_silence,
                 args.live_embedder, args.live_speaker, args.live_asr, args.live_model,
-                args.live_stream)
+                args.live_stream, mt_gateway=args.mt_gateway)
     server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload, live)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     translate = args.translate_model or "no translation (--translate-model is empty)"

@@ -29,6 +29,9 @@
 # Whisper-Large-v3-Turbo --asr-mode full (Lemonade, do not unload its model).
 # --live-embedder ends a line when the voice changes, not only at a pause
 # (the sherpa image carries the 28 MB 3D-Speaker embedding).
+# --mt-gateway is the Bifrost gateway on :8080 (OpenAI-compatible): its chat
+# models owned_by "opencode" are announced in GET /live/models as
+# "opencode.<id>" and mt_model=opencode.<id> is routed there, prefix stripped.
 # --translate-model turns on live translation at GET /live (one line at a time,
 # semi-batch); it loads that model into Lemonade's llm slot and keeps it there.
 # An empty --translate-model serves the live transcript alone.
@@ -60,6 +63,7 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
   --live-embedder localhost/halogen-diarizer \
   --live-asr http://127.0.0.1:8090 --live-model vibevoice_asr_streaming_7b_q8_0 \
+  --mt-gateway http://127.0.0.1:8080 \
   --live-stream
 # The batch ASR is MOSS-Transcribe-Diarize through audio.cpp on :8090: one request
 # for the whole meeting, and it answers the speaker labels and the timestamps
