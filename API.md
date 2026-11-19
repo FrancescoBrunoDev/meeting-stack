@@ -129,10 +129,10 @@ The poll answers `mt_model` and `asr_model`: the translator and transcriber the
 session is really using, so a client that asked for one can see whether it got it.
 
 `GET /live/models` lists what the box can translate and transcribe with:
-`{"models": [{"id", "recipe"}], "default": "...", "asr_models": [{"id", "recipe", "diarize"?}], "asr_default": "...", "batch_models": [{"id", "recipe"}], "batch_default": "..."}`.
+`{"models": [{"id", "recipe"}], "default": "...", "asr_models": [{"id", "recipe"}], "asr_default": "...", "batch_models": [{"id", "recipe"}], "batch_default": "..."}`.
 When `MISTRAL_API_KEY` is set, `asr_models` offers `voxtral-mini-transcribe-realtime-3`
-(WebSocket streaming with live diarization: `rows[].speaker` carries `speaker_1`,
-`speaker_2`, … and a speaker change closes the current row and starts a new one)
+(WebSocket streaming with end-of-turn detection, not diarization: the rows carry
+no speaker, and a `turn.end` event closes the row and starts a new one)
 alongside `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`;
 `batch_models` offers `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`
 for `POST /jobs?model=...` (file transcription with `diarize=true` and

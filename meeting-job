@@ -717,6 +717,9 @@ LIVE_LINE = 1.5                         # a pause this long ends the line
 # sentence is still the middle of a sentence.
 LIVE_SENTENCE_END = ".!?…"
 LIVE_MIN_SPEECH = 0.6                   # a shorter cut is dropped, not transcribed
+# The turn.end of a cloud ASR closes its line after this delay: the transcript
+# trails the turn events by the streaming delay, so the last words come first.
+LIVE_TURN_CLOSE_DELAY = 0.7
 # No pause at all: cut here, at the quietest frame. Measured from the page with
 # continuous speech, 20 s meant the first text appeared after ten seconds and
 # then nothing until the next pause — "everyone keeps talking" is exactly the
@@ -1047,17 +1050,21 @@ class StreamingASR:
 
 
 class MistralRealtimeASR:
-    """Mistral Voxtral Realtime WebSocket with live speaker diarization.
+    """Mistral Voxtral Realtime WebSocket with end-of-turn detection.
 
     The protocol is four steps in order: connect, wait for `session.created`,
-    send `session.update` (with `diarize: true` before any audio chunk, because
-    settings lock on the first `input_audio.append`), then stream base64 PCM16
-    chunks and read `transcription.segment` events carrying `text` and
-    `speaker_id`.
+    send `session.update` (with `turn_detection` before any audio chunk, because
+    settings lock on the first `input_audio.append` — turn detection and
+    diarization cannot share a session), then stream base64 PCM16 chunks and
+    read `transcription.segment` events carrying `text`. Diarization is off, so
+    the segments carry no speaker_id: a turn, not a speaker change, is what
+    ends a line — `on_turn` gets every `turn.end`. The transcript lags the turn
+    events by the streaming delay, so the last words of a turn can still
+    arrive after its turn.end.
     """
 
     def __init__(self, model: str, language: str, glossary: str, key: str,
-                 on_text, host: str = MISTRAL_HOST) -> None:
+                 on_text, host: str = MISTRAL_HOST, on_turn=None) -> None:
         if not key:
             raise ValueError("MISTRAL_API_KEY is not set")
         clean_model = model.removeprefix("mistral.")
@@ -1084,6 +1091,7 @@ class MistralRealtimeASR:
             self.sock.close()
             raise ValueError(f"Mistral Realtime refused ({status}): {detail}")
         self.on_text = on_text
+        self.on_turn = on_turn        # a turn.end: what was said is a line
         self.dead = False
         self.reason = ""
         self._lock = threading.Lock()
@@ -1096,7 +1104,10 @@ class MistralRealtimeASR:
         session_cfg: dict = {
             "audio_format": {"encoding": "pcm_s16le", "sample_rate": LIVE_RATE},
             "target_streaming_delay_ms": 480,
-            "diarize": True,
+            # End-of-turn detection, not diarization, ends a line (the two are
+            # mutually exclusive in one session). Defaults: min 500 ms of pause
+            # before a turn can end, 3 s at most.
+            "turn_detection": {},
         }
         lang = iso_language(language)
         if lang:
@@ -1173,6 +1184,8 @@ class MistralRealtimeASR:
                                  str(event.get("speaker_id") or ""), False)
                 elif kind == "transcription.text.delta":
                     self.on_text(str(event.get("text") or ""), "", False)
+                elif kind == "turn.end" and self.on_turn:
+                    self.on_turn()
                 elif kind == "transcription.done":
                     break
                 elif kind == "error":
@@ -1270,7 +1283,8 @@ class LiveSession:
         if is_mistral_realtime(self.asr_model):
             return MistralRealtimeASR(
                 self.asr_model, self.language, self.glossary,
-                getattr(self.live, "mistral_key", ""), self._streamed)
+                getattr(self.live, "mistral_key", ""), self._streamed,
+                on_turn=self._turn_end)
         return StreamingASR(self.live.asr, self.asr_model, self._streamed)
 
     def feed(self, pcm: bytes) -> None:
@@ -1320,6 +1334,29 @@ class LiveSession:
                 if speech and len(clip) >= LIVE_MIN_SPEECH * LIVE_BYTES_PER_S:
                     self._queue.put(clip)
             self._close_on_pause()
+
+    def _turn_end(self) -> None:
+        """A turn.end from the cloud ASR: this line is over; a new one starts
+        with the next turn. The last words trail the event by the streaming
+        delay (480 ms), so close on a timer, not on the spot.
+        """
+        with self._lock:
+            row = self._pending_row
+        timer = threading.Timer(LIVE_TURN_CLOSE_DELAY, self._close_turn, (row,))
+        timer.daemon = True
+        timer.start()
+
+    def _close_turn(self, row: int) -> None:
+        """Close `row`, unless something already did or the talk moved on."""
+        with self._lock:
+            if (self._closing or not self._pending or self._pending_row != row):
+                return
+            self._closing = True
+            text = self._pending
+            self._pending, self._translated, self._partial_busy = "", 0, False
+        # shortcut: words of the next turn that land within the timer still join
+        # the old row; rare (the turn must start within ~0.7 s) and cosmetic.
+        self._queue.put(Close(row, text))
 
     def _close_on_pause(self) -> None:
         """End the line when the room has been quiet for LIVE_LINE.
@@ -1457,16 +1494,6 @@ class LiveSession:
         if not text:
             return
         with self._lock:
-            if (self._pending and self._pending_row >= 0
-                    and speaker and self._speaker and speaker != self._speaker):
-                # Live diarization reported a new speaker: close the previous
-                # speaker's line right away and start a fresh row for the new one.
-                row, head = self._pending_row, self._pending
-                self._pending = ""
-                self._translated = 0
-                self._partial_busy = False
-                self._closing = False
-                self._queue.put(Close(row, head))
             if self._pending and self._pending_row >= 0:
                 fresh = repeated_tail(self._pending, text) if dedupe else text
                 if not fresh:
@@ -1476,6 +1503,8 @@ class LiveSession:
                 self.rows[self._pending_row]["src"] = self._pending
                 if speaker and not self.rows[self._pending_row].get("speaker"):
                     self.rows[self._pending_row]["speaker"] = self._speaker = speaker
+                # (The cloud ASR runs with turn detection, so its segments carry
+                # no speaker_id; the label stays for whoever does send one.)
                 if len(self._pending) >= LIVE_PENDING_CHARS:
                     head, tail = sentence_split(self._pending, LIVE_PENDING_CHARS // 2)
                     if head:
@@ -1727,8 +1756,9 @@ class Live:
         if self.mistral_key:
             for name in MISTRAL_LIVE_MODELS:
                 if name != self.model:
-                    items.append({"id": name, "recipe": "mistral",
-                                  "diarize": "realtime" in name})
+                    # No "diarize" flag: realtime runs with turn detection, so
+                    # a line ends at a turn, and the rows carry no speaker.
+                    items.append({"id": name, "recipe": "mistral"})
         return items
 
     def models(self) -> list[dict]:

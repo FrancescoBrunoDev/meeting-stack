@@ -1306,22 +1306,42 @@ class LiveLines(unittest.TestCase):
         session.close()
         self.drain(session)
 
-    def test_live_diarization_splits_the_row_when_the_speaker_changes(self):
+    def test_turn_end_closes_the_line_and_the_next_turn_starts_a_new_one(self):
         calls = []
         session = meeting_job.LiveSession(self.fake(calls), "de", "it",
                                           asr_model="voxtral-mini-transcribe-realtime-3")
-        session._streamed("Guten Tag,", speaker="speaker_1", dedupe=False)
-        session._streamed("wie geht es?", speaker="speaker_1", dedupe=False)
-        session._streamed("Danke, sehr gut.", speaker="speaker_2", dedupe=False)
-        session._queue.put(None)
-        self.drain(session)
+        session._streamed("Guten Tag, wie geht es?", dedupe=False)
+        session._turn_end()                 # the cloud ASR said the turn is over
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and session._pending:
+            time.sleep(0.01)
+        self.assertFalse(session._pending, "turn.end did not close the line")
+        session._streamed("Danke, sehr gut.", dedupe=False)
         self.assertEqual(len(session.rows), 2)
         self.assertEqual(session.rows[0]["src"], "Guten Tag, wie geht es?")
-        self.assertEqual(session.rows[0]["speaker"], "speaker_1")
-        self.assertTrue(session.rows[0]["done"])
         self.assertEqual(session.rows[1]["src"], "Danke, sehr gut.")
-        self.assertEqual(session.rows[1]["speaker"], "speaker_2")
+        session._queue.put(None)
+        self.drain(session)
+        self.assertTrue(session.rows[0]["done"])
         self.assertEqual(session.view(0)["asr_model"], "voxtral-mini-transcribe-realtime-3")
+
+    def test_a_stale_turn_end_does_not_close_the_next_line(self):
+        calls = []
+        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
+                                          asr_model="voxtral-mini-transcribe-realtime-3")
+        session._streamed("Erstes.", dedupe=False)
+        session._turn_end()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and session._pending:
+            time.sleep(0.01)                # the timer closed row 0
+        session._streamed("Zweites.", dedupe=False)
+        with session._lock:
+            row, text = session._pending_row, session._pending
+        session._close_turn(row - 1)       # the stale timer fires too late
+        with session._lock:
+            self.assertEqual(session._pending, text, "it closed the new line")
+        session._queue.put(None)
+        self.drain(session)
 
     def test_mistral_batch_turns_keep_speakers_and_context_bias(self):
         captured = {}

@@ -507,8 +507,8 @@ export default function Live() {
             <SessionBadge state={state} started={started} buffered={buffered} />
           </CardTitle>
           <CardDescription>
-            A line ends on a pause or when the voice changes; models with live diarization
-            also label the speaker.
+            A line ends on a pause or a change of voice; the cloud transcriber ends it at
+            the end of a turn.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
