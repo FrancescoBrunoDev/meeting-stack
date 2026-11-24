@@ -196,6 +196,41 @@ def load_audiocpp_model(transcription_url: str, model: str) -> bool:
         return False
 
 
+def transcribe_diarized_upload(url: str, audio: Path, model: str, timeout: float,
+                               max_tokens: int, attempts: int = ATTEMPTS) -> str:
+    """The same one request, as a multipart upload instead of a server path.
+
+    For a service running on another machine than audio.cpp: no shared
+    directory exists, and the WAV travels as one request body.
+    """
+    body, boundary = multipart(
+        {"model": model, "options": json.dumps({"max_tokens": max_tokens})},
+        audio.name, audio.read_bytes())
+    failure = "ASR unreachable"
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                answer = json.loads(response.read())
+            return str(answer.get("text") or "")
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read().decode(errors="replace")[:300]
+            failure = f"ASR refused the file: {error.code} {detail}"
+            if error.code == 404 and load_audiocpp_model(url, model):
+                continue
+            if error.code not in RETRYABLE:
+                raise SystemExit(failure)
+        except (urllib.error.URLError, TimeoutError) as error:
+            failure = f"ASR unreachable: {error}"
+        if attempt == attempts:
+            raise SystemExit(f"{failure} (after {attempts} tries)")
+        time.sleep(RETRY_S * attempt)
+    raise SystemExit(failure)
+
+
 def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
                         max_tokens: int, attempts: int = ATTEMPTS) -> str:
     """audio.cpp transcribes a file it opens itself, and labels the speakers.
@@ -240,6 +275,10 @@ def transcribe_diarized(url: str, audio: Path, model: str, timeout: float,
 # (decode cache 99900 steps). A tight cap does not truncate the transcript, it
 # loses it.
 AUDIOCPP_MAX_TOKENS = 65536
+# Measured: a 21 MB upload (11 min meeting) transcribes whole, an 80 MB one
+# (43 min) SEGFAULTS the server. Until audio.cpp fixes its multipart receive,
+# bigger recordings must go over a shared --asr-dir or to Mistral.
+AUDIOCPP_UPLOAD_MAX_BYTES = 32 * 1024 * 1024
 MISTRAL_URL = "https://api.mistral.ai"
 # Mistral's /v1/audio/transcriptions has a 65,536-token context window (~34 min).
 MISTRAL_MAX_S = 1500.0
@@ -368,26 +407,45 @@ def audiocpp_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dic
     No diarizer and no clip cutting: the model hands back "[start][Sxx] words"
     with the turns already separated, so nothing can be truncated and nobody has
     to guess where one voice stops.
+
+    With --asr-dir the normalized WAV lands in a directory audio.cpp opens
+    itself (a shared filesystem; --asr-remote-dir when the two see it
+    differently). Without it the WAV is uploaded -- for a service on another
+    machine -- but only up to AUDIOCPP_UPLOAD_MAX_BYTES: a too-big multipart
+    request does not fail here, it SEGFAULTS the server everybody shares.
     """
-    name = f"meeting-{uuid.uuid4().hex[:12]}.wav"
-    shared = Path(args.asr_dir) / name
-    normalize_wav(source, shared)
-    remote = Path(args.asr_remote_dir or args.asr_dir) / name
-    seconds = wav_seconds(shared) or 0.0
+    url = args.asr.rstrip("/") + "/v1/audio/transcriptions"
     cap = max(args.max_tokens, AUDIOCPP_MAX_TOKENS)
-    # One request for the whole file means one silence as long as the meeting:
-    # the answer arrives when the model is done, not a word at a time. A
-    # 38-minute meeting measured 25 minutes of wall time, so 0.6x would have cut
-    # it off just before the end.
-    wait = max(args.asr_timeout, seconds * 1.2 + 600)
-    try:
-        text = transcribe_diarized(args.asr.rstrip("/") + "/v1/audio/transcriptions",
-                                   remote, args.model, wait, cap)
-    finally:
-        # The duration is read back from the normalized WAV, so it moves into
-        # this track's workdir instead of staying in the shared directory.
-        if shared.exists():
-            shutil.move(str(shared), str(workdir / "audio.wav"))
+    if args.asr_dir:
+        name = f"meeting-{uuid.uuid4().hex[:12]}.wav"
+        shared = Path(args.asr_dir) / name
+        normalize_wav(source, shared)
+        remote = Path(args.asr_remote_dir or args.asr_dir) / name
+        seconds = wav_seconds(shared) or 0.0
+        # One request for the whole file means one silence as long as the
+        # meeting: the answer arrives when the model is done, not a word at a
+        # time. A 38-minute meeting measured 25 minutes of wall time, so 0.6x
+        # would have cut it off just before the end.
+        wait = max(args.asr_timeout, seconds * 1.2 + 600)
+        try:
+            text = transcribe_diarized(url, remote, args.model, wait, cap)
+        finally:
+            # The duration is read back from the normalized WAV, so it moves
+            # into this track's workdir instead of staying in the shared
+            # directory.
+            if shared.exists():
+                shutil.move(str(shared), str(workdir / "audio.wav"))
+    else:
+        audio = workdir / "audio.wav"
+        normalize_wav(source, audio)
+        seconds = wav_seconds(audio) or 0.0
+        if audio.stat().st_size > AUDIOCPP_UPLOAD_MAX_BYTES:
+            raise SystemExit(
+                f"the recording is {int(seconds / 60)} min: audio.cpp's multipart "
+                "receive crashes past ~20 minutes (measured). Mount a shared "
+                "--asr-dir, or use a mistral.voxtral-* model.")
+        wait = max(args.asr_timeout, seconds * 1.2 + 600)
+        text = transcribe_diarized_upload(url, audio, args.model, wait, cap)
     turns = parse_diarized(text)
     if not turns:
         if lenient:
@@ -585,9 +643,6 @@ def track_turns(args, source: Path, workdir: Path, hotwords: str,
     workdir.mkdir(parents=True, exist_ok=True)
     if is_mistral_asr(args.model):
         return mistral_turns(args, source, workdir, hotwords, lenient)
-    if not args.asr_dir:
-        raise SystemExit("audio.cpp reads the audio from a path, not an upload: "
-                         "set --asr-dir where the server can open the WAV")
     return audiocpp_turns(args, source, workdir, lenient)
 
 
@@ -601,8 +656,9 @@ def main() -> None:
                         help=f"audio.cpp base URL (default {DEFAULT_ASR})")
     parser.add_argument("--model", default=DEFAULT_ASR_MODEL, help=f"ASR model (default {DEFAULT_ASR_MODEL})")
     parser.add_argument("--asr-dir", type=Path, default=None,
-                        help="a directory this process writes and the ASR server reads, "
-                             "because audio.cpp takes a path, not an upload (default: none)")
+                        help="a shared directory audio.cpp reads the WAV from, when "
+                             "it runs on this machine; without it the WAV is "
+                             "uploaded (safe up to ~20 min, measured)")
     parser.add_argument("--asr-remote-dir", default=None,
                         help="how --asr-dir is seen by the ASR server, when the two differ "
                              "(default: the same path)")

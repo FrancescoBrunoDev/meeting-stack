@@ -1,14 +1,20 @@
-# meeting-job per Coolify (o un qualunque docker compose).
+# meeting-job per Coolify (o un qualunque docker compose) su un server
+# DIVERSO da ubuntu, ma nella stessa LAN.
 #
 #   build: dal repo (Coolify: app "Docker Compose", compose file: docker-compose.yml,
-#   Dockerfile: Containerfile). MEETING_TOKEN e MISTRAL_API_KEY vanno nell'env
-#   della piattaforma, non in un file.
+#   Dockerfile: Containerfile). Env da impostare in Coolify:
+#     MEETING_TOKEN     un bearer token (la dashboard e' pubblica, ora)
+#     MISTRAL_API_KEY   la key
+#     UBUNTU_HOST       l'indirizzo LAN del box che serve audio.cpp (:8090),
+#                       Lemonade (:8731) e Bifrost (:8080); ${...} qui sotto e'
+#                       la sostituzione standard di compose, fatta da Coolify
+#                       con le variabili della UI
 #
-#   L'ipotesi e' che Coolify e il resto dello stack (audio.cpp :8090, Lemonade
-#   :8731, Bifrost :8080) siano sulla STESSA macchina: bridge network di Coolify
-#   => 127.0.0.1 sarebbe il container stesso, quindi gli endpoint puntano a
-#   host.docker.internal. Se invece deployi su un'altra macchina, quei servizi
-#   devono essere raggiungibili a un indirizzo che puoi mettere in `command`.
+#   Il batch di default e' Mistral (voxtral diarizza via API, ovunque): un job
+#   audio.cpp da quaggiu' viaggia come upload multipart, che audio.cpp regge
+#   fino a ~20 minuti di registrazione e oltre va in SEGFAULT — la pipeline lo
+#   rifiuta con un errore chiaro. Con un filesystem condiviso (-v ...:/asr-share
+#   e --asr-dir) si torna alla modalita' path per qualunque durata.
 services:
   meeting-job:
     build:
@@ -16,31 +22,22 @@ services:
       dockerfile: Containerfile
     image: meeting-job:latest
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      # MEETING_TOKEN e MISTRAL_API_KEY arrivano dall'env di Coolify:
-      # vuoto MEETING_TOKEN = nessuna auth.
-      - HOME=/data
     ports:
       - "8099:8099"
     volumes:
       # inbox/out, jobs.json, hooks.json, gli upload con --keep-audio
       - meeting-data:/data
-      # la stessa directory dell'host che audio.cpp vede come /opt/audiocpp:
-      # meeting-transcribe ci scrive il WAV e audio.cpp lo apre dal suo mount
-      - /home/francesco/audio:/asr-share
-    # only what differs from the defaults: the endpoints become
-    # host.docker.internal because the bridge network does not cross 127.0.0.1,
-    # and --live-asr is left empty so the live path uses the same --asr.
+    # solo cio' che differisce dai default: gli endpoint sull'altro box (la
+    # variabile sopra) e la scelta dei modelli. --live-asr resta vuoto: usa lo
+    # stesso --asr.
     command: >-
       --dir /data
-      --asr http://host.docker.internal:8090
-      --asr-dir /asr-share --asr-remote-dir /opt/audiocpp
+      --asr http://${UBUNTU_HOST}:8090
+      --model mistral.voxtral-small-transcribe-3
       --keep-audio
-      --translate-url http://host.docker.internal:8731 --translate-model Qwen3.8-27B-GGUF
+      --translate-url http://${UBUNTU_HOST}:8731 --translate-model Qwen3.8-27B-GGUF
       --live-model vibevoice_asr_streaming_7b_q8_0
-      --mt-gateway http://host.docker.internal:8080
+      --mt-gateway http://${UBUNTU_HOST}:8080
       --live-stream
 volumes:
   meeting-data:

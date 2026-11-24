@@ -299,6 +299,74 @@ class TwoTracks(unittest.TestCase):
         self.assertEqual([t["speaker"] for t in labelled], [5, 5])
         self.assertEqual({t["name"] for t in labelled}, {"Me"})
 
+    def test_audio_cpp_upload_when_no_shared_dir(self):
+        """No --asr-dir (the service and audio.cpp on different machines):
+        the WAV travels as one multipart request, options included."""
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({"text": "[0.10][S01] Hallo.[1.20]"}).encode()
+
+        def fake_open(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["body"] = req.data.decode("utf-8", "replace")
+            return FakeResponse()
+
+        orig = meeting.urllib.request.urlopen
+        meeting.urllib.request.urlopen = fake_open
+        orig_norm, orig_wav = meeting.normalize_wav, meeting.wav_seconds
+        meeting.normalize_wav = lambda source, out: out.write_bytes(b"RIFF" + b"\0" * 100)
+        meeting.wav_seconds = lambda path: 5.0
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / "in.wav"
+                src.write_bytes(b"x")
+                args = types.SimpleNamespace(asr="http://192.168.1.5:8090",
+                                             model="moss-transcribe-diarize",
+                                             asr_dir=None, asr_remote_dir=None,
+                                             asr_timeout=10, max_tokens=512)
+                (Path(tmp) / "work").mkdir()
+                turns = meeting.audiocpp_turns(args, src, Path(tmp) / "work", lenient=False)
+        finally:
+            meeting.urllib.request.urlopen = orig
+            meeting.normalize_wav, meeting.wav_seconds = orig_norm, orig_wav
+        self.assertEqual(captured["url"], "http://192.168.1.5:8090/v1/audio/transcriptions")
+        self.assertIn('name="model"\r\r\nmoss-transcribe-diarize'.replace("\r\r\n", "\r\n\r\n"),
+                      captured["body"])
+        self.assertIn("max_tokens", captured["body"])
+        self.assertEqual(turns, [{"speaker": 1, "start": 0.1, "end": 1.2, "text": "Hallo."}])
+
+    def test_audio_cpp_upload_refuses_what_would_kill_the_server(self):
+        """A too-big multipart does not fail the job: it SEGFAULTS the shared
+        audio.cpp (measured at 80 MB). The upload path must refuse first."""
+        orig_norm, orig_wav = meeting.normalize_wav, meeting.wav_seconds
+        meeting.normalize_wav = lambda source, out: out.write_bytes(b"\0" * 100)
+        meeting.wav_seconds = lambda path: 60.0
+        orig_limit = meeting.AUDIOCPP_UPLOAD_MAX_BYTES
+        meeting.AUDIOCPP_UPLOAD_MAX_BYTES = 10
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / "in.wav"
+                src.write_bytes(b"x")
+                args = types.SimpleNamespace(asr="http://192.168.1.5:8090",
+                                             model="moss-transcribe-diarize",
+                                             asr_dir=None, asr_remote_dir=None,
+                                             asr_timeout=10, max_tokens=512)
+                (Path(tmp) / "work").mkdir()
+                with self.assertRaises(SystemExit) as raised:
+                    meeting.audiocpp_turns(args, src, Path(tmp) / "work", lenient=False)
+                self.assertIn("voxtral", str(raised.exception))
+        finally:
+            meeting.normalize_wav, meeting.wav_seconds = orig_norm, orig_wav
+            meeting.AUDIOCPP_UPLOAD_MAX_BYTES = orig_limit
+
     def test_a_diarized_second_track_numbsers_after_the_first(self):
         turns = [{"speaker": 0, "start": 1.0, "end": 2.0, "text": "a"},
                  {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
