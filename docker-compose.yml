@@ -33,7 +33,7 @@ services:
     command: >-
       --dir /data --port 8099
       --asr http://host.docker.internal:8090 --model moss-transcribe-diarize
-      --asr-mode audiocpp --asr-dir /asr-share --asr-remote-dir /opt/audiocpp
+      --asr-dir /asr-share --asr-remote-dir /opt/audiocpp
       --keep-audio
       --translate-url http://host.docker.internal:8731 --translate-model Qwen3.8-27B-GGUF
       --live-asr http://host.docker.internal:8090 --live-model vibevoice_asr_streaming_7b_q8_0

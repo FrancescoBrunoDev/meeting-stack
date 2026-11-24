@@ -17,7 +17,7 @@
 # on http://ubuntu:8090 (one request for the whole meeting; it answers the
 # speaker labels and the timestamps itself; `--asr-dir` is the share audio.cpp
 # reads the normalized WAV from, ~/audio mounted at the same path it has on
-# the ASR host), or Mistral with asr_mode=mistral when $MISTRAL_API_KEY is set.
+# host); a voxtral-* model goes to Mistral's cloud API (needs MISTRAL_API_KEY).
 # Live transcription is audio.cpp's streaming endpoint; translation is
 # Lemonade on :8731, Mistral or the Bifrost gateway on :8080 (--mt-gateway).
 # --keep-audio keeps the upload so the dashboard can play the recording next
@@ -44,7 +44,7 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   localhost/meeting-job:latest \
   --dir %h/.cache/mcp-meeting-transcribe --port 8099 \
   --asr http://ubuntu:8090 --model moss-transcribe-diarize \
-  --asr-mode audiocpp --asr-dir /asr-share --asr-remote-dir /opt/audiocpp \
+  --asr-dir /asr-share --asr-remote-dir /opt/audiocpp \
   --keep-audio \
   --translate-url http://127.0.0.1:8731 --translate-model Qwen3.8-27B-GGUF \
   --live-asr http://ubuntu:8090 --live-model vibevoice_asr_streaming_7b_q8_0 \

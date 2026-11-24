@@ -44,8 +44,9 @@ Query parameters are per-job options (all optional):
 | `hotwords` | names and jargon to bias the ASR |
 | `max_tokens` | the audiocpp output cap |
 | `second_name`, `second_offset` | the microphone track of a two-track recording |
-| `model`, `asr_mode` | `asr_mode` is `audiocpp` (default) or `mistral`; a
-  `mistral.voxtral-*` model routes to Mistral whatever `asr_mode` says |
+| `model` | the model names its provider: `mistral.voxtral-*` goes to
+  Mistral's `/v1/audio/transcriptions` with `diarize=true`, anything else to
+  audio.cpp |
 
 Two tracks of the same recording are paired by `filename`: upload both with the
 same name and one job covers both.

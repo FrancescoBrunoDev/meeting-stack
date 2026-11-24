@@ -172,9 +172,10 @@ class Defaults(unittest.TestCase):
     def test_an_empty_audio_cpp_answer_is_no_turns(self):
         self.assertEqual(meeting.parse_diarized(""), [])
 
-    def test_asr_mode_defaults_to_audiocpp(self):
-        source = (HERE / "meeting-transcribe").read_text(encoding="utf-8")
-        self.assertIn('"--asr-mode", default="audiocpp"', source)
+    def test_the_model_names_its_provider(self):
+        self.assertTrue(meeting.is_mistral_asr("voxtral-mini-transcribe-3"))
+        self.assertTrue(meeting.is_mistral_asr("mistral.voxtral-small-transcribe-3"))
+        self.assertFalse(meeting.is_mistral_asr("moss-transcribe-diarize"))
 
 
 class RecordingLength(unittest.TestCase):
@@ -305,7 +306,7 @@ class TwoTracks(unittest.TestCase):
         self.assertEqual([t["speaker"] for t in labelled], [4, 5])
 
     def test_a_silent_mic_track_is_not_a_failed_job(self):
-        args = types.SimpleNamespace(asr_mode="mistral", model="voxtral-mini-transcribe-3",
+        args = types.SimpleNamespace(model="voxtral-mini-transcribe-3",
                                      language=None, asr_timeout=10, mistral_key="k")
         original = meeting.transcribe_mistral
         meeting.transcribe_mistral = lambda *a, **k: []
@@ -1247,7 +1248,7 @@ class LiveLines(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 args = types.SimpleNamespace(
-                    model="voxtral-mini-transcribe-3", asr_mode="mistral",
+                    model="voxtral-mini-transcribe-3",
                     language="de", diarize_second=False, second_name="Me",
                     second_offset=0.0, merge_gap=2.0, output=Path(tmp) / "out",
                     diarization=None, names=None, hotwords="")

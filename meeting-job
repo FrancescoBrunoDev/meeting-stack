@@ -7,7 +7,8 @@ later). One worker thread runs `meeting-transcribe` at a time. No inference is
 managed here: the ASR is audio.cpp (which diarizes itself) or Mistral, the
 translators are Lemonade, Mistral or the Bifrost gateway, all over HTTP.
 
-Defaults: MOSS-Transcribe-Diarize through audio.cpp, --asr-mode audiocpp.
+Defaults: MOSS-Transcribe-Diarize through audio.cpp; a voxtral-* model goes to
+Mistral instead: the model id names its provider.
 
     ./meeting-job --dir /mnt/cache/mcp-meeting-transcribe --token secret
 
@@ -68,7 +69,7 @@ SUFFIX = re.compile(r"\.[a-z0-9]{1,5}$")
 OPTION_FLAGS = (("language", "--language"), ("hotwords", "--hotwords"),
                 ("names", "--names"), ("max_tokens", "--max-tokens"),
                 ("model", "--model"),
-                ("asr_mode", "--asr-mode"), ("second_name", "--second-name"),
+                ("second_name", "--second-name"),
                 ("asr_dir", "--asr-dir"), ("asr_remote_dir", "--asr-remote-dir"),
                 ("second_offset", "--second-offset"))
 # Query parameters this server consumes itself and never forwards to the worker.
@@ -281,13 +282,11 @@ class Jobs:
     def __init__(self, meeting: Path, root: Path, keep_audio: bool = False,
                  timeout: float = 14400, asr: str = "http://ubuntu:8090",
                  model: str = "moss-transcribe-diarize",
-                 asr_mode: str = "audiocpp",
                  asr_dir: str | None = None, asr_remote_dir: str | None = None,
                  pair_wait: float = 900, retain_days: float = 30) -> None:
         self.meeting = Path(meeting).resolve()
         self.asr = asr
         self.model = model
-        self.asr_mode = asr_mode
         self.asr_dir = asr_dir
         self.asr_remote_dir = asr_remote_dir
         self.pair_wait = pair_wait
@@ -581,8 +580,7 @@ class Jobs:
             job.finished = time.time()
             return
         command = [str(self.meeting), str(audio), "--output", str(prefix),
-                   "--asr", self.asr, "--model", self.model,
-                   "--asr-mode", self.asr_mode]
+                   "--asr", self.asr, "--model", self.model]
         if self.asr_dir:
             command += ["--asr-dir", self.asr_dir]
         if self.asr_remote_dir:
@@ -761,9 +759,9 @@ def iso_language(language: str | None) -> str:
     return ISO_LANGS.get(raw, "")
 
 
-def is_mistral_asr(model: str, mode: str = "") -> bool:
-    name = (model or "").removeprefix("mistral.")
-    return mode == "mistral" or name.startswith("voxtral-")
+def is_mistral_asr(model: str) -> bool:
+    """The model id names its provider: voxtral-* is Mistral, anything else audio.cpp."""
+    return (model or "").removeprefix("mistral.").startswith("voxtral-")
 
 
 def is_mistral_realtime(model: str) -> bool:
@@ -1892,12 +1890,9 @@ def tools() -> list[dict]:
              "hotwords": {"type": "string", "description": "names and jargon to bias the ASR"},
              "names": {"type": "string", "description": "speaker names, e.g. 1:Anna,2:Bernd"},
              "model": {"type": "string",
-                       "description": "ASR model the endpoint serves (default moss-transcribe-diarize)"},
-             "asr_mode": {"type": "string", "enum": ["audiocpp", "mistral"],
-                          "description": "audiocpp: one request to audio.cpp, which diarizes "
-                                         "itself (needs asr_dir); mistral: one request to Mistral's "
-                                         "/v1/audio/transcriptions with diarize=true "
-                                         "(auto-selected for voxtral-* models)"}},
+                       "description": "ASR model: voxtral-* goes to Mistral's "
+                                      "/v1/audio/transcriptions with diarize=true, anything else "
+                                      "to audio.cpp (default moss-transcribe-diarize)"}},
              "required": ["audio_base64"]}},
         {"name": "meeting_status",
          "description": "Status of a transcription job by id.",
@@ -2254,13 +2249,8 @@ def main() -> None:
     parser.add_argument("--model", default="moss-transcribe-diarize",
                         help="ASR model the endpoint serves "
                              "(default moss-transcribe-diarize)")
-    parser.add_argument("--asr-mode", default="audiocpp",
-                        choices=("audiocpp", "mistral"),
-                        help="audiocpp (default): one request to audio.cpp, which diarizes "
-                             "itself; mistral: one request to Mistral's "
-                             "/v1/audio/transcriptions with diarize=true")
     parser.add_argument("--asr-dir", default=None,
-                        help="with --asr-mode audiocpp: directory the ASR server can read, where "
+                        help="directory the ASR server can read, where "
                              "the normalized WAV is written (audio.cpp takes a path, not an upload)")
     parser.add_argument("--asr-remote-dir", default=None,
                         help="how --asr-dir is seen by the ASR server (default: the same path)")
@@ -2310,7 +2300,7 @@ def main() -> None:
     args = parser.parse_args()
 
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
-                args.asr, args.model, args.asr_mode,
+                args.asr, args.model,
                 args.asr_dir, args.asr_remote_dir,
                 pair_wait=args.pair_wait,
                 retain_days=args.retain_audio_days)

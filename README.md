@@ -25,10 +25,10 @@ Two tools, a service and a web page.
 ```
 audio ──> ffmpeg: 16 kHz mono WAV
               │
-              ├──> one request to audio.cpp (--asr-mode audiocpp)
+              ├──> one request to audio.cpp (moss-transcribe-diarize)
               │     MOSS-Transcribe-Diarize: words, speaker labels, timestamps
               │
-              └──> one request to Mistral (--asr-mode mistral, diarize=true)
+              └──> one request to Mistral (voxtral-*, diarize=true)
                     words, speaker labels, timestamps
                                   │
                                   └──> turns ──> markdown + json
@@ -64,11 +64,11 @@ service.
 ## Usage
 
 ```sh
-./meeting-transcribe meeting.m4a --asr-mode audiocpp \
+./meeting-transcribe meeting.m4a \
     --model moss-transcribe-diarize --asr-dir ~/audio
 ./meeting-transcribe meeting.m4a                      # the same, by default
 ./meeting-transcribe meeting.wav --names "1:Anna,2:Bernd"   # names also bias Mistral
-./meeting-transcribe meeting.m4a --asr-mode mistral --model mistral.voxtral-mini-transcribe-3
+./meeting-transcribe meeting.m4a --model mistral.voxtral-mini-transcribe-3    # goes to Mistral
 ```
 
 `--asr-dir` is where the 16 kHz mono WAV is written so audio.cpp can open it;
@@ -178,7 +178,7 @@ MCP (`POST /mcp`, stateless JSON-RPC 2.0 — `initialize`, `tools/list`,
 
 | tool | arguments |
 |---|---|
-| `transcribe_meeting` | `audio_base64`, `filename`, `language`, `hotwords`, `names`, `model`, `asr_mode` |
+| `transcribe_meeting` | `audio_base64`, `filename`, `language`, `hotwords`, `names`, `model` |
 | `meeting_status` | `id` |
 | `meeting_result` | `id`, `format` (`markdown` or `json`) |
 
@@ -325,7 +325,7 @@ ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with
 
 ## Flags worth knowing
 
-- `--asr-mode audiocpp` (default) — one request to
+- A model audiocpp serves (default) — one request to
   [audio.cpp](https://github.com/ggml-org/audio.cpp) with
   `MOSS-Transcribe-Diarize`, which returns the speaker labels and the
   timestamps itself. It needs `--asr-dir`, the directory audio.cpp reads the
@@ -336,10 +336,10 @@ ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with
   (65536) and it must travel under `"options"` — at 24000 the model stops with
   `reached max_tokens before EOS` and the transcript is lost, and at the top
   level of the request the server ignores it without a word.
-- `--asr-mode mistral` — one request to Mistral's `/v1/audio/transcriptions`
-  with `diarize=true` (auto-selected for `voxtral-*` models, whatever
-  `--asr-mode` says); recordings longer than 34 minutes go in chunks. Needs
-  `MISTRAL_API_KEY`.
+- A `voxtral-*` model — one request to Mistral's `/v1/audio/transcriptions`
+  with `diarize=true`; recordings longer than 34 minutes go in chunks. Needs
+  `MISTRAL_API_KEY`. `mistral.voxtral-*` is the prefixed id the API and the
+  dashboard speak.
 - `--second FILE` — the microphone track of a two-track recording; see above.
   `--second-name` (default `Me`), `--second-offset`.
 - `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the
@@ -349,8 +349,8 @@ ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
 The systemd unit runs the audio.cpp path: `--asr http://ubuntu:8090 --model
-moss-transcribe-diarize --asr-mode audiocpp` with `--keep-audio`, live streaming
-from the same endpoint, translation through Lemonade and the Bifrost gateway.
+moss-transcribe-diarize` with `--keep-audio`, live streaming from the same
+endpoint, translation through Lemonade and the Bifrost gateway.
 
 ## Tests
 

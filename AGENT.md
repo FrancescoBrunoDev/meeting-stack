@@ -44,7 +44,7 @@ GPU lock. Everything is an HTTP endpoint the service calls.
   (`--live-stream`, `vibevoice_asr_streaming_7b_q8_0`) or one clip per
   utterance without it.
 - ASR, cloud: Mistral `/v1/audio/transcriptions` with `diarize=true`
-  (`--asr-mode mistral`, auto-selected for `voxtral-*`); key in
+  (the `voxtral-*` model id routes there); key in
   `$MISTRAL_API_KEY`. The realtime models are the live ones.
 - Translators: Lemonade `http://127.0.0.1:8731` (`--translate-model`), Mistral's
   chat models (`mistral.<id>`) and the Bifrost gateway `http://127.0.0.1:8080`

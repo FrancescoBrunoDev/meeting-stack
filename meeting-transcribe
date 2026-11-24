@@ -6,9 +6,9 @@ diarizes itself (MOSS-Transcribe-Diarize — one request for the whole file, it
 answers the speaker labels, the timestamps and the words). Cloud: Mistral's
 /v1/audio/transcriptions answers the same with diarize=true.
 
-    ./meeting-transcribe meeting.m4a --asr-mode audiocpp \
+    ./meeting-transcribe meeting.m4a \
         --model moss-transcribe-diarize --asr-dir /asr-share
-    ./meeting-transcribe meeting.wav --asr-mode mistral --language de
+    ./meeting-transcribe meeting.wav --model mistral.voxtral-mini-transcribe-3
 
 audio.cpp reads the audio from a path, not an upload, so the normalized WAV
 has to sit where the server can open it (--asr-dir, seen from the server as
@@ -259,9 +259,9 @@ def iso_language(language: str | None) -> str:
     return ISO_LANGS.get(raw, "")
 
 
-def is_mistral_asr(model: str, mode: str = "") -> bool:
-    name = (model or "").removeprefix("mistral.")
-    return mode == "mistral" or name.startswith("voxtral-")
+def is_mistral_asr(model: str) -> bool:
+    """The model id names its provider: voxtral-* is Mistral, anything else audio.cpp."""
+    return (model or "").removeprefix("mistral.").startswith("voxtral-")
 
 
 def transcribe_mistral(url: str, audio: Path, model: str, language: str | None,
@@ -583,11 +583,12 @@ def track_turns(args, source: Path, workdir: Path, hotwords: str,
     microphone track that may be silent.
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    if is_mistral_asr(args.model, args.asr_mode):
+    if is_mistral_asr(args.model):
         return mistral_turns(args, source, workdir, hotwords, lenient)
-    if args.asr_mode == "audiocpp":
-        return audiocpp_turns(args, source, workdir, lenient)
-    raise SystemExit("--asr-mode must be audiocpp or mistral")
+    if not args.asr_dir:
+        raise SystemExit("audio.cpp reads the audio from a path, not an upload: "
+                         "set --asr-dir where the server can open the WAV")
+    return audiocpp_turns(args, source, workdir, lenient)
 
 
 def main() -> None:
@@ -600,17 +601,11 @@ def main() -> None:
                         help=f"audio.cpp base URL (default {DEFAULT_ASR})")
     parser.add_argument("--model", default=DEFAULT_ASR_MODEL, help=f"ASR model (default {DEFAULT_ASR_MODEL})")
     parser.add_argument("--asr-dir", type=Path, default=None,
-                        help="with --asr-mode audiocpp: a directory this process writes and "
-                             "the ASR server reads, because audio.cpp takes a path, not an upload")
+                        help="a directory this process writes and the ASR server reads, "
+                             "because audio.cpp takes a path, not an upload (default: none)")
     parser.add_argument("--asr-remote-dir", default=None,
                         help="how --asr-dir is seen by the ASR server, when the two differ "
                              "(default: the same path)")
-    parser.add_argument("--asr-mode", default="audiocpp",
-                        choices=("audiocpp", "mistral"),
-                        help="audiocpp (default): one request to audio.cpp, which diarizes "
-                             "itself and returns the turns (needs --asr-dir); "
-                             "mistral: one request to Mistral's /v1/audio/transcriptions with "
-                             "diarize=true (auto-selected for voxtral-* models)")
     parser.add_argument("--mistral-url", default=MISTRAL_URL,
                         help=f"Mistral API base URL (default {MISTRAL_URL})")
     parser.add_argument("--mistral-key", default=os.environ.get("MISTRAL_API_KEY", ""),
@@ -647,9 +642,6 @@ def main() -> None:
     names = parse_names(args.names)
     hotwords = ", ".join(part for part in (args.hotwords, ", ".join(names.values())) if part)
     prefix = args.output or source.with_suffix("")
-    if args.asr_mode == "audiocpp" and not is_mistral_asr(args.model, args.asr_mode) and not args.asr_dir:
-        raise SystemExit("--asr-mode audiocpp needs --asr-dir: audio.cpp reads the audio from "
-                         "a path, so the normalized WAV must sit where it can open it")
 
     # Next to the outputs, not /tmp: a service running in a container cannot
     # see the host's /tmp.
