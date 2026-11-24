@@ -30,13 +30,16 @@ services:
       # la stessa directory dell'host che audio.cpp vede come /opt/audiocpp:
       # meeting-transcribe ci scrive il WAV e audio.cpp lo apre dal suo mount
       - /home/francesco/audio:/asr-share
+    # only what differs from the defaults: the endpoints become
+    # host.docker.internal because the bridge network does not cross 127.0.0.1,
+    # and --live-asr is left empty so the live path uses the same --asr.
     command: >-
-      --dir /data --port 8099
-      --asr http://host.docker.internal:8090 --model moss-transcribe-diarize
+      --dir /data
+      --asr http://host.docker.internal:8090
       --asr-dir /asr-share --asr-remote-dir /opt/audiocpp
       --keep-audio
       --translate-url http://host.docker.internal:8731 --translate-model Qwen3.8-27B-GGUF
-      --live-asr http://host.docker.internal:8090 --live-model vibevoice_asr_streaming_7b_q8_0
+      --live-model vibevoice_asr_streaming_7b_q8_0
       --mt-gateway http://host.docker.internal:8080
       --live-stream
 volumes:

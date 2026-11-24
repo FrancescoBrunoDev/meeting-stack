@@ -171,5 +171,7 @@ systemctl --user restart meeting-job.service
 curl -s localhost:8099/health
 ```
 
-The unit passes the ASR endpoint, model and mode explicitly, so the running
-configuration is visible in `systemctl --user cat meeting-job.service`.
+The unit passes only what differs from the defaults (the directory, the
+asr-dir share, the model choices, the gateway): the running configuration is
+visible in `systemctl --user cat meeting-job.service`, the rest is the
+default contract tested in `test_meeting.py`.
