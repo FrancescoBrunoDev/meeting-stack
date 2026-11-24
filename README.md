@@ -2,7 +2,7 @@
 
 Diarized transcripts of long meetings, on the Strix Halo box.
 
-Two tools, a service, a web page and three diarizer images:
+Two tools, a service and a web page.
 
 - **`meeting-transcribe`** — one audio file in, a speaker-labelled transcript out
   (`PREFIX.md` + `PREFIX.json`).
@@ -23,52 +23,30 @@ Two tools, a service, a web page and three diarizer images:
 ## How it works
 
 ```
-audio ──> diarizer container ──> audio.wav (16 kHz mono, loudnorm)
-                                     │
-                                     ├──> one ASR request per turn (--asr-mode segments)
-                                     │
-                                     └──> the turn already carries its speaker
-                                                    │
-                                                    └──> turns ──> markdown + json
+audio ──> ffmpeg: 16 kHz mono WAV
+              │
+              ├──> one request to audio.cpp (--asr-mode audiocpp)
+              │     MOSS-Transcribe-Diarize: words, speaker labels, timestamps
+              │
+              └──> one request to Mistral (--asr-mode mistral, diarize=true)
+                    words, speaker labels, timestamps
+                                  │
+                                  └──> turns ──> markdown + json
 ```
 
-The box runs the per-turn path: gufo on `:8097` serving `qwen3-asr-1.7b`, which
-answers `json` with text and nothing else — its `verbose_json` carries an empty
-`segments` array, so the one-pass path cannot use it. Each diarizer turn is cut
-out, padded into the silence beside it (`--turn-pad`-style padding of
-`TURN_PAD_S`), transcribed, and kept with its speaker. Cutting at the diarizer's
-edges costs audio when an edge is wrong, and a per-clip `max_tokens` cap can drop
-a tail silently (a 240 s clip of dense speech lost 170 of 575 words with
-`status=200`) — which is why the one-pass path exists and stays the default of
-the CLI itself.
+No inference runs in this stack. The local path is one request to
+[audio.cpp](https://github.com/ggml-org/audio.cpp) serving
+`moss-transcribe-diarize`: the model answers the words *and* the speaker labels
+*and* the timestamps, so nothing is cut, no diarizer runs, and no edge that is
+half a second off can move a word. The cloud path is one request to Mistral's
+`/v1/audio/transcriptions` with `diarize=true` (auto-selected for `voxtral-*`
+models); its 65,536-token context window is ~34 minutes, so longer recordings go
+in `MISTRAL_MAX_S` chunks with the timestamps shifted back.
 
-The one-pass path (`--asr-mode full`, the CLI default) sends the whole file to
-an endpoint that answers `verbose_json` with real segment timestamps — Lemonade
-on `:8731` with `Whisper-Large-v3-Turbo`. Nothing is cut: the ASR owns the words
-and the diarizer only labels them, so a diarizer edge that is half a second off
-moves a word instead of losing audio.
-
-One thing Whisper gets wrong on its own: on audio it cannot decode (music,
-crosstalk, a phone held to a speaker) it latches onto one sentence and
-repeats it every second for minutes, with confident scores — a 38-minute meeting
-got 134 s of `Ich denke, das ist doch nicht da.` that way, and the endpoint
-ignores `condition_on_previous_text`, `vad_filter` and `no_speech_threshold`.
-`collapse_repetitions()` therefore drops a run of identical segments once it is
-physically impossible: four or more of them, covering eight seconds or more, of a
-sentence at least four words long. "Ja" and "tschüss" repeated quickly survive.
-It runs on the one-pass path only; Qwen3-ASR does not loop.
-
-Measured on a 38:13 German meeting (5.439 words, `--diarizer nemotron`):
-
-- one-pass Whisper, Lemonade: **1 m 38 s end to end** — normalization, one
-diarization pass, one ASR pass, fusion — 119 turns, 8 speakers, transcript
-covering 0 s to 2290 s of 2293 s.
-- per-turn Qwen3-ASR, gufo with `--language de`: **4 m 02 s**, 229 turns. The
-`--language` flag is not optional here: with `auto`, 25 of 226 turns of that same
-German meeting came back in Chinese and Dutch. There is no hand-corrected
-reference on this box, so the two transcripts only give their disagreement with
-each other: **33.8% of words** (35.4% without `--language de`). That is not an
-accuracy verdict for either model.
+Measured on a 38:13 German meeting: 429 turns in 25 minutes of wall time on the
+audio.cpp path, 30365 prompt tokens. The `max_tokens` cap has to be generous
+(65536) and it must travel under `"options"` — at 24000 the model stops with
+`reached max_tokens before EOS` and the transcript is *lost*, not truncated.
 
 The HTTP API (batch jobs, live sessions, MCP) is written up in
 [API.md](API.md), which is the file to hand to anything that has to talk to this
@@ -76,67 +54,41 @@ service.
 
 ## Requirements
 
-- an OpenAI-compatible ASR: gufo on `http://127.0.0.1:8097` serving
-  `qwen3-asr-1.7b` for the per-turn path (see [AGENT.md](AGENT.md) for the
-  container), or Lemonade on `http://127.0.0.1:8731` serving
-  `Whisper-Large-v3-Turbo` for `--asr-mode full`
-- rootless **podman** with `/dev/kfd` and `/dev/dri` for the diarizer
-- a built diarizer image (see below)
+- [audio.cpp](https://github.com/ggml-org/audio.cpp) on `http://ubuntu:8090`
+  serving `moss-transcribe-diarize`, and a directory it can read the normalized
+  WAV from (`--asr-dir`): it takes a path, not an upload
+- `MISTRAL_API_KEY` for the cloud path (batch `mistral.voxtral-*`, the cloud
+  translators, live realtime)
+- **podman** for the service container, **ffmpeg** for the normalization
 
 ## Usage
 
 ```sh
-./meeting-transcribe meeting.m4a --asr http://127.0.0.1:8097 \
-    --model qwen3-asr-1.7b --asr-mode segments --language de
-./meeting-transcribe meeting.m4a                      # Whisper + Nemotron, one pass
-./meeting-transcribe meeting.wav --language de --speakers 4
-./meeting-transcribe meeting.wav --names "1:Anna,2:Bernd"   # names also bias the ASR
-./meeting-transcribe meeting.wav --diarizer pyannote-rocm   # the other diarizer
+./meeting-transcribe meeting.m4a --asr-mode audiocpp \
+    --model moss-transcribe-diarize --asr-dir ~/audio
+./meeting-transcribe meeting.m4a                      # the same, by default
+./meeting-transcribe meeting.wav --names "1:Anna,2:Bernd"   # names also bias Mistral
+./meeting-transcribe meeting.m4a --asr-mode mistral --model mistral.voxtral-mini-transcribe-3
 ```
 
-The first run downloads the Nemotron checkpoint (~380 MB) into the Hugging Face
-cache; the container mounts it, so later runs are offline.
-
-## Diarizers
-
-| `--diarizer` | what it is | notes |
-|---|---|---|
-| `nemotron` (default) | NVIDIA Nemotron-3-Diarization, 99 M params, 8 speakers, OpenMDW 1.1, via transformers in `diarizer-nemotron/` | no HF token; estimates the speaker count; 4.5x faster than pyannote here |
-| `pyannote-rocm` | pyannote.audio 4.x on the iGPU (ROCm) | gated models, needs an HF token; honours `--min-speakers`/`--max-speakers` |
-| `sherpa` | ONNX on the CPU, no GPU | over-splits on real meetings, wants `--speakers N`; embedding trained on Chinese/English |
-
-Measured on 10 minutes of far-field German: pyannote labelled 44.2% of the audio
-and left 37.6% of ASR segments without a speaker; Nemotron labelled 75.9% and
-left 2.6%. On an independent German benchmark pyannote Community-1 scores 20.22%
-DER against 7.3% for Nemotron — but the real difference here was recall: a
-conservative VAD was dropping half the speech.
-
-Because Nemotron has exactly eight output channels, a meeting with more than
-eight voices will misattribute or lose some.
-
-Build the images once:
-
-```sh
-podman build -t localhost/halogen-diarizer-nemotron diarizer-nemotron/
-podman build -t localhost/halogen-diarizer-pyannote-rocm diarizer-pyannote-rocm/
-podman build -t localhost/halogen-diarizer diarizer/            # only for --diarizer sherpa
-```
-
-`halogen-diarizer-nemotron` is built `FROM halogen-diarizer-pyannote-rocm`: that
-11.6 GB image is its base, so do not delete it if you want to rebuild.
+`--asr-dir` is where the 16 kHz mono WAV is written so audio.cpp can open it;
+`--asr-remote-dir` says how that same directory looks to the server when the two
+differ (audio.cpp running in its own container: host `~/audio`, server
+`/opt/audiocpp`).
 
 ## Service: REST + MCP
 
-The service and the dashboard run in one container. The diarizer containers are
-*not* nested: the service starts them through the host's podman socket, so they
-still get `/dev/kfd`, the diarizer images and the HF cache already on the host.
+The service and the dashboard run in one container - a plain one now: no
+podman socket, no device mounts, no nested containers. All inference is reached
+over HTTP (audio.cpp, Mistral, Lemonade for the translations, the Bifrost
+gateway).
 
 ```sh
 podman build -t localhost/meeting-job .     # Containerfile in this repo
-systemctl --user enable --now podman.socket
 install -m 644 systemd/meeting-job.service ~/.config/systemd/user/
 install -d -m 700 ~/.config/meeting-stack
-printf 'MEETING_TOKEN=%s\n' "$(openssl rand -hex 24)" > ~/.config/meeting-stack/meeting-job.env
+printf 'MEETING_TOKEN=%s\nMISTRAL_API_KEY=%s\n' "$(openssl rand -hex 24)" "$MISTRAL_API_KEY" \
+  > ~/.config/meeting-stack/meeting-job.env
 chmod 600 ~/.config/meeting-stack/meeting-job.env
 systemctl --user daemon-reload && systemctl --user enable --now meeting-job.service
 ```
@@ -199,15 +151,13 @@ gives up. Announcements are idempotent (the same body twice is a 200 and bumps
 `count`) and stored in `hooks.json` under `--dir`, so they survive a restart
 while the job list does not.
 
-The two tracks are worth keeping apart. The system track is diarized as usual
-(`Speaker 1…N` are the remote participants); a microphone track that carries
-only the recorder's room is *one* speaker, so it is never clustered, only
-*labelled* `Me` (`--second-name`; `--diarize-second` when several people share
-the room). With `--asr-mode full` it is sent whole in one pass and never
-diarized. With `segments` (gufo, which returns no timestamps) the diarizer runs
-on it too, for the turn boundaries — without them there is nothing to place on
-the timeline. If it finds more than one voice, its labels are kept and matched
-to the first track's speakers instead of calling the whole room `Me`.
+Both tracks are diarized by the ASR itself. The system track's
+`Speaker 1…N` are the remote participants; a microphone track that carries
+only the recorder's room comes back as *one* speaker and is labelled `Me`
+(`--second-name`). A mic track that holds several voices keeps its own labels,
+shifted after the system ones — unless both tracks recorded the same room, in
+which case the shared clock matches each mic voice to the first track's speaker
+(see below).
 
 The two timelines are interleaved, and crosstalk stays two lines instead of one
 garbled one, because the channels already separated it. When both tracks are
@@ -228,16 +178,12 @@ MCP (`POST /mcp`, stateless JSON-RPC 2.0 — `initialize`, `tools/list`,
 
 | tool | arguments |
 |---|---|
-| `transcribe_meeting` | `audio_base64`, `filename`, `speakers`, `min_speakers`, `max_speakers`, `language`, `hotwords`, `names`, `threshold`, `diarizer`, `model`, `asr_mode` |
+| `transcribe_meeting` | `audio_base64`, `filename`, `language`, `hotwords`, `names`, `model`, `asr_mode` |
 | `meeting_status` | `id` |
 | `meeting_result` | `id`, `format` (`markdown` or `json`) |
 
-One job runs at a time, because the diarizer loads the GPU. `meeting-job` holds
-an exclusive lock for the whole job at `/run/user/1000/halogen-gpu.lock`; any
-other GPU workload on the box that respects the same path will not overlap with
-a transcription. The path is the contract, not this code: `lockfile.py` is a 50
-line `flock` wrapper, and image generation on the same box keeps an identical
-copy.
+One job runs at a time (a single worker thread, in process); the ASR server
+on the other end serializes its own GPU however it likes.
 
 ## Dashboard
 
@@ -290,10 +236,9 @@ translated fragments. The line is then translated by an LLM (named in the
 prompt: a bare ISO code is read as an English word) and, if the model answers
 nothing at all, retried once without the context and then reported instead of
 sitting on "…".
-Semi-batch on purpose: a whole utterance is what keeps the words Whisper needs,
-and one is cheap. Measured on this box with a looped 2.8 s Italian clip: 0.24 s
-to transcribe 10 s through `Whisper-Large-v3-Turbo`, 0.78 s through
-gufo/Qwen3-ASR, 0.59 s to translate a line with `Qwen3.8-27B-GGUF` (0.45 s of
+Semi-batch on purpose: a whole utterance is what keeps the words the ASR
+needs, and one is cheap. Measured on this box: 0.59 s to translate a line with
+`Qwen3.8-27B-GGUF` (0.45 s of
 generation at 35.7 tok/s, the rest prompt), and on the page the source line
 appears at 3.4 s, the translation **starts 0.3 s later and completes 0.6 s
 later** — the tokens are streamed into the row, so nothing waits for the whole
@@ -305,21 +250,6 @@ While a stretch of speech has not reached a pause yet, the page says how many
 seconds are held back (`2.8 s in attesa di una pausa`), then `trascrivo…` and
 `traduco…`, and a level bar moves with the microphone: a transcript that stays
 empty for ten seconds is supposed to look busy, not broken.
-
-A line also ends when **the voice changes**, which is what a pause cannot tell you
-when two people talk without one. That is a disposable diarization: one 28 MB
-3D-Speaker embedding per clip, no clustering, one `podman run` (0.40 s measured,
-and it runs beside the ASR request, so it costs no latency), compared with the
-mean embedding of the line being built. Measured on the box with different texts
-per voice: the same voice scores 0.888-0.954, different voices 0.144-0.408, so
-the threshold is 0.6 (`--live-speaker`). Verified end to end: two voices separated
-by 0.35 s of silence (too short for the line rule) come out as two lines, the same
-voice with the same gap stays one. The limit is a change of voice *inside* one
-clip, which no per-clip embedding can see.
-
-```sh
-podman build -t localhost/halogen-diarizer diarizer/   # the image the embedding runs in
-```
 
 The transcript shows the last three lines — the newest full, the ones above it
 stepping back (opacities 1, 0.86, 0.72) — and **Expand** opens the whole thing,
@@ -333,11 +263,9 @@ adds names and terms the translation must leave untouched.
 
 What it is not:
 
-- **No speaker labels.** Live attribution would need online clustering; the
-  batch transcript is still the labelled truth, so a live session is a preview.
-- **One session at a time.** A live session holds the same
-  `/run/user/1000/halogen-gpu.lock` for its whole life, so a job waits for it and
-  vice versa (a second session gets a 409).
+- **No speaker labels.** Neither the local nor the cloud live ASR runs the
+  online clustering that would attribute the lines; the batch transcript is
+  still the labelled truth, so a live session is a preview.
 - **The microphone needs a secure context.** `getUserMedia` is refused on plain
   `http://` to another host: open the page as `http://127.0.0.1:8099/live` on the
   box, or behind https. Tab audio (`getDisplayMedia`) needs the same.
@@ -375,7 +303,7 @@ The endpoint contract, if you write your own client: `POST /live/<id>/audio`
 with raw **16 kHz mono PCM16** (half a second at a time is plenty, `?language=de&to=it`
 on the first one), `GET /live/<id>?since=<cursor>` until `done` is true, then
 `POST /live/<id>/close`. The token goes in the `Authorization` header; the first
-chunk creates the session and takes the GPU lock (409 if a job has it). Every
+chunk creates the session. Every
 row carries `i` (its index), `src`, `mt`, `done`, and `error` when it did not
 work; `state` and `buffered` describe what the worker is doing meanwhile.
 
@@ -385,65 +313,44 @@ filters, and whether the transcript was expanded — in `localStorage` under
 device that has since been unplugged is dropped rather than failing to open.
 Flags for the live path: `--live-asr`/`--live-model` point it at a faster
 endpoint than the jobs use — a clip every half second makes the fixed cost of a
-request the budget, and Whisper through Lemonade answers in 0.24 s against gufo's
-0.78 s (measured) — `--live-embedder` is the diarizer image whose embedding is
-kept in one long-lived container (0.40 s of container startup per clip became
-0.02 s), and `--live-silence` is the pause that ends a line (0.8 s; clips are cut
-at 0.6 s).
+request the budget — and `--live-silence` is the pause that ends a line
+(0.8 s; clips are cut at 0.6 s).
 
 `--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
 the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
 is where the LLM lives, `--live-idle 120` closes a session that stopped sending
-audio, `--live-glossary`, `--live-silence` (0.5 splits more, 1.2 merges more),
-`--live-embedder` (empty = lines end on pauses only) and `--live-speaker`.
-ASR comes from `--asr`/`--model` like the jobs do, so
-gufo works too but wants an explicit `?language=`. Stopping frees the GPU lock as
-soon as the last utterance is transcribed, not on the next housekeeping tick, so
-a second session can start immediately.
+audio, `--live-glossary`, `--live-silence` (0.5 splits more, 1.2 merges more).
+ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with
+`--live-stream`, or one clip per utterance without it).
 
 ## Flags worth knowing
 
-- `--asr-mode audiocpp` — one request to [audio.cpp](https://github.com/ggml-org/audio.cpp)
-  with `MOSS-Transcribe-Diarize`, which returns the speaker labels and the
-  timestamps itself, so no diarizer runs at all:
-
-  ```sh
-  ./meeting-transcribe meeting.wav --asr http://127.0.0.1:8090 \
-      --model moss-transcribe-diarize --asr-mode audiocpp \
-      --asr-dir ~/audio --asr-remote-dir /opt/audiocpp
-  ```
-
-  It needs a directory the ASR server can read (`audio.cpp` takes a path, not an
-  upload — `--asr-dir` is where the 16 kHz mono WAV is written, `--asr-remote-dir`
-  is how that same directory looks to the server), and `ffmpeg`. One request
-  covers a whole meeting: a 38-minute German recording came back as 429 turns in
-  25 minutes of wall time, with 30365 prompt tokens. The `max_tokens` cap has to
-  be generous (65536) and it must travel under `"options"` — at 24000 the model
-  stops with `reached max_tokens before EOS` and the transcript is lost, and at
-  the top level of the request the server ignores it without a word.
-- `--asr-mode full` (default) — one request for the whole file.
-  `--asr-mode segments` is the older per-clip path, kept for ASR endpoints that
-  return text without timestamps.
-- `--merge-gap 2.0` — merge same-speaker ASR segments across gaps this long.
+- `--asr-mode audiocpp` (default) — one request to
+  [audio.cpp](https://github.com/ggml-org/audio.cpp) with
+  `MOSS-Transcribe-Diarize`, which returns the speaker labels and the
+  timestamps itself. It needs `--asr-dir`, the directory audio.cpp reads the
+  normalized WAV from (a path, not an upload — `--asr-remote-dir` when the two
+  processes see it differently), and `ffmpeg`. One request covers a whole
+  meeting: a 38-minute German recording came back as 429 turns in 25 minutes of
+  wall time, with 30365 prompt tokens. The `max_tokens` cap has to be generous
+  (65536) and it must travel under `"options"` — at 24000 the model stops with
+  `reached max_tokens before EOS` and the transcript is lost, and at the top
+  level of the request the server ignores it without a word.
+- `--asr-mode mistral` — one request to Mistral's `/v1/audio/transcriptions`
+  with `diarize=true` (auto-selected for `voxtral-*` models, whatever
+  `--asr-mode` says); recordings longer than 34 minutes go in chunks. Needs
+  `MISTRAL_API_KEY`.
 - `--second FILE` — the microphone track of a two-track recording; see above.
-  `--second-name` (default `Me`), `--diarize-second`, `--second-offset`.
-- `--diarization FILE` — take the final speakers from an external diarization
-  (`{"diarization": [{start, end, speaker}]}` or a plain list), e.g. a pyannote
-  precision-3 run; each turn gets the reference speaker it overlaps most. Also
-  available as a job option (`diarization=<path>`), and the path must be visible
-  inside the service container (i.e. under the mounted cache dir).
+  `--second-name` (default `Me`), `--second-offset`.
 - `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the
   other track before running anyway.
 - `--retain-audio-days 30` (on `meeting-job`) — delete kept uploads older than
   this; `0` keeps them forever. Only done and failed jobs are candidates.
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
-The service runs the gufo/Qwen3-ASR path (`--asr http://127.0.0.1:8097 --model
-qwen3-asr-1.7b --diarizer nemotron --asr-mode segments`). The endpoint is a
-`gufo serve asr` container with a 4.4 GB BF16 checkpoint; both the launch command
-and the rebuild steps are in [AGENT.md](AGENT.md). Point the unit back at
-`http://127.0.0.1:8731 --model Whisper-Large-v3-Turbo --asr-mode full` to return
-to the one-pass path.
+The systemd unit runs the audio.cpp path: `--asr http://ubuntu:8090 --model
+moss-transcribe-diarize --asr-mode audiocpp` with `--keep-audio`, live streaming
+from the same endpoint, translation through Lemonade and the Bifrost gateway.
 
 ## Tests
 
@@ -451,6 +358,6 @@ to the one-pass path.
 python3 -m unittest test_meeting -v
 ```
 
-They cover the pure functions — rebuilding words split by the server's 32
-character wrap, the segment/speaker fusion, the turn merge — and assert that the
-defaults stay on the verbose_json path.
+They cover the pure functions — the audio.cpp and Mistral answer parsing, the
+turn merge and dedupe, the two-track matching, the live line building — and
+assert that the defaults stay on the audio.cpp path.

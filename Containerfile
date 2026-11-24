@@ -3,26 +3,24 @@
 #   podman build -t localhost/meeting-job .
 #   podman run --rm --network=host \
 #     -v ~/.cache/mcp-meeting-transcribe:~/.cache/mcp-meeting-transcribe \
-#     -v ~/.cache/huggingface:~/.cache/huggingface \
-#     -v /run/user/$(id -u):/run/user/$(id -u) \
-#     -e HOME=$HOME -e CONTAINER_HOST=unix:///run/user/$(id -u)/podman/podman.sock \
-#     localhost/meeting-job --dir ~/.cache/mcp-meeting-transcribe
+#     -v ~/audio:/asr-share \
+#     -e HOME=$HOME -e MISTRAL_API_KEY=$MISTRAL_API_KEY \
+#     localhost/meeting-job --dir ~/.cache/mcp-meeting-transcribe --asr-dir /asr-share
 #
-# The diarizer containers are not nested: `podman-remote` talks to the podman
-# socket on the host, so each job still starts a sibling `podman run --rm` with
-# the GPU devices, the images and the HF cache where they already are.
+# A plain service: no podman socket, no device mounts, no nested containers —
+# all inference (audio.cpp, Mistral, Lemonade, the Bifrost gateway) is reached
+# over HTTP.
 FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 podman-remote ca-certificates ffmpeg \
- && rm -rf /var/lib/apt/lists/* \
- && command -v podman >/dev/null || ln -sf /usr/bin/podman-remote /usr/bin/podman
+ && apt-get install -y --no-install-recommends python3 ca-certificates ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY meeting-job meeting-transcribe lockfile.py dashboard.html /app/
+COPY meeting-job meeting-transcribe dashboard.html /app/
 RUN chmod +x /app/meeting-job /app/meeting-transcribe
 
-# The container writes into the mounted cache dir and talks to the host podman.
+# The container writes into the mounted cache dir only.
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8099
 ENTRYPOINT ["/app/meeting-job"]

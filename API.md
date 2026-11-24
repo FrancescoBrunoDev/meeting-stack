@@ -8,11 +8,10 @@ different jobs, and they behave differently:
 - **live** — you stream microphone audio as it happens, it answers with a growing
   transcript and its translation. Fast, approximate, **no speaker labels**.
 
-They share one GPU and one lock: a local batch job and a local live session
-never run at the same time. A local live session holds the lock for its whole
-life, so a job submitted during one waits (and a second local live session gets
-`409`). Mistral cloud transcription jobs and live sessions (`voxtral-*` /
-`asr_mode=mistral`) run off-box and bypass the local GPU lock.
+The service itself runs no inference: audio.cpp on `:8090` answers the batch
+and live transcription, Mistral the cloud transcribers and translators,
+Lemonade on `:8731` and the Bifrost gateway on `:8080` the translators. Jobs
+run one at a time in a worker thread; live sessions are independent of them.
 
 ## Auth
 
@@ -41,12 +40,12 @@ Query parameters are per-job options (all optional):
 |---|---|
 | `filename` | original name, only used for the format hint |
 | `language` | force the spoken language, e.g. `de` |
-| `speakers` | known speaker count; omit to let the model decide |
 | `names` | `1:Anna,2:Bernd` |
 | `hotwords` | names and jargon to bias the ASR |
-| `merge_gap`, `max_segment`, `max_tokens`, `threshold` | numbers |
+| `max_tokens` | the audiocpp output cap |
 | `second_name`, `second_offset` | the microphone track of a two-track recording |
-| `diarize_second` | label several voices in the second track |
+| `model`, `asr_mode` | `asr_mode` is `audiocpp` (default) or `mistral`; a
+  `mistral.voxtral-*` model routes to Mistral whatever `asr_mode` says |
 
 Two tracks of the same recording are paired by `filename`: upload both with the
 same name and one job covers both.
@@ -170,7 +169,7 @@ The poll answers:
   show what it is doing.
 - `open:false` means the session is closed: no new audio, but the rows are
   readable for a while (`--live-idle`, 120 s) so a late reader gets the tail.
-- `409` when the GPU is busy with a batch job, `404` for an unknown session.
+- `404` for an unknown session.
 
 ### How a line is built
 
@@ -212,7 +211,6 @@ request: under a second for a local model, two to three seconds for a cloud one.
   batch transcript is the labelled truth. A live session is a preview.
 - **Not a record.** The streaming model invents words when the audio is noisy or
   after a loop. Use batch for anything you keep.
-- One session at a time per GPU.
 
 ## Other routes
 
@@ -224,6 +222,7 @@ request: under a second for a local model, two to three seconds for a cloud one.
 
 ## Not part of this service
 
-The ASR, the translator and the diarizer are separate processes the service
-calls: audio.cpp on `:8090` (MOSS for batch, VibeVoice 7B for live) and Lemonade
-on `:8731` (the translator). Nothing in this API exposes them directly.
+The ASR and the translators are separate processes the service calls:
+audio.cpp on `:8090` (MOSS for batch, VibeVoice 7B for live), Mistral (cloud
+transcription and translation), Lemonade on `:8731` and the Bifrost gateway on
+`:8080` (translators). Nothing in this API exposes them directly.

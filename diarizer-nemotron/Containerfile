@@ -1,4 +1,0 @@
-FROM localhost/halogen-diarizer-pyannote-rocm:latest
-RUN pip install --no-cache-dir "transformers>=5.18" soundfile librosa
-COPY nemotron_diarize.py /nemotron_diarize.py
-ENTRYPOINT ["python3", "/nemotron_diarize.py"]

@@ -3,18 +3,17 @@
 
 Meetings take minutes and Hermes' tools have a fixed deadline, so nothing here
 blocks: a caller submits audio, gets a job id, and polls (or reads the result
-later). One worker thread runs `meeting-transcribe` at a time, because the
-diarizer loads the GPU; with --asr-mode full the ASR is Whisper through Lemonade,
-already resident, so the lock is there for the diarizer.
+later). One worker thread runs `meeting-transcribe` at a time. No inference is
+managed here: the ASR is audio.cpp (which diarizes itself) or Mistral, the
+translators are Lemonade, Mistral or the Bifrost gateway, all over HTTP.
 
-Defaults since 2026-10-20: Whisper-Large-v3-Turbo through Lemonade on 8731,
---asr-mode full, --diarizer nemotron.
+Defaults: MOSS-Transcribe-Diarize through audio.cpp, --asr-mode audiocpp.
 
     ./meeting-job --dir /mnt/cache/mcp-meeting-transcribe --token secret
 
     # upload (n8n: HTTP Request, binary body; curl:)
     curl --data-binary @meeting.m4a \
-         "http://halogen-host:8099/jobs?filename=meeting.m4a&speakers=4&language=it" \
+         "http://halogen-host:8099/jobs?filename=meeting.m4a&language=it" \
          -H "Authorization: Bearer secret"
     # -> {"id":"1a2b...","status":"queued"}
 
@@ -40,7 +39,6 @@ import base64
 import binascii
 import collections
 import hashlib
-import http.client
 import io
 import json
 import math
@@ -48,7 +46,6 @@ import mimetypes
 import os
 import queue
 import re
-import select
 import signal
 import ssl
 import struct
@@ -64,29 +61,21 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from lockfile import Lock
-
 HERE = Path(__file__).resolve().parent
 PROTOCOL_SUPPORTED = ("2025-03-26", "2025-06-18")
 PROTOCOL_LATEST = "2025-06-18"
 SUFFIX = re.compile(r"\.[a-z0-9]{1,5}$")
-OPTION_FLAGS = (("speakers", "--speakers"), ("min_speakers", "--min-speakers"),
-                ("max_speakers", "--max-speakers"), ("threshold", "--threshold"),
-                ("language", "--language"), ("hotwords", "--hotwords"),
-                ("names", "--names"), ("merge_gap", "--merge-gap"),
-                ("max_segment", "--max-segment"), ("max_tokens", "--max-tokens"),
-                ("diarizer", "--diarizer"), ("model", "--model"),
+OPTION_FLAGS = (("language", "--language"), ("hotwords", "--hotwords"),
+                ("names", "--names"), ("max_tokens", "--max-tokens"),
+                ("model", "--model"),
                 ("asr_mode", "--asr-mode"), ("second_name", "--second-name"),
                 ("asr_dir", "--asr-dir"), ("asr_remote_dir", "--asr-remote-dir"),
-                ("second_offset", "--second-offset"),
-                ("diarization", "--diarization"))
-# Booleans: the flag is passed alone, so any truthy value turns it on.
-SWITCH_FLAGS = (("diarize_second", "--diarize-second"),)
+                ("second_offset", "--second-offset"))
 # Query parameters this server consumes itself and never forwards to the worker.
 CONSUMED_OPTIONS = ("pair", "track")
 PAIR_NAME = re.compile(r"^(?P<key>.+?)-(system|mic)(-16k)?\.[a-z0-9]{1,5}$", re.IGNORECASE)
 # meeting-transcribe wants ints for these; every other flag takes a float or a string.
-INT_OPTIONS = ("speakers", "min_speakers", "max_speakers", "max_tokens")
+INT_OPTIONS = ("max_tokens",)
 
 def job_id(audio: bytes) -> str:
     return hashlib.sha256(audio).hexdigest()[:16]
@@ -290,23 +279,17 @@ class Jobs:
     """A single-worker FIFO queue of transcription jobs, kept in memory."""
 
     def __init__(self, meeting: Path, root: Path, keep_audio: bool = False,
-                 timeout: float = 14400, asr: str = "http://127.0.0.1:8731",
-                 parallel: int = 4, diarizer: str = "nemotron",
-                 model: str = "Whisper-Large-v3-Turbo", asr_mode: str = "full",
+                 timeout: float = 14400, asr: str = "http://ubuntu:8090",
+                 model: str = "moss-transcribe-diarize",
+                 asr_mode: str = "audiocpp",
                  asr_dir: str | None = None, asr_remote_dir: str | None = None,
-                 lock_path: Path = Path("/run/user/1000/halogen-gpu.lock"),
-                 lock_wait: float = 600, pair_wait: float = 900,
-                 retain_days: float = 30) -> None:
+                 pair_wait: float = 900, retain_days: float = 30) -> None:
         self.meeting = Path(meeting).resolve()
         self.asr = asr
-        self.parallel = parallel
-        self.diarizer = diarizer
         self.model = model
         self.asr_mode = asr_mode
         self.asr_dir = asr_dir
         self.asr_remote_dir = asr_remote_dir
-        self.lock = Lock(lock_path)
-        self.lock_wait = lock_wait
         self.pair_wait = pair_wait
         self.inbox = root / "inbox"
         self.out = root / "out"
@@ -559,7 +542,7 @@ class Jobs:
 
     def models(self, mistral_key: str = "") -> list[dict]:
         """Batch transcription models: the configured local one, plus Mistral if a key is set."""
-        items = [{"id": self.model, "recipe": self.asr_mode}] if self.model else []
+        items = [{"id": self.model, "recipe": "local"}] if self.model else []
         if mistral_key:
             for name in MISTRAL_BATCH_MODELS:
                 if name != self.model:
@@ -587,33 +570,18 @@ class Jobs:
             self._persist()
 
     def _transcribe(self, job: Job) -> None:
-        # One GPU/NPU user at a time: wait for any image generation to finish.
-        chosen_model = str(job.options.get("model") or self.model)
-        chosen_mode = str(job.options.get("asr_mode") or self.asr_mode)
-        needs_gpu = not is_mistral_asr(chosen_model, chosen_mode)
-        if needs_gpu and not self.lock.acquire(self.lock_wait):
-            job.status = "error"
-            job.error = f"waited {self.lock_wait:g}s for the GPU lock (an image is generating?)"
-            job.finished = time.time()
-            return
         prefix = self.out / job.id
         audio = job.audio
         if audio is None:
             job.status = "error"
             job.error = "no audio for this job"
             job.finished = time.time()
-            if needs_gpu:
-                self.lock.release()
             return
         if job.status == "cancelled":
-            # Stopped while it waited for the lock: nothing was run.
             job.finished = time.time()
-            if needs_gpu:
-                self.lock.release()
             return
         command = [str(self.meeting), str(audio), "--output", str(prefix),
-                   "--asr", self.asr, "--parallel", str(self.parallel),
-                   "--diarizer", self.diarizer, "--model", self.model,
+                   "--asr", self.asr, "--model", self.model,
                    "--asr-mode", self.asr_mode]
         if self.asr_dir:
             command += ["--asr-dir", self.asr_dir]
@@ -625,9 +593,6 @@ class Jobs:
         for key, flag in OPTION_FLAGS:
             if job.options.get(key) is not None:
                 command += [flag, str(job.options[key])]
-        for key, flag in SWITCH_FLAGS:
-            if job.options.get(key):
-                command.append(flag)
         try:
             process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                        text=True, start_new_session=True)
@@ -671,8 +636,6 @@ class Jobs:
             job.status = "error"
             job.error = str(error)
         finally:
-            if needs_gpu:
-                self.lock.release()
             with self._current_lock:
                 self._current = None
             job.finished = time.time()
@@ -687,7 +650,7 @@ class Jobs:
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> None:
-        """Stop the worker and everything it spawned (its diarizer container)."""
+        """Stop the worker and any process it spawned."""
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
@@ -734,10 +697,6 @@ TRANSLATE_PROMPT = (
     "are given only. A line may be a fragment that ends mid-thought: translate the "
     "words you are given, do not complete the sentence yourself.")
 LIVE_CONTEXT = 2                        # translated lines handed back as context
-# Same voice stays well above this, different voices well below (measured on the
-# box with different texts: 0.888-0.954 within one voice, 0.144-0.408 across), so
-# a line also ends where the voice changes, which a pause cannot tell you.
-LIVE_SPEAKER = 0.6
 LIVE_TRANSLATE_EVERY = 60               # source characters between partial translations
 # The first translation of a line is not worth waiting for: measured with a cloud
 # model, the worker sat idle for 14.8 s while the page showed a source line with
@@ -1243,7 +1202,6 @@ class LiveSession:
         self.rows: list[dict] = []
         self.closed = False
         self.done = False                      # the worker drained the queue
-        self.locked = False                    # still holds the GPU lock
         self.last = time.monotonic()
         self._pcm = b""
         self._noise = LIVE_FLOOR
@@ -1255,7 +1213,7 @@ class LiveSession:
         self._pending = ""
         self._pending_row = 0
         self._pending_at = 0.0
-        self._speaker = ""                       # current speaker_id when live-diarized
+        self._speaker = ""                       # speaker_id when the ASR sends one
         self._translated = 0                     # source length at the last partial translation
         self._partial_busy = False                # a partial translation is in flight
         # The newest text of the line being built, waiting for a free worker: a
@@ -1264,7 +1222,6 @@ class LiveSession:
         # What the worker is doing right now, for the page: silence on screen
         # while a 10 s stretch waits for a pause reads as "the thing is broken".
         self._state = "idle"
-        self._voice: list[float] | None = None   # mean of the line's clips
         self._closing = False                    # a close is already queued
         self.stream: StreamingASR | MistralRealtimeASR | None = None
         self._stream_restarts = 0
@@ -1432,7 +1389,6 @@ class LiveSession:
             if item is None:
                 self._flush()               # half a sentence still counts as words
                 self.done = True
-                self.live.settled(self)     # the GPU is free: a new session may start
                 return
             if isinstance(item, Close):
                 with self._lock:
@@ -1450,25 +1406,9 @@ class LiveSession:
                     self._partial_busy = False
                 continue
             clip = item
-            box: dict = {}
-            listener = None
-            if self.live.embedder and not is_mistral_asr(self.asr_model):
-                # The container start plus the model is 0.40 s: run it beside the
-                # ASR instead of after it, so a voice change costs no latency.
-                def listen() -> None:
-                    try:
-                        box["voice"] = self.live.embed(clip)
-                    except (OSError, ValueError, subprocess.TimeoutExpired):
-                        box["voice"] = None
-
-                listener = threading.Thread(target=listen, daemon=True)
-                listener.start()
             self._set_state("asr")
             try:
-                try:
-                    src = self.live.transcribe(clip, self.language, self.asr_model)
-                except TypeError:
-                    src = self.live.transcribe(clip, self.language)
+                src = self.live.transcribe(clip, self.language, self.asr_model)
             except (OSError, ValueError) as error:
                 # One failed clip must not end the session: say so and go on.
                 with self._lock:
@@ -1476,17 +1416,8 @@ class LiveSession:
                                       "done": True})
                 continue
             self._set_state("idle")
-            voice = None
-            if listener is not None:
-                listener.join(timeout=60)
-                voice = box.get("voice")
-            other = self._other_voice(voice)
-            if other and self._pending:
-                # Someone else is talking: the previous line ends here, even if
-                # nobody paused for long enough.
-                self._flush()
             if src:
-                self._hear(src, closed=other, voice=voice)
+                self._hear(src)
 
     def _streamed(self, delta: str, speaker: str = "", dedupe: bool = True) -> None:
         """A piece of the line, while the speaker is still talking."""
@@ -1556,21 +1487,7 @@ class LiveSession:
         with self._lock:
             self._state = state
 
-    def _other_voice(self, voice: list[float] | None) -> bool:
-        """True when this clip is a different speaker from the line being built."""
-        if voice is None:
-            return False
-        with self._lock:
-            if self._voice is None:
-                return False
-            similarity = sum(a * b for a, b in zip(voice, self._voice))
-            if similarity < self.live.speaker:
-                print(f"live: new speaker ({similarity:.2f} < {self.live.speaker:.2f})",
-                      flush=True)
-                return True
-            return False
-
-    def _hear(self, src: str, closed: bool, voice: list[float] | None = None) -> None:
+    def _hear(self, src: str, closed: bool = False) -> None:
         """Add a clip's text to the line being built, and close it on a real pause.
 
         The ASR punctuates every clip as if it were a sentence, so its full stops
@@ -1581,9 +1498,6 @@ class LiveSession:
         translated as two sentences.
         """
         with self._lock:
-            if voice is not None:
-                self._voice = voice if self._voice is None else [
-                    (old + new) / 2 for old, new in zip(self._voice, voice)]
             if not self._pending:
                 self.rows.append({"src": src, "mt": "", "done": False})
                 self._pending, self._pending_row = src, len(self.rows) - 1
@@ -1600,7 +1514,6 @@ class LiveSession:
             self._pending = ""
             self._translated = 0
             self._partial_busy = False
-            self._voice = None              # the next clip opens a new line
             if overlong and not closed and not held:
                 # Cut the line at a full stop and let the rest keep growing.
                 head, tail = sentence_head(text, LIVE_PENDING_CHARS // 2)
@@ -1610,7 +1523,6 @@ class LiveSession:
                     text, self._pending = head, tail
                     self._pending_row = len(self.rows) - 1
                     self._pending_at = time.monotonic()
-                    self._voice = voice      # the tail is the same speaker
         self._say(text, row)
 
     def _flush(self) -> None:
@@ -1619,7 +1531,6 @@ class LiveSession:
                 return
             text, row = self._pending, self._pending_row
             self._pending = ""
-            self._voice = None
             self._closing = False
         self._say(text, row)
 
@@ -1695,14 +1606,13 @@ class Live:
     """The live sessions, and the GPU lock they share with the job queue."""
 
     def __init__(self, asr: str, model: str, llm: str, translate_model: str,
-                 lock_path: Path, idle: float = 120, glossary: str = "",
-                 silence: float = LIVE_LINE, embedder: str = "",
-                 speaker: float = LIVE_SPEAKER, live_asr: str = "",
+                 idle: float = 120, glossary: str = "",
+                 silence: float = LIVE_LINE, live_asr: str = "",
                  live_model: str = "", stream_asr: bool = False,
                  mt_gateway: str = "", mistral_key: str = "") -> None:
         # The live path can use its own endpoint: a clip every half second makes
-        # the fixed cost of a request the whole budget (gufo 0.78 s, Whisper
-        # through Lemonade 0.24 s, measured), and the jobs keep their own choice.
+        # the fixed cost of a request the whole budget, and the jobs keep their
+        # own choice.
         self.asr = (live_asr or asr).rstrip("/")
         self.model = live_model or model
         # One long request per session instead of one per clip: the model's
@@ -1721,32 +1631,18 @@ class Live:
         self.glossary = glossary
         self.idle = idle
         self.silence = silence
-        self.embedder = embedder        # diarizer image, empty = line ends on pauses only
-        self.speaker = speaker
-        self._embed_lock = threading.Lock()     # one pipe, shared by every session
-        self._embed_process = None
-        self._embed_failures = 0
-        # Its own Lock: two flock()s on one open file description never exclude
-        # each other, so reusing Jobs.lock would let a session and a diarizer run
-        # together, which is exactly what the lock is for.
-        self.gpu = Lock(lock_path)
         self.sessions: dict[str, LiveSession] = {}
         self._lock = threading.Lock()
         threading.Thread(target=self._reap, daemon=True).start()
 
     def feed(self, identity: str, pcm: bytes, language: str, target: str,
-             model: str = "", asr_model: str = "", glossary: str = "") -> LiveSession | None:
-        """Add audio, opening the session on the first chunk. None means GPU busy."""
-        needs_gpu = not is_mistral_asr(asr_model or self.model)
+             model: str = "", asr_model: str = "", glossary: str = "") -> LiveSession:
+        """Add audio, opening the session on the first chunk."""
         with self._lock:
             session = self.sessions.get(identity)
             if session is None:
-                if needs_gpu and not self.gpu.acquire(0):
-                    return None
                 session = self.sessions[identity] = LiveSession(
                     self, language, target, self.silence, model, asr_model, glossary)
-                if needs_gpu:
-                    session.locked = True
         session.feed(pcm)
         return session
 
@@ -1767,7 +1663,7 @@ class Live:
         Listed rather than hardcoded: a name in the page that the box does not
         serve is a setting that fails silently. Lemonade labels what a model can
         do, so "chat" is the filter — not the recipe, which is the runtime and
-        would offer the embedder and the rerankers too. On top of those, Mistral's
+        would offer the rerankers too. On top of those, Mistral's
         chat models when a key is set and the gateway's opencode models when
         --mt-gateway is. A cloud id carries its provider as a prefix
         ("mistral.ministral-8b-latest", "opencode.opencode-go/model_1"), which is
@@ -1819,17 +1715,6 @@ class Live:
                 for model in found
                 if isinstance(model, dict) and model.get("owned_by") == "opencode"]
 
-    def settled(self, session: LiveSession) -> None:
-        """The worker drained: free the GPU now, but let the page read the tail.
-
-        Releasing here rather than in the reaper is what makes "Ferma" immediate:
-        otherwise a new session waits up to one reaper tick for the lock.
-        """
-        with self._lock:
-            if session.locked:
-                session.locked = False
-                self.gpu.release()
-
     def get(self, identity: str) -> LiveSession | None:
         with self._lock:
             found = self.sessions.get(identity)
@@ -1868,71 +1753,6 @@ class Live:
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(request, timeout=60) as response:
             return clean_live_text(str(json.loads(response.read()).get("text", "")))
-
-    def embed(self, pcm: bytes) -> list[float] | None:
-        """One speaker embedding for one clip, through a process that stays open.
-
-        A container per clip cost 0.40 s of startup — measured, and with clips cut
-        every half second it was the whole latency budget. The first clip pays it,
-        the rest are about 20 ms. No embedder, a dead one or too little audio all
-        mean "no opinion": the line then ends on pauses alone.
-        """
-        if not self.embedder or len(pcm) < LIVE_MIN_SPEECH * LIVE_BYTES_PER_S:
-            return None
-        with self._embed_lock:
-            if self._embed_failures >= 3:
-                return None
-            process = self._embedder()
-            if process is None:
-                return None
-            payload = wav_bytes(pcm)
-            try:
-                process.stdin.write(struct.pack(">I", len(payload)) + payload)
-                process.stdin.flush()
-                if not select.select([process.stdout], [], [], 10)[0]:
-                    raise ValueError("no answer within 10 s")
-                answer = json.loads(process.stdout.readline() or b"{}")
-                if "error" in answer:
-                    raise ValueError(answer["error"])
-                vector = [float(value) for value in answer["vector"]]
-            except (OSError, ValueError) as error:
-                self._stop_embedder()
-                self._embed_failures += 1
-                if self._embed_failures == 3:
-                    # A missing image must not cost a container per clip all day.
-                    print(f"live: speaker embedding off ({error})", flush=True)
-                return None
-            self._embed_failures = 0
-        norm = math.sqrt(sum(value * value for value in vector))
-        return [value / norm for value in vector] if norm else None
-
-    def _embedder(self) -> "subprocess.Popen[bytes] | None":
-        if self._embed_process is not None and self._embed_process.poll() is None:
-            return self._embed_process
-        try:
-            self._embed_process = subprocess.Popen(
-                ["podman", "run", "--rm", "-i", "--entrypoint", "python3",
-                 self.embedder, "/embed.py", "--loop"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except OSError as error:
-            self._embed_failures += 1
-            print(f"live: no embedder ({error})", flush=True)
-            return None
-        return self._embed_process
-
-    def _stop_embedder(self) -> None:
-        process, self._embed_process = self._embed_process, None
-        if process is None:
-            return
-        for step in (lambda: process.stdin.close(), process.terminate):
-            try:
-                step()
-            except OSError:
-                pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
 
     def translate(self, src: str, target: str, context: list[str],
                   on_token=None, model: str = "", glossary: str = "") -> str:
@@ -2058,23 +1878,16 @@ def tools() -> list[dict]:
          "inputSchema": {"type": "object", "properties": {
              "audio_base64": {"type": "string", "description": "the recording, base64-encoded"},
              "filename": {"type": "string", "description": "original name, for the format hint"},
-             "speakers": {"type": "integer", "description": "known speaker count; omit to cluster"},
-             "min_speakers": {"type": "integer", "description": "fewest speakers to expect"},
-             "max_speakers": {"type": "integer", "description": "most speakers to expect"},
              "language": {"type": "string", "description": "force a language, e.g. de or German"},
              "hotwords": {"type": "string", "description": "names and jargon to bias the ASR"},
              "names": {"type": "string", "description": "speaker names, e.g. 1:Anna,2:Bernd"},
-             "threshold": {"type": "number", "description": "sherpa clustering threshold when speakers is omitted"},
-             "diarizer": {"type": "string", "enum": ["pyannote-rocm", "sherpa", "nemotron"],
-                          "description": "diarizer backend; nemotron labels far-field German audio best"},
              "model": {"type": "string",
-                       "description": "ASR model the endpoint serves (Whisper-Large-v3-Turbo when asr_mode is full)"},
-             "asr_mode": {"type": "string", "enum": ["segments", "full", "audiocpp", "mistral"],
-                          "description": "segments: one ASR request per turn clip (gufo); full: one pass "
-                                         "over the whole file, needs a verbose_json endpoint; audiocpp: one "
-                                         "request to audio.cpp, which diarizes itself (needs asr_dir); "
-                                         "mistral: one request to Mistral's /v1/audio/transcriptions with "
-                                         "diarize=true (auto-selected for voxtral-* models)"}},
+                       "description": "ASR model the endpoint serves (default moss-transcribe-diarize)"},
+             "asr_mode": {"type": "string", "enum": ["audiocpp", "mistral"],
+                          "description": "audiocpp: one request to audio.cpp, which diarizes "
+                                         "itself (needs asr_dir); mistral: one request to Mistral's "
+                                         "/v1/audio/transcriptions with diarize=true "
+                                         "(auto-selected for voxtral-* models)"}},
              "required": ["audio_base64"]}},
         {"name": "meeting_status",
          "description": "Status of a transcription job by id.",
@@ -2376,21 +2189,13 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             asr_choice = query.get("asr_model", [""])[0]
             glossary = query.get("glossary", [""])[0]
-            try:
-                session = self.server.live.feed(identity, body, query.get("language", [""])[0],
-                                                query.get("to", [""])[0],
-                                                query.get("mt_model", [""])[0],
-                                                asr_choice, glossary)
-            except TypeError:
-                session = self.server.live.feed(identity, body, query.get("language", [""])[0],
-                                                query.get("to", [""])[0],
-                                                query.get("mt_model", [""])[0])
-            if session is None:
-                self._json(409, {"error": "the GPU is busy: a transcription job is running"})
-            else:
-                view = session.view(0)
-                self._json(202, {"ok": True, "cursor": view["cursor"],
-                                 "open": view["open"]})
+            session = self.server.live.feed(identity, body, query.get("language", [""])[0],
+                                            query.get("to", [""])[0],
+                                            query.get("mt_model", [""])[0],
+                                            asr_choice, glossary)
+            view = session.view(0)
+            self._json(202, {"ok": True, "cursor": view["cursor"],
+                             "open": view["open"]})
         else:
             self._json(404, {"error": "not found"})
 
@@ -2433,31 +2238,22 @@ def main() -> None:
                              "(default /mnt/fanxiang/cache/mcp-meeting-transcribe)")
     parser.add_argument("--meeting", type=Path, default=HERE / "meeting-transcribe",
                         help="the worker script (default meeting-transcribe next to this one)")
-    parser.add_argument("--asr", default="http://127.0.0.1:8731",
-                        help="OpenAI-compatible ASR base URL the worker transcribes through "
-                             "(default Lemonade on 127.0.0.1:8731, verbose_json)")
-    parser.add_argument("--parallel", type=int, default=4,
-                        help="transcriptions in flight at once (default 4; 1 is sequential)")
-    parser.add_argument("--diarizer", default="nemotron",
-                        choices=("sherpa", "pyannote-rocm", "nemotron"),
-                        help="diarizer backend (default nemotron)")
-    parser.add_argument("--model", default="Whisper-Large-v3-Turbo",
-                        help="ASR model the endpoint serves (default Whisper-Large-v3-Turbo)")
-    parser.add_argument("--asr-mode", default="full",
-                        choices=("segments", "full", "audiocpp", "mistral"),
-                        help="segments: one ASR request per turn clip (default); full: one pass over "
-                             "the whole file, needs a verbose_json endpoint such as Lemonade; "
-                             "audiocpp: one request to audio.cpp, which diarizes itself; "
-                             "mistral: one request to Mistral's /v1/audio/transcriptions with diarize=true")
+    parser.add_argument("--asr", default="http://ubuntu:8090",
+                        help="audio.cpp base URL the worker transcribes through "
+                             "(default http://ubuntu:8090)")
+    parser.add_argument("--model", default="moss-transcribe-diarize",
+                        help="ASR model the endpoint serves "
+                             "(default moss-transcribe-diarize)")
+    parser.add_argument("--asr-mode", default="audiocpp",
+                        choices=("audiocpp", "mistral"),
+                        help="audiocpp (default): one request to audio.cpp, which diarizes "
+                             "itself; mistral: one request to Mistral's "
+                             "/v1/audio/transcriptions with diarize=true")
     parser.add_argument("--asr-dir", default=None,
                         help="with --asr-mode audiocpp: directory the ASR server can read, where "
                              "the normalized WAV is written (audio.cpp takes a path, not an upload)")
     parser.add_argument("--asr-remote-dir", default=None,
                         help="how --asr-dir is seen by the ASR server (default: the same path)")
-    parser.add_argument("--lock", type=Path, default=Path("/run/user/1000/halogen-gpu.lock"),
-                        help="exclusive lock held while a job runs, shared with image-guard")
-    parser.add_argument("--lock-wait", type=float, default=600,
-                        help="seconds to wait for the lock before failing the job (default 600)")
     parser.add_argument("--token", default=os.environ.get("MEETING_TOKEN", ""),
                         help="bearer token required on every route but /health (default $MEETING_TOKEN)")
     parser.add_argument("--max-upload", type=int, default=512 * 1024 * 1024,
@@ -2473,8 +2269,7 @@ def main() -> None:
                         help="delete kept uploads older than this many days; 0 keeps them "
                              "forever (default 30)")
     parser.add_argument("--live-asr", default="",
-                        help="ASR base URL for the live path only (default: --asr); Whisper "
-                             "through Lemonade answers a clip in 0.24 s against gufo's 0.78 s")
+                        help="audio.cpp base URL for the live path only (default: --asr)")
     parser.add_argument("--live-model", default="",
                         help="ASR model for the live path only (default: --model)")
     parser.add_argument("--translate-url", default="http://127.0.0.1:8731",
@@ -2495,13 +2290,6 @@ def main() -> None:
                         help="a pause this long ends a live line (default "
                              f"{LIVE_LINE:g}); a line also needs to end on a full stop, "
                              "unless the silence runs three times longer")
-    parser.add_argument("--live-embedder", default="",
-                        help="diarizer image used for speaker embeddings, so a line also "
-                             "ends when the voice changes (e.g. localhost/halogen-diarizer); "
-                             "empty ends lines on pauses only")
-    parser.add_argument("--live-speaker", type=float, default=LIVE_SPEAKER,
-                        help="cosine below which two clips are different speakers "
-                             f"(default {LIVE_SPEAKER})")
     parser.add_argument("--live-stream", action="store_true",
                         help="feed the live audio to audio.cpp's streaming endpoint "
                              "(/v1/audio/transcriptions/live) instead of sending one clip "
@@ -2512,20 +2300,19 @@ def main() -> None:
     args = parser.parse_args()
 
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
-                args.asr, args.parallel, args.diarizer, args.model, args.asr_mode,
+                args.asr, args.model, args.asr_mode,
                 args.asr_dir, args.asr_remote_dir,
-                args.lock, args.lock_wait, pair_wait=args.pair_wait,
+                pair_wait=args.pair_wait,
                 retain_days=args.retain_audio_days)
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
     live = Live(args.asr, args.model, args.translate_url, args.translate_model,
-                args.lock, args.live_idle, args.live_glossary, args.live_silence,
-                args.live_embedder, args.live_speaker, args.live_asr, args.live_model,
+                args.live_idle, args.live_glossary, args.live_silence,
+                args.live_asr, args.live_model,
                 args.live_stream, mt_gateway=args.mt_gateway)
     server = Server((args.host, args.port), jobs, hooks, args.token, args.max_upload, live)
     auth = "bearer token required" if args.token else "NO AUTH: anyone who can reach the port can use it"
     translate = args.translate_model or "no translation (--translate-model is empty)"
-    print(f"live: speech embedding {'via ' + args.live_embedder if args.live_embedder else 'off'}"
-          f", line closes at {args.live_silence:g}s of pause"
+    print(f"live: line closes at {args.live_silence:g}s of pause"
           f", asr {live.asr} ({live.model})"
           f"{' streaming' if live.stream_asr else ' per clip'}", flush=True)
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)

@@ -343,7 +343,6 @@ function Jobs() {
     const form = new FormData(event.currentTarget)
     const files = (form.getAll("file") as File[]).filter((file) => file.size > 0)
     if (!files.length) return
-    const speakers = String(form.get("speakers") ?? "")
     const language = String(form.get("language") ?? "auto")
     const model = String(form.get("model") ?? DEFAULT_MODEL)
     const hotwords = String(form.get("hotwords") ?? "").trim()
@@ -359,7 +358,6 @@ function Jobs() {
     try {
       for (const file of files) {
         const query = new URLSearchParams({ filename: file.name })
-        if (speakers) query.set("speakers", speakers)
         if (language !== "auto") query.set("language", language)
         if (model && model !== DEFAULT_MODEL) query.set("model", model)
         if (hotwords) query.set("hotwords", hotwords)
@@ -414,17 +412,6 @@ function Jobs() {
                   multiple
                   required
                   ref={fileInput}
-                />
-              </div>
-              <div className="grid w-full gap-2 sm:w-24">
-                <Label htmlFor="speakers">Speakers</Label>
-                <Input
-                  id="speakers"
-                  name="speakers"
-                  type="number"
-                  min={1}
-                  max={20}
-                  placeholder="auto"
                 />
               </div>
               <div className="grid w-full gap-2 sm:w-36">
