@@ -1420,7 +1420,16 @@ class LiveSession:
                 self._hear(src)
 
     def _streamed(self, delta: str, speaker: str = "", dedupe: bool = True) -> None:
-        """A piece of the line, while the speaker is still talking."""
+        """A piece of the line, while the speaker is still talking.
+
+        Voxtral Realtime emits LLM-style token pieces: a piece that starts with
+        its own whitespace begins a word (' Abend'), one without continues the
+        word in progress (' Hall' then 'o' = "Hallo") — gluing the pieces the
+        way audio.cpp's whole segments want split every word that crossed one
+        ("Fac ci amo", "gi usto"). audio.cpp never cuts inside a word, so it
+        keeps the separator.
+        """
+        lead = delta[:1].isspace()
         text = clean_live_text(delta)
         if not text:
             return
@@ -1429,7 +1438,8 @@ class LiveSession:
                 fresh = repeated_tail(self._pending, text) if dedupe else text
                 if not fresh:
                     return                  # the model said it again: not new words
-                glue = "" if fresh[0] in ".!?,;:…)]\"'»" else " "
+                glue = "" if fresh[0] in ".!?,;:…)]\"'»" else (
+                    " " if lead or not is_mistral_realtime(self.asr_model) else "")
                 self._pending = f"{self._pending}{glue}{fresh}".strip()
                 self.rows[self._pending_row]["src"] = self._pending
                 if speaker and not self.rows[self._pending_row].get("speaker"):

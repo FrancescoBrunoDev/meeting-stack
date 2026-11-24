@@ -1086,6 +1086,26 @@ class LiveLines(unittest.TestCase):
         self.assertTrue(session.rows[0]["done"])
         self.assertEqual(session.view(0)["asr_model"], "voxtral-mini-transcribe-realtime-3")
 
+    def test_voxtral_pieces_do_not_split_a_word(self):
+        # Measured on the realtime API: token pieces cut inside words, and a
+        # piece without its own whitespace continues the word (' Hall','o').
+        calls = []
+        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
+                                          asr_model="voxtral-mini-transcribe-realtime-3")
+        for piece in ("Guten", " Abend", ".", " Hall", "o", "."):
+            session._streamed(piece, dedupe=False)
+        self.assertEqual(session.rows[0]["src"], "Guten Abend. Hallo.")
+
+    def test_whole_segment_streams_keep_the_separator(self):
+        # audio.cpp sends whole segments with no relation to word starts:
+        # they always take the space back.
+        calls = []
+        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
+                                          asr_model="vibevoice_asr_streaming_7b_q8_0")
+        session._streamed("Hall", dedupe=True)
+        session._streamed("o", dedupe=True)
+        self.assertEqual(session.rows[0]["src"], "Hall o")
+
     def test_a_stale_turn_end_does_not_close_the_next_line(self):
         calls = []
         session = meeting_job.LiveSession(self.fake(calls), "de", "it",
