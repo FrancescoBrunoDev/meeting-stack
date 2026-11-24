@@ -289,7 +289,14 @@ function Jobs() {
     let alive = true
     api("/live/models")
       .then((answer) => alive && setBatchModels(answer.batch_models ?? []))
-      .catch(() => alive && setBatchModels([]))
+      .catch((failure) => {
+        if (alive) {
+          setBatchModels([])
+          // "service default" alone in the dropdown reads as "no models";
+          // a refused request (the token is missing or wrong) must say so.
+          setAuthError((failure as Error).message)
+        }
+      })
     return () => {
       alive = false
     }

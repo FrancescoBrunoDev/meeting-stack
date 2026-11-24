@@ -202,10 +202,13 @@ export default function Live() {
         setMtModels(answer.models ?? [])
         setAsrModels(answer.asr_models ?? [])
       })
-      .catch(() => {
+      .catch((failure) => {
         if (!alive) return
         setMtModels([])
         setAsrModels([])
+        // "service default" alone in the dropdown reads as "no models";
+        // a refused request (the token is missing or wrong) must say so.
+        setError((failure as Error).message)
       })
     return () => {
       alive = false
