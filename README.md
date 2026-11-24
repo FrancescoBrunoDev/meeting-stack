@@ -1,6 +1,8 @@
 # meeting-stack
 
-Diarized transcripts of long meetings, on the Strix Halo box.
+Diarized transcripts of long meetings. The inference (audio.cpp, Mistral,
+Lemonade) lives on a GPU box; the service is one plain container that deploys
+anywhere that can reach it.
 
 Two tools, a service and a web page.
 
@@ -59,7 +61,7 @@ service.
   WAV from (`--asr-dir`): it takes a path, not an upload
 - `MISTRAL_API_KEY` for the cloud path (batch `mistral.voxtral-*`, the cloud
   translators, live realtime)
-- **podman** for the service container, **ffmpeg** for the normalization
+- **podman or docker** for the service container, **ffmpeg** for the normalization
 
 ## Usage
 
@@ -108,6 +110,13 @@ whole, 43 min crash), so the pipeline refuses the bigger ones with an
 actionable error. A shared filesystem (`--asr-dir`) restores the path mode
 for any length. The cache dir is a volume, so jobs and transcripts survive
 redeploys.
+
+That is the live deployment today: Coolify on `raspberrypi2:8099`, with
+`tailscale serve --bg --https=443 8099` over it — so the same service answers
+at `https://raspberrypi2.tail4050b0.ts.net/`, which is also the easiest secure
+context for the live page's `getUserMedia`. Without `--bg` the serve runs in
+the foreground and a `Ctrl+C` removes it. If the port ever changes, redo the
+serve with the new one.
 
 With `MEETING_TOKEN` empty the service starts **without authentication**; every
 route but `/health` then accepts anyone who can reach the port.
@@ -284,7 +293,8 @@ What it is not:
   still the labelled truth, so a live session is a preview.
 - **The microphone needs a secure context.** `getUserMedia` is refused on plain
   `http://` to another host: open the page as `http://127.0.0.1:8099/live` on the
-  box, or behind https. Tab audio (`getDisplayMedia`) needs the same.
+  box, or behind https — on the tailnet, `tailscale serve --bg --https=443 8099`
+  gives the page one for free. Tab audio (`getDisplayMedia`) needs the same.
 - **System audio depends on the engine, not the OS.** Chrome never gives audio
   from a *window*: share a **tab** (only the browser's own sound) or, from Chrome
   141 on macOS, the **entire screen** with "Condividi l'audio di sistema". Firefox
