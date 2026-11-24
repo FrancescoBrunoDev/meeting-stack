@@ -106,7 +106,7 @@ curl -H "Authorization: Bearer $TOKEN" http://box:8099/jobs/<id>/audio    # the 
 `GET /jobs/<id>/audio` answers byte ranges (206), so a player can seek; the
 dashboard passes the token in the query (`?token=…`) because an `<audio src>`
 cannot send headers, and only that route accepts it there. The recording is kept
-when the service runs with `--keep-audio` (the systemd unit does) and deleted
+kept by default (`--no-keep-audio` deletes) and pruned
 after `--retain-audio-days` (default 30; `0` keeps it forever). Audio of a job
 that is still queued or running is never touched, and the job list itself is
 saved in `jobs.json` under `--dir`: restarting the service keeps the list and
@@ -321,7 +321,7 @@ the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
 is where the LLM lives, `--live-idle 120` closes a session that stopped sending
 audio, `--live-glossary`, `--live-silence` (0.5 splits more, 1.2 merges more).
 ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with
-`--live-stream`, or one clip per utterance without it).
+streaming, on by default, or one clip per utterance with `--no-live-stream`).
 
 ## Flags worth knowing
 
@@ -349,7 +349,7 @@ ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
 The systemd unit runs the audio.cpp path: `--asr http://ubuntu:8090 --model
-moss-transcribe-diarize` with `--keep-audio`, live streaming from the same
+moss-transcribe-diarize`, uploads kept, live streaming from the same
 endpoint, translation through Lemonade and the Bifrost gateway.
 
 ## Tests

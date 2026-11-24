@@ -279,7 +279,7 @@ class Job:
 class Jobs:
     """A single-worker FIFO queue of transcription jobs, kept in memory."""
 
-    def __init__(self, meeting: Path, root: Path, keep_audio: bool = False,
+    def __init__(self, meeting: Path, root: Path, keep_audio: bool = True,
                  timeout: float = 14400, asr: str = "http://ubuntu:8090",
                  model: str = "moss-transcribe-diarize",
                  asr_dir: str | None = None, asr_remote_dir: str | None = None,
@@ -1616,7 +1616,7 @@ class Live:
     def __init__(self, asr: str, model: str, llm: str, translate_model: str,
                  idle: float = 120, glossary: str = "",
                  silence: float = LIVE_LINE, live_asr: str = "",
-                 live_model: str = "", stream_asr: bool = False,
+                 live_model: str = "", stream_asr: bool = True,
                  mt_gateway: str = "", mistral_key: str = "") -> None:
         # The live path can use its own endpoint: a clip every half second makes
         # the fixed cost of a request the whole budget, and the jobs keep their
@@ -2263,8 +2263,10 @@ def main() -> None:
     parser.add_argument("--pair-wait", type=float, default=900,
                         help="seconds to wait for the second track of a two-track recording "
                              "before transcribing the one that arrived (default 900)")
-    parser.add_argument("--keep-audio", action="store_true",
-                        help="keep the uploaded audio instead of deleting it after the job")
+    parser.add_argument("--no-keep-audio", action="store_false", dest="keep_audio",
+                        help="delete the uploaded audio after the job instead of keeping it "
+                             "for the dashboard's player (kept by default, pruned after "
+                             "--retain-audio-days)")
     parser.add_argument("--retain-audio-days", type=float, default=30,
                         help="delete kept uploads older than this many days; 0 keeps them "
                              "forever (default 30)")
@@ -2290,10 +2292,10 @@ def main() -> None:
                         help="a pause this long ends a live line (default "
                              f"{LIVE_LINE:g}); a line also needs to end on a full stop, "
                              "unless the silence runs three times longer")
-    parser.add_argument("--live-stream", action="store_true",
-                        help="feed the live audio to audio.cpp's streaming endpoint "
-                             "(/v1/audio/transcriptions/live) instead of sending one clip "
-                             "per utterance: the text grows while the speaker talks")
+    parser.add_argument("--no-live-stream", action="store_false", dest="live_stream",
+                        help="send one clip per utterance instead of audio.cpp's streaming "
+                             "endpoint (/v1/audio/transcriptions/live): the text arrives "
+                             "only on a pause (streaming is the default)")
     parser.add_argument("--live-glossary", default="",
                         help="names and terms the live translation must leave unchanged, "
                              "comma separated (default: none)")

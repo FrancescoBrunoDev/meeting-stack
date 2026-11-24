@@ -41,7 +41,7 @@ GPU lock. Everything is an HTTP endpoint the service calls.
   server ignores it and uses 5120, and a tight cap ends in `reached max_tokens
   before EOS`, which loses the transcript instead of truncating it. 38 minutes
   measured 25 minutes of wall time. Live: the streaming endpoint
-  (`--live-stream`, `vibevoice_asr_streaming_7b_q8_0`) or one clip per
+  (streaming by default, `vibevoice_asr_streaming_7b_q8_0`) or one clip per
   utterance without it.
 - ASR, cloud: Mistral `/v1/audio/transcriptions` with `diarize=true`
   (the `voxtral-*` model id routes there); key in
@@ -96,7 +96,7 @@ and call out over HTTP only. Consequences that bite:
   character wrap, repetition loops) do not apply any more: the words come from
   one answer of MOSS or Mistral, parsed by `parse_diarized()` /
   `transcribe_mistral()`.
-- `--keep-audio` is on in the unit so the dashboard can play a recording. The
+- Uploaded audio is kept (the default) so the dashboard can play it. The
   uploads are pruned after `--retain-audio-days` (default 30; `0` disables),
   hourly and at startup; a queued, waiting or running job's audio is never
   pruned. `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the

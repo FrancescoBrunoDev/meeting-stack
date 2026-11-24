@@ -20,9 +20,9 @@
 # host); a voxtral-* model goes to Mistral's cloud API (needs MISTRAL_API_KEY).
 # Live transcription is audio.cpp's streaming endpoint; translation is
 # Lemonade on :8731, Mistral or the Bifrost gateway on :8080 (--mt-gateway).
-# --keep-audio keeps the upload so the dashboard can play the recording next
-# to the transcript; the files live in ~/.cache/mcp-meeting-transcribe/inbox/
-# and are pruned after --retain-audio-days (default 30; 0 keeps them). Send
+# The uploads are kept by default (the dashboard plays the recording next to
+# the transcript; pruned after --retain-audio-days, default 30, 0 keeps them;
+# --no-keep-audio deletes them). Send
 # language=de: with language=auto Qwen3-ASR answers short turns in a foreign
 # language (25 of 226 turns of a German meeting came back in Chinese).
 [Unit]
@@ -44,11 +44,9 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   localhost/meeting-job:latest \
   --dir %h/.cache/mcp-meeting-transcribe \
   --asr-dir /asr-share --asr-remote-dir /opt/audiocpp \
-  --keep-audio \
   --translate-model Qwen3.8-27B-GGUF \
   --live-model vibevoice_asr_streaming_7b_q8_0 \
-  --mt-gateway http://127.0.0.1:8080 \
-  --live-stream
+  --mt-gateway http://127.0.0.1:8080
 # audio.cpp reads only 16 kHz mono WAV, so meeting-transcribe normalizes with
 # ffmpeg. Measured on a 38-minute German meeting: 429 turns in 25 minutes of
 # wall time, prompt 30365 tokens. The max_tokens cap must be generous and must
