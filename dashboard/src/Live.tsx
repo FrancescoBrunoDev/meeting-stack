@@ -364,6 +364,7 @@ export default function Live() {
     const id = crypto.randomUUID?.() ?? `live-${Date.now()}`
     session.current = id
     cursor.current = 0
+    setRows([]) // a new session starts from row 0: the old transcript must go
     setSessionId(id)
     setStarted(true)
     setError(null)
