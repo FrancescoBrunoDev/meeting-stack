@@ -93,6 +93,22 @@ chmod 600 ~/.config/meeting-stack/meeting-job.env
 systemctl --user daemon-reload && systemctl --user enable --now meeting-job.service
 ```
 
+### Docker Compose / Coolify, on another machine
+
+`docker-compose.yml` deploys the same image on any docker host — e.g. a
+Coolify server in the same LAN as this box. Every deploy choice is an
+environment variable: `MEETING_TOKEN`, `MISTRAL_API_KEY` and `UBUNTU_HOST`
+(the LAN address of this box; audio.cpp `:8090`, Lemonade `:8731` and Bifrost
+`:8080` all hang off it) must be set, the rest — `MEETING_PORT`,
+`AUDIOCPP/LEMONADE/BIFROST_PORT`, `BATCH/LIVE/TRANSLATE_MODEL` — carries a
+default in the file. Batch defaults to `mistral.voxtral-small-transcribe-3`:
+an audio.cpp model travels as a multipart upload from another machine, and
+the server **segfaults past ~20 minutes of recording** (measured: 11 min
+whole, 43 min crash), so the pipeline refuses the bigger ones with an
+actionable error. A shared filesystem (`--asr-dir`) restores the path mode
+for any length. The cache dir is a volume, so jobs and transcripts survive
+redeploys.
+
 With `MEETING_TOKEN` empty the service starts **without authentication**; every
 route but `/health` then accepts anyone who can reach the port.
 
@@ -106,8 +122,8 @@ curl -H "Authorization: Bearer $TOKEN" http://box:8099/jobs/<id>/audio    # the 
 `GET /jobs/<id>/audio` answers byte ranges (206), so a player can seek; the
 dashboard passes the token in the query (`?token=…`) because an `<audio src>`
 cannot send headers, and only that route accepts it there. The recording is kept
-kept by default (`--no-keep-audio` deletes) and pruned
-after `--retain-audio-days` (default 30; `0` keeps it forever). Audio of a job
+by default (`--no-keep-audio` deletes) and pruned after `--retain-audio-days`
+(default 30; `0` keeps it forever). Audio of a job
 that is still queued or running is never touched, and the job list itself is
 saved in `jobs.json` under `--dir`: restarting the service keeps the list and
 the finished transcripts, and marks a job that was mid-run as an error with its

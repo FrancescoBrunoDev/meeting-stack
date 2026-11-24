@@ -1,34 +1,33 @@
-# meeting-job per Coolify (o un qualunque docker compose) su un server
-# DIVERSO da ubuntu, ma nella stessa LAN. Ogni scelta del deploy e' una
-# variabile d'ambiente: quelle obbligatorie vanno impostate nella UI di
-# Coolify, le altre hanno il default scritto qui (sintassi standard di
-# compose, ${VAR:-default}).
+# meeting-job for Coolify (or any docker compose) on a server OTHER than
+# ubuntu, but in the same LAN. Every deploy choice is an environment variable:
+# the required ones go in the Coolify UI, the rest carry the default written
+# here (standard compose syntax, ${VAR:-default}).
 #
-#   build: dal repo (Coolify: app "Docker Compose", compose file:
+#   build: from the repo (Coolify: "Docker Compose" resource, compose file:
 #   docker-compose.yml, Dockerfile: Containerfile)
 #
-#   Env da impostare in Coolify:
-#     MEETING_TOKEN     un bearer token (la dashboard e' pubblica, ora)
-#     MISTRAL_API_KEY   la key
-#     UBUNTU_HOST       l'indirizzo LAN del box che serve audio.cpp,
-#                       Lemonade e Bifrost
+#   Required env, set in Coolify:
+#     MEETING_TOKEN     a bearer token (the dashboard is exposed now)
+#     MISTRAL_API_KEY   the key
+#     UBUNTU_HOST       the LAN address of the box that serves audio.cpp,
+#                       Lemonade and Bifrost
 #
-#   Env facoltative (con default):
-#     MEETING_PORT      porta del servizio (8099)
+#   Optional env (with defaults):
+#     MEETING_PORT      the service's port (8099)
 #     AUDIOCPP_PORT     audio.cpp (8090)
-#     LEMONADE_PORT     Lemonade, il traduttore locale (8731)
-#     BIFROST_PORT      il gateway dei traduttori cloud (8080)
-#     BATCH_MODEL       il modello di trascrizione di default
-#                       (mistral.voxtral-small-transcribe-3; da quaggiu' un
-#                       modello audio.cpp viaggia come upload, e il server
-#                       SEGFAULTA oltre ~20 minuti di registrazione: la
-#                       pipeline lo rifiuta - mounts un --asr-dir condiviso
-#                       per tornare alla modalita' path)
-#     LIVE_MODEL        il modello della sessione live (vibevoice_asr_streaming_7b_q8_0)
-#     TRANSLATE_MODEL   il traduttore di default (Qwen3.8-27B-GGUF)
+#     LEMONADE_PORT     Lemonade, the local translator (8731)
+#     BIFROST_PORT      the cloud-translator gateway (8080)
+#     BATCH_MODEL       the default transcription model
+#                       (mistral.voxtral-small-transcribe-3; an audio.cpp model
+#                       travels as an upload from here, and the server
+#                       SEGFAULTS past ~20 minutes of recording - the pipeline
+#                       refuses it. Mount a shared --asr-dir to go back to the
+#                       path mode for any length)
+#     LIVE_MODEL        the live session model (vibevoice_asr_streaming_7b_q8_0)
+#     TRANSLATE_MODEL   the default translator (Qwen3.8-27B-GGUF)
 #
-#   --keep-audio e --live-stream sono i default del servizio; per toglierli
-#   aggiungi --no-keep-audio / --no-live-stream in `command`.
+#   --keep-audio and --live-stream are the service defaults; add
+#   --no-keep-audio / --no-live-stream in `command` to turn them off.
 services:
   meeting-job:
     build:
@@ -41,9 +40,9 @@ services:
     ports:
       - "${MEETING_PORT:-8099}:${MEETING_PORT:-8099}"
     volumes:
-      # inbox/out, jobs.json, hooks.json, gli upload tenuti col keep-audio
+      # inbox/out, jobs.json, hooks.json, the uploads kept by default
       - meeting-data:/data
-    # --live-asr resta vuoto: la sessione live usa lo stesso --asr.
+    # --live-asr stays empty: the live path uses the same --asr.
     command: >-
       --dir /data
       --port ${MEETING_PORT:-8099}
