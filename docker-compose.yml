@@ -39,6 +39,13 @@ services:
       - HOME=/data
     ports:
       - "${MEETING_PORT:-8099}:${MEETING_PORT:-8099}"
+    # GET /health answers 200 without auth; the image has no curl, python3 does.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${MEETING_PORT:-8099}/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     volumes:
       # inbox/out, jobs.json, hooks.json, the uploads kept by default
       - meeting-data:/data
