@@ -541,7 +541,9 @@ class Jobs:
 
     def models(self, mistral_key: str = "") -> list[dict]:
         """Batch transcription models: the configured local one, plus Mistral if a key is set."""
-        items = [{"id": self.model, "recipe": "local"}] if self.model else []
+        items = ([{"id": self.model,
+                   "recipe": "mistral" if is_mistral_asr(self.model) else "local"}]
+                 if self.model else [])
         if mistral_key:
             for name in MISTRAL_BATCH_MODELS:
                 if name != self.model:
