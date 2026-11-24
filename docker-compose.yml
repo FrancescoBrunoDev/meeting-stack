@@ -1,0 +1,43 @@
+# meeting-job per Coolify (o un qualunque docker compose).
+#
+#   build: dal repo (Coolify: app "Docker Compose", compose file: docker-compose.yml,
+#   Dockerfile: Containerfile). MEETING_TOKEN e MISTRAL_API_KEY vanno nell'env
+#   della piattaforma, non in un file.
+#
+#   L'ipotesi e' che Coolify e il resto dello stack (audio.cpp :8090, Lemonade
+#   :8731, Bifrost :8080) siano sulla STESSA macchina: bridge network di Coolify
+#   => 127.0.0.1 sarebbe il container stesso, quindi gli endpoint puntano a
+#   host.docker.internal. Se invece deployi su un'altra macchina, quei servizi
+#   devono essere raggiungibili a un indirizzo che puoi mettere in `command`.
+services:
+  meeting-job:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: meeting-job:latest
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # MEETING_TOKEN e MISTRAL_API_KEY arrivano dall'env di Coolify:
+      # vuoto MEETING_TOKEN = nessuna auth.
+      - HOME=/data
+    ports:
+      - "8099:8099"
+    volumes:
+      # inbox/out, jobs.json, hooks.json, gli upload con --keep-audio
+      - meeting-data:/data
+      # la stessa directory dell'host che audio.cpp vede come /opt/audiocpp:
+      # meeting-transcribe ci scrive il WAV e audio.cpp lo apre dal suo mount
+      - /home/francesco/audio:/asr-share
+    command: >-
+      --dir /data --port 8099
+      --asr http://host.docker.internal:8090 --model moss-transcribe-diarize
+      --asr-mode audiocpp --asr-dir /asr-share --asr-remote-dir /opt/audiocpp
+      --keep-audio
+      --translate-url http://host.docker.internal:8731 --translate-model Qwen3.8-27B-GGUF
+      --live-asr http://host.docker.internal:8090 --live-model vibevoice_asr_streaming_7b_q8_0
+      --mt-gateway http://host.docker.internal:8080
+      --live-stream
+volumes:
+  meeting-data:
