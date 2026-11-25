@@ -1911,7 +1911,9 @@ class Live:
             "model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": content}],
-            "max_tokens": 1200, "temperature": 0,
+            # top_p rides along because a gateway in the middle can inject its
+            # own default, and Mistral refuses top_p != 1 with temperature 0.
+            "max_tokens": 1200, "temperature": 0, "top_p": 1,
             "stream": on_token is not None}
         if not model.startswith("mistral."):
             # A thinking model spends the budget on its reasoning first, and a
