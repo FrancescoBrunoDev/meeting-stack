@@ -1725,6 +1725,18 @@ class Live:
                 return row
         return None
 
+    def _mistral_provider(self) -> dict | None:
+        """The Mistral connection, whatever type the studio saved it as.
+
+        The UI creates it as the built-in 'mistral' type or as a generic
+        'custom' OpenAI-compatible endpoint - the base URL is the one thing
+        that identifies it either way.
+        """
+        for row in self._providers():
+            if "api.mistral.ai" in str(row.get("base_url") or ""):
+                return row
+        return self._provider_of("mistral")
+
     def models(self) -> list[dict]:
         """The translators this box actually has: Lemonade's, plus the cloud ones.
 
@@ -1789,13 +1801,15 @@ class Live:
         The studio's Mistral connection lists them when its key is set; the
         direct API still answers without one, but only what the picker shows.
         """
-        connection = (self._provider_of("mistral")
+        connection = (self._mistral_provider()
                       if self.unsloth_url and self.unsloth_key else None)
         if connection is not None:
+            # The saved catalog can hold ids a wrong fetch brought in (zai-,
+            # deepseek-): only the Mistral families are announced, and voxtral
+            # stays out - it is the transcriber, already in asr_models.
             return [{"id": f"mistral.{name}", "recipe": "mistral"}
                     for name in connection.get("models") or []
-                    # voxtral is the transcriber, already announced in asr_models
-                    if not name.startswith("voxtral-")]
+                    if name.startswith(("mistral-", "ministral-", "magistral-"))]
         if not self.mistral_key:
             return []
         try:
@@ -1937,7 +1951,7 @@ class Live:
         external = ""
         if self.unsloth_url and self.unsloth_key:
             if model.startswith("mistral."):
-                connection = self._provider_of("mistral")
+                connection = self._mistral_provider()
                 if connection is not None:
                     external = (f"external::{connection['id']}::"
                                 + urllib.parse.quote(model.removeprefix("mistral.")))
