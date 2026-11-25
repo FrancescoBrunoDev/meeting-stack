@@ -539,11 +539,20 @@ class Jobs:
     def queued(self) -> int:
         return self._queue.qsize()
 
-    def models(self, mistral_key: str = "") -> list[dict]:
-        """Batch transcription models: the configured local one, plus Mistral if a key is set."""
-        items = ([{"id": self.model,
-                   "recipe": "mistral" if is_mistral_asr(self.model) else "local"}]
-                 if self.model else [])
+    def models(self, mistral_key: str = "", unsloth_key: str = "") -> list[dict]:
+        """Batch transcription models: the configured one, plus the studio's
+        and Mistral's diarizers when their keys are set."""
+        if self.model and is_unsloth_asr(self.model):
+            recipe = "unsloth"
+        elif self.model and is_mistral_asr(self.model):
+            recipe = "mistral"
+        else:
+            recipe = "local"
+        items = [{"id": self.model, "recipe": recipe}] if self.model else []
+        if unsloth_key:
+            for name in UNSLOTH_BATCH_MODELS:
+                if name != self.model:
+                    items.append({"id": name, "recipe": "unsloth"})
         if mistral_key:
             for name in MISTRAL_BATCH_MODELS:
                 if name != self.model:
@@ -717,6 +726,12 @@ ISO_LANGS = {name.lower(): code for code, name in LANG_NAMES.items()}
 MISTRAL_HOST = "api.mistral.ai"
 MISTRAL_URL = f"https://{MISTRAL_HOST}"
 MISTRAL_BATCH_MODELS = ("voxtral-mini-transcribe-3", "voxtral-small-transcribe-3")
+UNSLOTH_BATCH_MODELS = ("unsloth.MOSS-Transcribe-Diarize",)
+
+
+def is_unsloth_asr(model: str) -> bool:
+    """The id names its provider: unsloth.* is the studio's transcribe workflow."""
+    return (model or "").startswith("unsloth.")
 MISTRAL_LIVE_MODELS = ("voxtral-mini-transcribe-realtime-3", *MISTRAL_BATCH_MODELS)
 AUDIOCPP_MODELS = {
     "vibevoice_asr_streaming_7b_q8_0": {
@@ -2087,7 +2102,8 @@ class Handler(BaseHTTPRequestHandler):
             key = getattr(self.server.live, "mistral_key", "")
             asr_models = (self.server.live.asr_models()
                           if hasattr(self.server.live, "asr_models") else [])
-            batch_models = (self.server.jobs.models(key)
+            batch_models = (self.server.jobs.models(
+                                key, os.environ.get("UNSLOTH_API_KEY", ""))
                             if hasattr(self.server.jobs, "models") else [])
             self._json(200, {"models": self.server.live.models(),
                              "default": self.server.live.translate_model,

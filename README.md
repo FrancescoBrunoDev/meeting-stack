@@ -372,6 +372,15 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
   with `diarize=true`; recordings longer than 34 minutes go in chunks. Needs
   `MISTRAL_API_KEY`. `mistral.voxtral-*` is the prefixed id the API and the
   dashboard speak.
+- An `unsloth.*` model (e.g. `unsloth.MOSS-Transcribe-Diarize`) — Unsloth
+  Studio's transcribe workflow on `$UNSLOTH_URL` (default `http://ubuntu:8888`)
+  with `$UNSLOTH_API_KEY`: the same audio.cpp diarizers, but the original file
+  travels as one raw upload (the studio decodes it — no normalization, no
+  shared directory) and the workflow accepts **up to 4 hours**, where
+  audio.cpp's own multipart receive segfaults past ~20 minutes. Measured: 43
+  minutes of audio in 10 minutes of wall time, speakers included. `--job-timeout`
+  (4 h) is the service-side cap for one job; the studio's own answer for a
+  longer recording is a clean 413, not a crash.
 - `--second FILE` — the microphone track of a two-track recording; see above.
   `--second-name` (default `Me`), `--second-offset`.
 - `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the

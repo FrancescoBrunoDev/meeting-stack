@@ -303,6 +303,83 @@ def is_mistral_asr(model: str) -> bool:
     return (model or "").removeprefix("mistral.").startswith("voxtral-")
 
 
+# The studio serves its models with full ids; the short names come from its
+# /v1/models listing.
+UNSLOTH_MODELS = {
+    "MOSS-Transcribe-Diarize": "audio-cpp/audio.cpp-gguf/MOSS-Transcribe-Diarize-GGUF",
+}
+
+
+def is_unsloth_asr(model: str) -> bool:
+    """The id names its provider: unsloth.* is the studio's transcribe workflow."""
+    return (model or "").startswith("unsloth.")
+
+
+def unsloth_studio_id(model: str) -> str:
+    rest = model.removeprefix("unsloth.")
+    return UNSLOTH_MODELS.get(rest, rest)
+
+
+def unsloth_answer_turns(answer: dict) -> list[dict]:
+    """The complete event's segments become turns; the speakers arrive as
+    'S01' ids, which number_speakers relabels in order of first appearance."""
+    turns = []
+    for segment in answer.get("segments") or []:
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(segment.get("start") or 0.0)
+        end = max(float(segment.get("end") or 0.0), start)
+        turns.append({"speaker": str(segment.get("speaker") or ""),
+                      "start": round(start, 2), "end": round(end, 2), "text": text})
+    return turns
+
+
+def transcribe_unsloth(url: str, key: str, source: Path, model: str,
+                       language: str | None, timeout: float) -> list[dict]:
+    """Unsloth Studio's transcribe workflow, which diarizes audio.cpp models itself.
+
+    Two requests: the original file as a raw upload (the studio decodes it, so
+    no 16 kHz normalization and no shared directory), then a transcription
+    named by id that answers as NDJSON - heartbeats, progress, one 'complete'.
+    The workflow takes up to 4 hours of audio, where audio.cpp's own multipart
+    receive segfaults past ~20 minutes (measured: 43 min in 10 min wall here).
+    """
+    if not key:
+        raise SystemExit("UNSLOTH_API_KEY is required for unsloth.* models")
+    base = url.rstrip("/")
+    request = urllib.request.Request(
+        f"{base}/v1/audio/inputs?name={urllib.parse.quote(source.name)}",
+        data=source.read_bytes(),
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        uploaded = json.loads(response.read())
+    body = {"source": {"input_id": uploaded["id"]},
+            "model": unsloth_studio_id(model), "speakers": True}
+    if language:
+        body["language"] = language
+    request = urllib.request.Request(
+        f"{base}/api/inference/audio/transcribe/source",
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    # Heartbeats every few seconds keep the read alive; timeout is per call.
+    phase = ""
+    with urllib.request.urlopen(request, timeout=60) as response:
+        for line in response:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "complete":
+                return unsloth_answer_turns(event)
+            if event.get("type") == "progress" and event.get("phase") != phase:
+                phase = str(event.get("phase"))
+                print(f"unsloth studio: {phase}", file=sys.stderr)
+    raise SystemExit("the unsloth studio closed the stream without completing")
+
+
 def transcribe_mistral(url: str, audio: Path, model: str, language: str | None,
                        hotwords: str, key: str, timeout: float,
                        attempts: int = ATTEMPTS) -> list[dict]:
@@ -398,6 +475,23 @@ def mistral_turns(args, source: Path, workdir: Path, hotwords: str,
     # Mistral hands out speaker_1, speaker_2, ... per request; number_speakers()
     # downstream relabels them 1..N in order of first appearance, which is what
     # the rest of the pipeline expects.
+    return number_speakers(turns)
+
+
+def unsloth_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dict]:
+    """Diarize+transcribe through the studio's workflow: no normalization
+    (it decodes the upload itself), no shared directory, up to 4 hours."""
+    base = (getattr(args, "unsloth_url", "")
+            or os.environ.get("UNSLOTH_URL", "http://ubuntu:8888")).rstrip("/")
+    key = getattr(args, "unsloth_key", "") or os.environ.get("UNSLOTH_API_KEY", "")
+    turns = transcribe_unsloth(base, key, source, args.model,
+                               args.language, args.asr_timeout)
+    if not turns:
+        if lenient:
+            return []
+        raise SystemExit("ASR returned no turns")
+    print(f"asr: {len(turns)} diarized segments from the unsloth studio",
+          file=sys.stderr)
     return number_speakers(turns)
 
 
@@ -643,6 +737,8 @@ def track_turns(args, source: Path, workdir: Path, hotwords: str,
     workdir.mkdir(parents=True, exist_ok=True)
     if is_mistral_asr(args.model):
         return mistral_turns(args, source, workdir, hotwords, lenient)
+    if is_unsloth_asr(args.model):
+        return unsloth_turns(args, source, workdir, lenient)
     return audiocpp_turns(args, source, workdir, lenient)
 
 
@@ -662,6 +758,11 @@ def main() -> None:
     parser.add_argument("--asr-remote-dir", default=None,
                         help="how --asr-dir is seen by the ASR server, when the two differ "
                              "(default: the same path)")
+    parser.add_argument("--unsloth-url", default=os.environ.get("UNSLOTH_URL", "http://ubuntu:8888"),
+                        help="Unsloth Studio base URL, for unsloth.* models "
+                             "(default $UNSLOTH_URL or http://ubuntu:8888)")
+    parser.add_argument("--unsloth-key", default=os.environ.get("UNSLOTH_API_KEY", ""),
+                        help="Unsloth Studio API key (default $UNSLOTH_API_KEY)")
     parser.add_argument("--mistral-url", default=MISTRAL_URL,
                         help=f"Mistral API base URL (default {MISTRAL_URL})")
     parser.add_argument("--mistral-key", default=os.environ.get("MISTRAL_API_KEY", ""),

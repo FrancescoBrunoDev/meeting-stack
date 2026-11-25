@@ -1242,6 +1242,27 @@ class LiveLines(unittest.TestCase):
             {"speaker": "speaker_2", "start": 2.8, "end": 3.9, "text": "Guten Morgen."},
         ])
 
+    def test_unsloth_asr_route_and_answer(self):
+        # routing: the prefix is the provider
+        self.assertTrue(meeting.is_unsloth_asr("unsloth.MOSS-Transcribe-Diarize"))
+        self.assertFalse(meeting.is_unsloth_asr("moss-transcribe-diarize"))
+        # the studio id: a short name rides the map, an id with slashes passes
+        self.assertEqual(meeting.unsloth_studio_id("unsloth.MOSS-Transcribe-Diarize"),
+                         "audio-cpp/audio.cpp-gguf/MOSS-Transcribe-Diarize-GGUF")
+        self.assertEqual(meeting.unsloth_studio_id("unsloth.audio-cpp/x/y.z"),
+                         "audio-cpp/x/y.z")
+        # the complete event's segments become turns, in order, S02 kept
+        answer = {"type": "complete", "segments": [
+            {"start": 1.62, "end": 2.52, "text": "Hallo zusammen. ", "speaker": "S01"},
+            {"start": 3.0, "end": None, "text": "", "speaker": "S02"},
+            {"start": 3.1, "end": 4.0, "text": "Morgen.", "speaker": "S02"},
+        ]}
+        self.assertEqual(meeting.unsloth_answer_turns(answer), [
+            {"speaker": "S01", "start": 1.62, "end": 2.52, "text": "Hallo zusammen."},
+            {"speaker": "S02", "start": 3.1, "end": 4.0, "text": "Morgen."},
+        ])
+        self.assertEqual(meeting.number_speakers(meeting.unsloth_answer_turns(answer))[1]["speaker"], 2)
+
     def test_unsloth_model_id_rides_the_namespace(self):
         self.assertEqual(meeting_job.unsloth_model_id("unsloth.Hy-MT2-7B-GGUF"),
                          "unsloth/Hy-MT2-7B-GGUF")

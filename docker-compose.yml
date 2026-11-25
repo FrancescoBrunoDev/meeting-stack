@@ -22,8 +22,9 @@
 #                       (mistral.voxtral-small-transcribe-3; an audio.cpp model
 #                       travels as an upload from here, and the server
 #                       SEGFAULTS past ~20 minutes of recording - the pipeline
-#                       refuses it. Mount a shared --asr-dir to go back to the
-#                       path mode for any length)
+#                       refuses it. unsloth.MOSS-Transcribe-Diarize - the same
+#                       diarizer through Unsloth Studio's workflow, with
+#                       UNSLOTH_API_KEY - takes up to 4 hours of upload)
 #     LIVE_MODEL        the live session model (vibevoice_asr_streaming_7b_q8_0)
 #     TRANSLATE_MODEL   the default translator (unsloth.Hy-MT2-7B-GGUF:
 #                       a translation-specialised 7B on Unsloth Studio,
