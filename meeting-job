@@ -1717,7 +1717,29 @@ class Live:
                       if isinstance(model, dict) and "chat" in (model.get("labels") or [])]
         except Exception:
             pass
-        return items + self._mistral_translators() + self._opencode_translators()
+        return (items + self._mistral_translators() + self._unsloth_translators()
+                + self._opencode_translators())
+
+    def _unsloth_translators(self) -> list[dict]:
+        """The studio's translation models as "unsloth.<id>", when its key is set.
+
+        Fetched, not hardcoded: only what the studio actually serves appears in
+        the page. The family carries MT in its name (Hy-MT2-7B-GGUF today).
+        """
+        if not self.unsloth_key or not self.unsloth_url:
+            return []
+        try:
+            request = urllib.request.Request(
+                f"{self.unsloth_url}/v1/models",
+                headers={"Authorization": f"Bearer {self.unsloth_key}"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                answer = json.loads(response.read())
+            return [{"id": f"unsloth.{model.get('id', '').rsplit('/', 1)[-1]}",
+                     "recipe": "unsloth"}
+                    for model in answer.get("data") or []
+                    if "MT" in str(model.get("id") or "")]
+        except Exception:
+            return []
 
     def _mistral_translators(self) -> list[dict]:
         """Mistral's chat models as "mistral.<id>", when MISTRAL_API_KEY is set."""
