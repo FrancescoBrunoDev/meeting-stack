@@ -344,12 +344,16 @@ request the budget — and `--live-silence` is the pause that ends a line
 
 `--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
 the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
-is where the LLM lives. A model is routed by its prefix: `unsloth.<id>` goes to
-Unsloth Studio's OpenAI-compatible API (`UNSLOTH_URL`, default
-`http://ubuntu:8888`, with `UNSLOTH_API_KEY`) — measured live, its
-translation-specialised `unsloth.Hy-MT2-7B-GGUF` answers a line in ~0.3 s
-where the 27B via Lemonade takes ~0.6 s — and `mistral.<id>`/`opencode.<id>`
-go where their names say (the Mistral API, the `--mt-gateway`).
+is where the LLM lives. The studio is **the** model gateway: its saved
+connections carry the cloud keys (Mistral, OpenCode Go) and the Lemonade
+models, so `unsloth.<id>` reaches its own and the studio-named Lemonade
+models (`external::<connection>::<model>`), and `mistral.<id>`/`opencode.<id>`
+ride the studio's connections as `external::` ids too — one URL and one key
+(`UNSLOTH_URL`, default `http://ubuntu:8888`, `UNSLOTH_API_KEY`). Measured
+live, its translation-specialised `unsloth.Hy-MT2-7B-GGUF` answers a line in
+~0.3 s where the 27B needs ~0.6 s+. The direct paths (Lemonade at
+`--translate-url`, Mistral's API, `--mt-gateway`) survive only for a
+deployment with no studio at all.
 `--live-idle 120` closes a session that stopped sending
 audio, `--live-glossary`, `--live-silence` (0.5 splits more, 1.2 merges more).
 ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with

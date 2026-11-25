@@ -778,9 +778,12 @@ def iso_language(language: str | None) -> str:
 
 def unsloth_model_id(model: str) -> str:
     # The studio serves its models namespaced ("unsloth/Hy-MT2-7B-GGUF");
-    # an id that carries its own namespace passes through untouched.
+    # an id that carries its own namespace passes through untouched. A
+    # "external::<connection>::<model>" id is a studio connection, already whole.
     rest = model.removeprefix("unsloth.")
-    return rest if "/" in rest else f"unsloth/{rest}"
+    if rest.startswith("external::") or "/" in rest:
+        return rest
+    return f"unsloth/{rest}"
 
 
 def is_mistral_asr(model: str) -> bool:
@@ -1652,6 +1655,8 @@ class Live:
         # deltas grow the line while the speaker is still talking.
         self.stream_asr = stream_asr
         self.mistral_key = mistral_key or os.environ.get("MISTRAL_API_KEY", "")
+        # The studio's saved connections (the cloud keys live in it), once.
+        self._provider_cache: list | None = None
         # Unsloth Studio serves its translators behind an OpenAI-compatible
         # API and a key: "unsloth.<model>" routes there (env, like Mistral).
         self.unsloth_url = (unsloth_url
@@ -1695,6 +1700,31 @@ class Live:
                     items.append({"id": name, "recipe": "mistral"})
         return items
 
+    def _providers(self) -> list[dict]:
+        """The studio's saved connections, looked up once per process.
+
+        The studio is the one gateway: its connections carry the cloud keys
+        (the local Lemonade, Mistral, OpenCode Go), and every model addressed
+        as "external::<connection id>::<model>" rides the studio's
+        OpenAI-compatible endpoint - one URL and one key for all of them.
+        """
+        if self._provider_cache is None:
+            try:
+                request = urllib.request.Request(
+                    f"{self.unsloth_url}/api/providers/",
+                    headers={"Authorization": f"Bearer {self.unsloth_key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    self._provider_cache = json.loads(response.read())
+            except Exception:
+                self._provider_cache = []
+        return self._provider_cache
+
+    def _provider_of(self, provider_type: str) -> dict | None:
+        for row in self._providers():
+            if row.get("provider_type") == provider_type:
+                return row
+        return None
+
     def models(self) -> list[dict]:
         """The translators this box actually has: Lemonade's, plus the cloud ones.
 
@@ -1707,14 +1737,26 @@ class Live:
         ("mistral.ministral-8b-latest", "opencode.opencode-go/model_1"), which is
         also how translate() routes it — away from --translate-url.
         """
+        # The studio is the gateway for the local models too: what Lemonade
+        # serves is one of its connections, so every id rides the studio
+        # endpoint as external::<connection>::<model> - the chat label it
+        # filters by still only Lemonade knows, so the CATALOG is read there.
+        # Without a studio the bare ids stay, aimed straight at --translate-url.
+        connection = (self._provider_of("llama_cpp")
+                      if self.unsloth_url and self.unsloth_key else None)
         items: list[dict] = []
         try:
             with urllib.request.urlopen(f"{self.llm}/api/v1/models", timeout=10) as response:
                 answer = json.loads(response.read())
             found = answer.get("data") or answer.get("models") or []
-            items += [{"id": model.get("id"), "recipe": model.get("recipe")}
-                      for model in found
-                      if isinstance(model, dict) and "chat" in (model.get("labels") or [])]
+            for model in found:
+                if not (isinstance(model, dict) and "chat" in (model.get("labels") or [])):
+                    continue
+                if connection is not None:
+                    items.append({"id": (f"unsloth.external::{connection['id']}::"
+                                         f"{model.get('id')}"), "recipe": "unsloth"})
+                else:
+                    items.append({"id": model.get("id"), "recipe": model.get("recipe")})
         except Exception:
             pass
         return (items + self._mistral_translators() + self._unsloth_translators()
@@ -1742,7 +1784,18 @@ class Live:
             return []
 
     def _mistral_translators(self) -> list[dict]:
-        """Mistral's chat models as "mistral.<id>", when MISTRAL_API_KEY is set."""
+        """Mistral's chat models as "mistral.<id>".
+
+        The studio's Mistral connection lists them when its key is set; the
+        direct API still answers without one, but only what the picker shows.
+        """
+        connection = (self._provider_of("mistral")
+                      if self.unsloth_url and self.unsloth_key else None)
+        if connection is not None:
+            return [{"id": f"mistral.{name}", "recipe": "mistral"}
+                    for name in connection.get("models") or []
+                    # voxtral is the transcriber, already announced in asr_models
+                    if not name.startswith("voxtral-")]
         if not self.mistral_key:
             return []
         try:
@@ -1763,7 +1816,16 @@ class Live:
                 and not str(model.get("id") or "").startswith("voxtral-")]
 
     def _opencode_translators(self) -> list[dict]:
-        """The gateway's opencode models as "opencode.<id>", when --mt-gateway is set."""
+        """The OpenCode models as "opencode.<id>".
+
+        The studio's connection lists them when its key is set; --mt-gateway
+        answers without one, but only what the picker shows.
+        """
+        connection = (self._provider_of("opencode_go")
+                      if self.unsloth_url and self.unsloth_key else None)
+        if connection is not None:
+            return [{"id": f"opencode.{name}", "recipe": "opencode"}
+                    for name in connection.get("models") or []]
         if not self.gateway:
             return []
         try:
@@ -1869,7 +1931,26 @@ class Live:
         model = str(payload.get("model") or "")
         headers = {"Content-Type": "application/json",
                    "x-opencode-session": self.session}
-        if model.startswith("mistral."):
+        # The studio is the gateway: a cloud model rides its saved connection
+        # (external::<id>::<model>) when there is one; the direct paths stay
+        # only for a deployment that has no studio at all.
+        external = ""
+        if self.unsloth_url and self.unsloth_key:
+            if model.startswith("mistral."):
+                connection = self._provider_of("mistral")
+                if connection is not None:
+                    external = (f"external::{connection['id']}::"
+                                + urllib.parse.quote(model.removeprefix("mistral.")))
+            elif model.startswith("opencode."):
+                connection = self._provider_of("opencode_go")
+                if connection is not None:
+                    external = (f"external::{connection['id']}::"
+                                + urllib.parse.quote(model.removeprefix("opencode.")))
+        if external:
+            url = f"{self.unsloth_url}/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {self.unsloth_key}"
+            payload = dict(payload, model=external)
+        elif model.startswith("mistral."):
             if not self.mistral_key:
                 raise ValueError("MISTRAL_API_KEY is not set")
             url = f"{MISTRAL_URL}/v1/chat/completions"

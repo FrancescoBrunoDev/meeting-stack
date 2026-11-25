@@ -16,8 +16,6 @@
 #   Optional env (with defaults):
 #     MEETING_PORT      the service's port (8099)
 #     AUDIOCPP_PORT     audio.cpp (8090)
-#     LEMONADE_PORT     Lemonade, the local translator (8731)
-#     BIFROST_PORT      the cloud-translator gateway (8080)
 #     BATCH_MODEL       the default transcription model
 #                       (mistral.voxtral-small-transcribe-3; an audio.cpp model
 #                       travels as an upload from here, and the server
@@ -26,6 +24,11 @@
 #                       diarizer through Unsloth Studio's workflow, with
 #                       UNSLOTH_API_KEY - takes up to 4 hours of upload)
 #     LIVE_MODEL        the live session model (vibevoice_asr_streaming_7b_q8_0)
+#     UNSLOTH_API_KEY   also the model gateway: its studio connections carry
+#                       the cloud keys (Mistral, OpenCode Go) and the Lemonade
+#                       models - with it set, translators of every group route
+#                       through the studio and Lemonade/Bifrost are no longer
+#                       addressed directly
 #     TRANSLATE_MODEL   the default translator (unsloth.Hy-MT2-7B-GGUF:
 #                       a translation-specialised 7B on Unsloth Studio,
 #                       ~0.3s a line against ~0.6s+ for the 27B via Lemonade;
@@ -62,9 +65,7 @@ services:
       --port ${MEETING_PORT:-8099}
       --asr http://${UBUNTU_HOST}:${AUDIOCPP_PORT:-8090}
       --model ${BATCH_MODEL:-mistral.voxtral-small-transcribe-3}
-      --translate-url http://${UBUNTU_HOST}:${LEMONADE_PORT:-8731}
       --translate-model ${TRANSLATE_MODEL:-unsloth.Hy-MT2-7B-GGUF}
       --live-model ${LIVE_MODEL:-vibevoice_asr_streaming_7b_q8_0}
-      --mt-gateway http://${UBUNTU_HOST}:${BIFROST_PORT:-8080}
 volumes:
   meeting-data:
