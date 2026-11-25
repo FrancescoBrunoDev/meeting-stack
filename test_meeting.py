@@ -1242,6 +1242,12 @@ class LiveLines(unittest.TestCase):
             {"speaker": "speaker_2", "start": 2.8, "end": 3.9, "text": "Guten Morgen."},
         ])
 
+    def test_unsloth_model_id_rides_the_namespace(self):
+        self.assertEqual(meeting_job.unsloth_model_id("unsloth.Hy-MT2-7B-GGUF"),
+                         "unsloth/Hy-MT2-7B-GGUF")
+        self.assertEqual(meeting_job.unsloth_model_id("unsloth.Qwen/Qwen3-4B-GGUF"),
+                         "Qwen/Qwen3-4B-GGUF")
+
     def test_mistral_translator_omits_extra_fields_that_cause_422(self):
         sent = {}
         with tempfile.TemporaryDirectory() as tmp:

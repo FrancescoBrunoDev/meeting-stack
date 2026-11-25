@@ -761,6 +761,13 @@ def iso_language(language: str | None) -> str:
     return ISO_LANGS.get(raw, "")
 
 
+def unsloth_model_id(model: str) -> str:
+    # The studio serves its models namespaced ("unsloth/Hy-MT2-7B-GGUF");
+    # an id that carries its own namespace passes through untouched.
+    rest = model.removeprefix("unsloth.")
+    return rest if "/" in rest else f"unsloth/{rest}"
+
+
 def is_mistral_asr(model: str) -> bool:
     """The model id names its provider: voxtral-* is Mistral, anything else audio.cpp."""
     return (model or "").removeprefix("mistral.").startswith("voxtral-")
@@ -1619,7 +1626,8 @@ class Live:
                  idle: float = 120, glossary: str = "",
                  silence: float = LIVE_LINE, live_asr: str = "",
                  live_model: str = "", stream_asr: bool = True,
-                 mt_gateway: str = "", mistral_key: str = "") -> None:
+                 mt_gateway: str = "", mistral_key: str = "",
+                 unsloth_url: str = "", unsloth_key: str = "") -> None:
         # The live path can use its own endpoint: a clip every half second makes
         # the fixed cost of a request the whole budget, and the jobs keep their
         # own choice.
@@ -1629,6 +1637,11 @@ class Live:
         # deltas grow the line while the speaker is still talking.
         self.stream_asr = stream_asr
         self.mistral_key = mistral_key or os.environ.get("MISTRAL_API_KEY", "")
+        # Unsloth Studio serves its translators behind an OpenAI-compatible
+        # API and a key: "unsloth.<model>" routes there (env, like Mistral).
+        self.unsloth_url = (unsloth_url
+                            or os.environ.get("UNSLOTH_URL", "")).rstrip("/")
+        self.unsloth_key = unsloth_key or os.environ.get("UNSLOTH_API_KEY", "")
         self.llm = llm.rstrip("/")
         # The gateway that serves the cloud translators (Bifrost on :8080): its
         # opencode models are announced as "opencode.<id>" and routed back to it.
@@ -1806,7 +1819,8 @@ class Live:
             # shows. Nothing was streamed yet, so trying again is safe. Only for
             # the local endpoint — a provider-prefixed model is routed elsewhere.
             if error.code != 404 or model.startswith(("user.", "builtin.",
-                                                     "mistral.", "opencode.")):
+                                                     "mistral.", "opencode.",
+                                                     "unsloth.")):
                 raise
             payload["model"] = f"user.{model}"
             return self._ask(payload, on_token)
@@ -1824,6 +1838,14 @@ class Live:
             url = f"{MISTRAL_URL}/v1/chat/completions"
             headers["Authorization"] = f"Bearer {self.mistral_key}"
             payload = dict(payload, model=model.removeprefix("mistral."))
+        elif model.startswith("unsloth."):
+            if not self.unsloth_key:
+                raise ValueError("UNSLOTH_API_KEY is not set")
+            if not self.unsloth_url:
+                raise ValueError("no UNSLOTH_URL configured for unsloth.* models")
+            url = f"{self.unsloth_url}/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {self.unsloth_key}"
+            payload = dict(payload, model=unsloth_model_id(model))
         elif model.startswith("opencode."):
             if not self.gateway:
                 raise ValueError("no --mt-gateway configured for opencode.* models")
