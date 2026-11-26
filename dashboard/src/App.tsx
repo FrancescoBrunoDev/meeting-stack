@@ -56,7 +56,6 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { cn } from "@/lib/utils"
-import Live from "@/Live"
 
 type ArchiveState = {
   state: "off" | "pending" | "archived" | "failed"
@@ -315,32 +314,21 @@ function ArchiveDetail({ archive }: { archive: ArchiveState }) {
 }
 
 export default function App() {
-  // Two views, two pages, one bundle: a full page load between them keeps the
-  // state honest (a live session must not survive a trip to the job list).
-  const live = /\/live\/?$/.test(location.pathname)
   return (
     <div className="min-h-svh bg-background text-foreground">
-      <TopBar live={live} />
-      {live ? <Live /> : <Jobs />}
+      <TopBar />
+      <Jobs />
     </div>
   )
 }
 
-function TopBar({ live }: { live: boolean }) {
+function TopBar() {
   return (
     <header className="sticky top-0 z-20 border-b bg-background/95 backdrop-blur">
       <div className="mx-auto flex w-full max-w-5xl items-center gap-3 px-4 py-2.5">
         <a href="/" className="flex items-center" aria-label="Eco-Remote" title="Eco-Remote">
           <img src={ecoIcon} alt="" className="size-7 rounded" />
         </a>
-        <nav className="flex items-center gap-1" aria-label="Views">
-          <Button asChild variant={live ? "ghost" : "secondary"} size="sm">
-            <a href="/">Transcripts</a>
-          </Button>
-          <Button asChild variant={live ? "secondary" : "ghost"} size="sm">
-            <a href="/live">Live</a>
-          </Button>
-        </nav>
         <div className="ml-auto">
           <ThemeToggle />
         </div>

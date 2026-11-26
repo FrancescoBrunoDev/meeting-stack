@@ -11,7 +11,7 @@ export default defineConfig({
   // `npm run dev` talks to the running service instead of needing a build.
   server: {
     proxy: Object.fromEntries(
-      ["/jobs", "/health", "/mcp", "/live"].map((p) => [p, "http://127.0.0.1:8099"])
+      ["/jobs", "/health", "/mcp"].map((p) => [p, "http://127.0.0.1:8099"])
     ),
   },
 })

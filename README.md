@@ -1,10 +1,10 @@
 # Eco-Remote
 
 Diarized transcripts of long meetings. The inference (Unsloth Studio, audio.cpp,
-Mistral, Lemonade) lives on a GPU box; the service is one plain container that
-deploys anywhere that can reach it.
+Mistral) lives on a GPU box; the service is one plain container that deploys
+anywhere that can reach it.
 
-Two tools, a service and a web page.
+The worker, the evaluator, the service and a web page.
 
 - **`meeting-transcribe`** — one audio file in, a speaker-labelled transcript out
   (`PREFIX.md` + `PREFIX.json`).
@@ -13,11 +13,8 @@ Two tools, a service and a web page.
   `meeting_result`.
 - **`meeting-eval`** — score a transcript against a reference before changing the
   pipeline.
-- **`GET /live`** — a second view of the same dashboard: stream audio from the
-  browser and read the translation as it arrives (see
-  [Live](#live-audio-in-a-translated-line-out)).
 - **`dashboard.html`** — the web UI `meeting-job` serves at `/` (and `/ui`):
-  upload with a progress bar, live job list, and the transcript in a dialog next
+  upload with a progress bar, the job list, and the transcript in a dialog next
   to an audio player — Text (paragraphs per speaker) or Segments (one timestamped
   line each), the sentence being spoken is highlighted and followed while it
   plays, and clicking a line seeks there. Built from `dashboard/`, one
@@ -59,7 +56,7 @@ audio.cpp path, 30365 prompt tokens. The `max_tokens` cap has to be generous
 (65536) and it must travel under `"options"` — at 24000 the model stops with
 `reached max_tokens before EOS` and the transcript is *lost*, not truncated.
 
-The HTTP API (batch jobs, live sessions, MCP) is written up in
+The HTTP API (batch jobs and MCP) is written up in
 [API.md](API.md), which is the file to hand to anything that has to talk to this
 service.
 
@@ -69,11 +66,9 @@ service.
   `http://ubuntu:8888`, serving `MOSS-Transcribe-Diarize`, with its API key in
   `UNSLOTH_API_KEY` (default batch path)
 - [audio.cpp](https://github.com/ggml-org/audio.cpp) on `http://ubuntu:8090`
-  for the live transcriber and the direct `moss-transcribe-diarize` fallback;
-  that fallback needs a directory it can read the normalized WAV from
-  (`--asr-dir`): it takes a path, not an upload
-- `MISTRAL_API_KEY` for the cloud path (batch `mistral.voxtral-*`, the cloud
-  translators, live realtime)
+  for the direct `moss-transcribe-diarize` fallback; it needs a directory it can
+  read the normalized WAV from (`--asr-dir`): it takes a path, not an upload
+- `MISTRAL_API_KEY` for the cloud path (batch `mistral.voxtral-*`)
 - **podman or docker** for the service container, **ffmpeg** for the
   normalization on the audio.cpp/Mistral paths
 
@@ -97,8 +92,7 @@ differ (audio.cpp running in its own container: host `~/audio`, server
 
 The service and the dashboard run in one container - a plain one now: no
 podman socket, no device mounts, no nested containers. All inference is reached
-over HTTP (audio.cpp, Mistral, Lemonade for the translations, the Bifrost
-gateway).
+over HTTP (audio.cpp, Unsloth Studio, Mistral).
 
 The deployment is `docker-compose.yml`: it builds the image and runs it with
 the config in `.env`.
@@ -117,10 +111,9 @@ and the `command` from the compose file.
 `docker-compose.yml` deploys the same image on any docker/podman host — e.g. a
 Coolify server in the same LAN as this box. Every deploy choice is an
 environment variable: `MEETING_TOKEN`, `MISTRAL_API_KEY`, `UNSLOTH_API_KEY` and
-`UBUNTU_HOST` (the LAN address of this box; audio.cpp `:8090`, Unsloth Studio
-`:8888`, Lemonade `:8731` and Bifrost `:8080` all hang off it) must be set, the
-rest — `MEETING_PORT`, `AUDIOCPP/LEMONADE/BIFROST_PORT`,
-`BATCH/LIVE/TRANSLATE_MODEL` — carries a default in the file. Batch defaults to
+`UBUNTU_HOST` (the LAN address of this box; audio.cpp `:8090` and Unsloth
+Studio `:8888` hang off it) must be set, the rest — `MEETING_PORT`,
+`AUDIOCPP_PORT`, `BATCH_MODEL` — carries a default in the file. Batch defaults to
 `unsloth.MOSS-Transcribe-Diarize`, which needs only the studio's key. A bare
 audio.cpp model from another machine travels as a multipart upload, and the
 server **segfaults past ~20 minutes of recording** (measured: 11 min whole, 43
@@ -131,10 +124,9 @@ history survive redeploys. WebDAV is optional: copy `.env.example` to `.env` and
 fill `WEBDAV_URL`, `WEBDAV_USER` and `WEBDAV_PASSWORD` (see [Archive](#archive-webdav--sqlite));
 without it the ledger still records every upload, no copy is made.
 
-That is the live deployment today: Coolify on `raspberrypi2:8099`, with
+That is the deployment today: Coolify on `raspberrypi2:8099`, with
 `tailscale serve --bg --https=443 8099` over it — so the same service answers
-at `https://raspberrypi2.tail4050b0.ts.net/`, which is also the easiest secure
-context for the live page's `getUserMedia`. Without `--bg` the serve runs in
+at `https://raspberrypi2.tail4050b0.ts.net/`. Without `--bg` the serve runs in
 the foreground and a `Ctrl+C` removes it. If the port ever changes, redo the
 serve with the new one.
 
@@ -239,144 +231,12 @@ cd dashboard && npm install      # once
 npm run build                    # -> ../dashboard.html (one inlined file)
 ```
 
-The same bundle answers `GET /live` with the live view (`dashboard/src/Live.tsx`):
-`App` picks it from the path, the header links the two, and a full page load
-between them keeps the state honest. The live page used to be a hand-written
-`live.html` — it now uses the same components, so there is one design system and
-one build.
-
 Source lives in `dashboard/src`; the components in `dashboard/src/components/ui`
 are the unmodified shadcn registry files (new-york, neutral theme). The bearer
 token goes in the field at the bottom of the upload card and stays in
 `localStorage`. Opening a finished job shows the recording in a native player
 above the transcript; the line being spoken is highlighted and scrolled into
 view, and clicking any line seeks to its timestamp.
-
-## Live: audio in, a translated line out
-
-The same service also answers a live stream at `GET /live` (the page) and
-`POST /live/<session>/audio` (16 kHz mono PCM16, raw body). The page captures the
-microphone, or the tab's audio, and shows two columns: what was said and its
-translation.
-
-```sh
-# the page posts one chunk every half second; here the same thing from a file
-ffmpeg -v error -i meeting.wav -f s16le -ar 16000 -ac 1 - | split -b 16000 - /tmp/live-
-for part in /tmp/live-*; do
-  curl -s --data-binary @$part \
-    "http://box:8099/live/demo/audio?language=de&to=it" -H "Authorization: Bearer $TOKEN"
-  sleep 0.5
-done
-curl -H "Authorization: Bearer $TOKEN" "http://box:8099/live/demo?since=0"
-curl -X POST -H "Authorization: Bearer $TOKEN" http://box:8099/live/demo/close
-```
-
-This is not a streaming ASR. A pause of 0.3 s ends an utterance, the utterance
-goes to the ASR endpoint as one clip. The ASR punctuates every clip as if it
-were a sentence, so its full stops are ignored: the line ends where the speaker
-paused for real, 0.8 s (`--live-silence`), which is what keeps "…gibt es mehr
-Gewalt." and "und Fehlverhalten als bislang bekannt." in one line instead of two
-translated fragments. The line is then translated by an LLM (named in the
-prompt: a bare ISO code is read as an English word) and, if the model answers
-nothing at all, retried once without the context and then reported instead of
-sitting on "…".
-Semi-batch on purpose: a whole utterance is what keeps the words the ASR
-needs, and one is cheap. Measured on this box: 0.59 s to translate a line with
-`Qwen3.8-27B-GGUF` (0.45 s of
-generation at 35.7 tok/s, the rest prompt), and on the page the source line
-appears at 3.4 s, the translation **starts 0.3 s later and completes 0.6 s
-later** — the tokens are streamed into the row, so nothing waits for the whole
-sentence to be translated. A line that never finds a pause is translated anyway
-after 500 characters or 10 s. A speaker who does not pause for 20 s is cut anyway,
-at the quietest frame.
-
-While a stretch of speech has not reached a pause yet, the page says how many
-seconds are held back (`2.8 s in attesa di una pausa`), then `trascrivo…` and
-`traduco…`, and a level bar moves with the microphone: a transcript that stays
-empty for ten seconds is supposed to look busy, not broken.
-
-The transcript shows the last three lines — the newest full, the ones above it
-stepping back (opacities 1, 0.86, 0.72) — and **Expand** opens the whole thing,
-scrollable with a snap and following the newest line unless you have scrolled up
-to read.
-
-The two lines before the current one go back to the model **as source and
-translation pairs** (`Wir müssen… -> Dobbiamo…`), so the wording of the line
-continues the wording already on screen. `--live-glossary "Candido,BSB,Zoom"`
-adds names and terms the translation must leave untouched.
-
-What it is not:
-
-- **No speaker labels.** Neither the local nor the cloud live ASR runs the
-  online clustering that would attribute the lines; the batch transcript is
-  still the labelled truth, so a live session is a preview.
-- **The microphone needs a secure context.** `getUserMedia` is refused on plain
-  `http://` to another host: open the page as `http://127.0.0.1:8099/live` on the
-  box, or behind https — on the tailnet, `tailscale serve --bg --https=443 8099`
-  gives the page one for free. Tab audio (`getDisplayMedia`) needs the same.
-- **System audio depends on the engine, not the OS.** Chrome never gives audio
-  from a *window*: share a **tab** (only the browser's own sound) or, from Chrome
-  141 on macOS, the **entire screen** with "Condividi l'audio di sistema". Firefox
-  — and Zen, which is Firefox — has **no audio at all** in `getDisplayMedia`
-  (bugzilla 1541425, still open), so the share dialog is a dead end there. The
-  path that always works is a virtual input device picked as the microphone:
-  BlackHole 2ch on macOS (route the output through it, a Multi-Output Device keeps
-  it audible), a PipeWire/Pulse loopback on Linux. Untick "filtri voce" for it:
-  noise suppression eats the quiet half of the other person's voice. The input
-  list only fills once the page has the microphone permission.
-
-### Feeding it without a browser
-
-`live-feed` is the same API as a script: ffmpeg reads the input (a file, or a
-device) and the tool posts half-second chunks, printing each line with its
-translation as it lands. That is the way in on macOS with Zen or Firefox, which
-have no audio in `getDisplayMedia`, and for a call in a native app:
-
-```sh
-# macOS, the system audio of a Zoom/Teams call through BlackHole
-./live-feed --url http://box:8099 --token "$TOKEN" --language de --to it \
-    --input "avfoundation::BlackHole 2ch"
-
-# Linux, the monitor of the speakers (pactl list short sources | grep monitor)
-./live-feed --language de --to it --input "pulse:alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
-
-# a recording, replayed at realtime speed into the live path
-./live-feed --language de --to it --input meeting.m4a
-```
-
-The endpoint contract, if you write your own client: `POST /live/<id>/audio`
-with raw **16 kHz mono PCM16** (half a second at a time is plenty, `?language=de&to=it`
-on the first one), `GET /live/<id>?since=<cursor>` until `done` is true, then
-`POST /live/<id>/close`. The token goes in the `Authorization` header; the first
-chunk creates the session. Every
-row carries `i` (its index), `src`, `mt`, `done`, and `error` when it did not
-work; `state` and `buffered` describe what the worker is doing meanwhile.
-
-The page remembers what you chose — spoken language, target, input device, voice
-filters, and whether the transcript was expanded — in `localStorage` under
-`live-*`, so the next meeting starts where the last one ended. A remembered
-device that has since been unplugged is dropped rather than failing to open.
-Flags for the live path: `--live-asr`/`--live-model` point it at a faster
-endpoint than the jobs use — a clip every half second makes the fixed cost of a
-request the budget — and `--live-silence` is the pause that ends a line
-(0.8 s; clips are cut at 0.6 s).
-
-`--translate-model Qwen3.8-27B-GGUF` turns translation on (empty serves
-the transcript alone), `--translate-url` (default Lemonade on `127.0.0.1:8731`)
-is where the LLM lives. The studio is **the** model gateway: its saved
-connections carry the cloud keys (Mistral, OpenCode Go) and the Lemonade
-models, so `unsloth.<id>` reaches its own and the studio-named Lemonade
-models (`external::<connection>::<model>`), and `mistral.<id>`/`opencode.<id>`
-ride the studio's connections as `external::` ids too — one URL and one key
-(`UNSLOTH_URL`, default `http://ubuntu:8888`, `UNSLOTH_API_KEY`). Measured
-live, its translation-specialised `unsloth.Hy-MT2-7B-GGUF` answers a line in
-~0.3 s where the 27B needs ~0.6 s+. The direct paths (Lemonade at
-`--translate-url`, Mistral's API, `--mt-gateway`) survive only for a
-deployment with no studio at all.
-`--live-idle 120` closes a session that stopped sending
-audio, `--live-glossary`, `--live-silence` (0.5 splits more, 1.2 merges more).
-ASR comes from `--live-asr`/`--live-model` (audio.cpp's streaming endpoint with
-streaming, on by default, or one clip per utterance with `--no-live-stream`).
 
 ## Flags worth knowing
 
@@ -393,8 +253,7 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
   level of the request the server ignores it without a word.
 - A `voxtral-*` model — one request to Mistral's `/v1/audio/transcriptions`
   with `diarize=true`; recordings longer than 34 minutes go in chunks. Needs
-  `MISTRAL_API_KEY`. `mistral.voxtral-*` is the prefixed id the API and the
-  dashboard speak.
+  `MISTRAL_API_KEY`. `mistral.voxtral-*` is the prefixed id the CLI accepts.
 - An `unsloth.*` model (e.g. `unsloth.MOSS-Transcribe-Diarize`) — Unsloth
   Studio's transcribe workflow on `$UNSLOTH_URL` (default
   `http://ubuntu:8888`) with `$UNSLOTH_API_KEY`: the original file travels as
@@ -408,9 +267,7 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
 The compose deployment runs the Unsloth Studio path: `--model
-unsloth.MOSS-Transcribe-Diarize` with `UNSLOTH_API_KEY`, uploads kept, live
-streaming from audio.cpp on `http://ubuntu:8090`, translation through Lemonade
-and the Bifrost gateway.
+unsloth.MOSS-Transcribe-Diarize` with `UNSLOTH_API_KEY`, uploads kept.
 
 ## Tests
 
@@ -419,6 +276,6 @@ python3 -m unittest test_meeting -v
 ```
 
 They cover the pure functions — the audio.cpp, Unsloth Studio and Mistral
-answer parsing, the paragraph merge, the archive ledger and WebDAV paths, the
-live line building — and assert that the standalone defaults stay on the keyless
+answer parsing, the paragraph merge, the archive ledger and WebDAV paths —
+and assert that the standalone defaults stay on the keyless
 audio.cpp path while `unsloth.*` is the studio's one-upload NDJSON workflow.

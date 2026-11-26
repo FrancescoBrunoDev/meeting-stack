@@ -4,8 +4,7 @@ transcript.
 
 The ASRs (audio.cpp, Mistral) are external, so what is tested here is
 everything that can be wrong without them: parsing their answers, merging
-paragraphs and turns, building the live lines, and the defaults that decide
-which path runs.
+paragraphs and turns, and the defaults that decide which path runs.
 """
 import base64
 import contextlib
@@ -26,6 +25,16 @@ import wave
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def wav_bytes(pcm: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(pcm)
+    return buffer.getvalue()
 
 
 def load_module(name: str, path: Path):
@@ -136,32 +145,6 @@ class Defaults(unittest.TestCase):
                          [(1, 1.74, 2.61, "Hallo zusammen."), (2, 3.06, 3.51, "Hallo."),
                           (2, 11.1, 12.01, "Morgen.")])
 
-    def test_a_long_pause_does_not_end_a_half_sentence(self):
-        fake = types.SimpleNamespace(
-            transcribe=lambda pcm, language, model="": "", translate=lambda *a, **k: "",
-)
-        session = meeting_job.LiveSession(fake, "de", "it")
-        session._pending, session._pending_row = "die drei Tage sind", 0
-        session.rows.append({"src": session._pending, "mt": "", "done": False})
-        # ten seconds of silence: longer than any threshold the old rule had
-        session._pcm = b"\x00\x00" * int(meeting_job.LIVE_RATE * 10)
-        session._noise = meeting_job.LIVE_FLOOR
-        session._close_on_pause()
-        self.assertTrue(session._queue.empty(), "a half sentence must stay open")
-        session._pending = "die drei Tage sind vorbei."
-        session._close_on_pause()
-        self.assertFalse(session._queue.empty(), "a full stop ends the line")
-
-    def test_a_repeated_delta_is_not_appended_twice(self):
-        line = ("Allora, quando una pausa viene fatta si inizia un nuovo paragrafo. "
-                "E invece no, ecco che siamo inculati subito.")
-        self.assertEqual(
-            meeting_job.repeated_tail(line, "E invece no, ecco che siamo inculati subito."),
-            "")
-        self.assertEqual(
-            meeting_job.repeated_tail(line, "inculati subito. Conosco questo paragrafo."),
-            "Conosco questo paragrafo.")
-
     def test_an_empty_audio_cpp_answer_is_no_turns(self):
         self.assertEqual(meeting.parse_diarized(""), [])
 
@@ -226,8 +209,8 @@ class MergeParagraphs(unittest.TestCase):
         self.assertEqual(len(merged), 2)
         self.assertTrue(all(len(turn["text"]) <= meeting.PARAGRAPH_CHARS for turn in merged))
 
-    def test_overlapping_tracks_are_not_joined(self):
-        # Two tracks can carry the same speaker at the same moment.
+    def test_overlapping_turns_are_not_joined(self):
+        # Two people can be talking at the same moment.
         turns = [{"speaker": 1, "start": 0.0, "end": 5.0, "text": "perché è proprio"},
                  {"speaker": 1, "start": 2.0, "end": 6.0, "text": "istintivo."}]
         self.assertEqual(len(meeting.merge_paragraphs(turns)), 2)
@@ -473,7 +456,7 @@ class JobRoutes(unittest.TestCase):
         self.addCleanup(self.jobs.stop)
         self.server = meeting_job.Server(
             ("127.0.0.1", 0), self.jobs,
-            meeting_job.Hooks(self.root / "hooks.json"), "", 10 * 1024 * 1024, None)
+            meeting_job.Hooks(self.root / "hooks.json"), "", 10 * 1024 * 1024)
         self.addCleanup(self.server.server_close)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -855,460 +838,8 @@ class ByteRange(unittest.TestCase):
         self.assertIsNone(self.range("bytes=a-b", 100))
 
 
-class LiveCutting(unittest.TestCase):
-    """Live audio is cut into utterances where the speaker pauses."""
-
-    def pcm(self, seconds, amplitude):
-        return b"".join(amplitude.to_bytes(2, "little", signed=True)
-                        for _ in range(int(meeting_job.LIVE_RATE * seconds)))
-
-    def test_cut_lands_at_the_start_of_the_pause(self):
-        cut = meeting_job.vad_cut(self.pcm(1.0, 4000) + self.pcm(1.0, 0), 200)
-        self.assertIsNotNone(cut)
-        at, speech = cut
-        self.assertTrue(speech)
-        self.assertAlmostEqual(at / meeting_job.LIVE_BYTES_PER_S, 1.0, delta=0.05)
-
-    def test_a_short_breath_does_not_end_the_clip(self):
-        # 0.2 s of silence is a gap between words, not a clip boundary: clips are
-        # cut tightly because the line, not the clip, is what must stay whole
-        self.assertIsNone(meeting_job.vad_cut(self.pcm(1.0, 4000) + self.pcm(0.2, 0), 200))
-
-    def test_a_sentence_still_going_is_left_alone(self):
-        self.assertIsNone(meeting_job.vad_cut(self.pcm(1.0, 4000), 200))
-
-    def test_a_silence_is_not_an_utterance(self):
-        self.assertIsNone(meeting_job.vad_cut(self.pcm(3.0, 0), 200))
-        cut = meeting_job.vad_cut(self.pcm(meeting_job.LIVE_MAX + 1, 0), 200)
-        self.assertIsNotNone(cut)
-        self.assertFalse(cut[1])
-
-    def test_a_stretch_without_a_pause_is_cut_before_the_limit(self):
-        cut = meeting_job.vad_cut(self.pcm(meeting_job.LIVE_MAX + 5, 4000), 200)
-        self.assertIsNotNone(cut)
-        at, speech = cut
-        self.assertTrue(speech)
-        self.assertLessEqual(at / meeting_job.LIVE_BYTES_PER_S, meeting_job.LIVE_MAX)
-
-    def test_the_cut_is_not_dragged_to_the_end_of_the_buffer(self):
-        # speech, a pause, then someone already talking again: the line ends at
-        # the pause, and the words after it belong to the next line
-        cut = meeting_job.vad_cut(self.pcm(1.0, 4000) + self.pcm(1.0, 0) + self.pcm(1.0, 4000), 200)
-        self.assertIsNotNone(cut)
-        at, speech = cut
-        self.assertTrue(speech)
-        self.assertAlmostEqual(at / meeting_job.LIVE_BYTES_PER_S, 1.0, delta=0.05)
-
-    def test_the_quiet_room_below_the_floor_still_counts_as_silence(self):
-        self.assertIsNone(meeting_job.vad_cut(self.pcm(1.0, 100) + self.pcm(1.0, 100), 200))
-
-    def test_wav_is_16k_mono_and_as_long_as_the_pcm(self):
-        clip = self.pcm(1.5, 4000)
-        with wave.open(io.BytesIO(meeting_job.wav_bytes(clip))) as handle:
-            self.assertEqual((handle.getframerate(), handle.getnchannels(),
-                              handle.getsampwidth()), (16000, 1, 2))
-            self.assertEqual(handle.getnframes(), len(clip) // 2)
-
-
-class LiveSession(unittest.TestCase):
-    """A session asks the endpoints for one line and keeps the order."""
-
-    def fake(self, rows, text="Guten Tag.", translated="Buongiorno"):
-        def transcribe(pcm, language, model=""):
-            rows.append(("asr", len(pcm)))
-            return text
-
-        def translate(src, target, context, on_token=None, model=""):
-            rows.append(("mt", target, list(context)))
-            if on_token is not None:
-                on_token(translated[:4])
-            return translated
-
-        return types.SimpleNamespace(transcribe=transcribe, translate=translate)
-
-    def speech(self):
-        return (4000).to_bytes(2, "little", signed=True) * 16000
-
-    def say(self, session, seconds=1.0):
-        """One clip, then the pause that closes the line — what the browser sends."""
-        speech = (4000).to_bytes(2, "little", signed=True) * int(16000 * seconds)
-        session.feed(speech + b"\x00\x00" * 16000)
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not session._pending:
-            time.sleep(0.01)
-        session.feed(b"\x00\x00" * 16000)          # silence past LIVE_LINE
-        time.sleep(0.05)
-
-    def drain(self, session, limit=5.0):
-        deadline = time.monotonic() + limit
-        while time.monotonic() < deadline and not session.done:
-            time.sleep(0.02)
-        self.assertTrue(session.done)
-
-    def test_the_page_can_pick_the_translator(self):
-        """The session carries the model the page asked for, all the way down."""
-        chosen = []
-
-        def translate(src, target, context, on_token=None, model=""):
-            chosen.append(model)
-            return "Buongiorno"
-
-        live = types.SimpleNamespace(transcribe=lambda pcm, language, model="": "Guten Tag.",
-                                     translate=translate)
-        session = meeting_job.LiveSession(live, "de", "it", meeting_job.LIVE_LINE,
-                                          "translategemma-4b-FLM")
-        session.feed(self.speech() + b"\x00\x00" * 16000)
-        session.close()
-        self.drain(session)
-        self.assertEqual(chosen, ["translategemma-4b-FLM"])
-
-    def open_line(self, text):
-        """A line being built, with nothing translated yet."""
-        session = meeting_job.LiveSession(self.fake([]), "de", "it")
-        session._pending, session._pending_row = text, 0
-        session.rows.append({"src": text, "mt": "", "done": False})
-        return session
-
-    def test_a_short_line_is_translated_without_waiting_for_the_pause(self):
-        """The worker used to sit idle while the page showed a line with nothing under it."""
-        session = self.open_line("die drei Tage sind weg")      # 23 characters
-        session._maybe_partial()
-        self.assertFalse(session._queue.empty(),
-                         "the first translation of a line must not wait for 60 characters")
-
-    def test_a_line_too_short_to_translate_is_left_alone(self):
-        session = self.open_line("die drei")                    # 8 characters
-        session._maybe_partial()
-        self.assertTrue(session._queue.empty())
-
-    def test_a_second_partial_waits_for_the_line_to_grow(self):
-        session = self.open_line("die drei Tage sind vorbei")   # 26 characters
-        session._maybe_partial()
-        session._partial_busy = False                            # the worker is free again
-        session._maybe_partial()
-        self.assertEqual(session._queue.qsize(), 1,
-                         "the same text twice is a request nobody will read")
-
-    def test_a_cut_clip_becomes_one_translated_row(self):
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it")
-        session.feed(self.speech() + b"\x00\x00" * 16000)
-        session.close()
-        self.drain(session)
-        self.assertEqual(session.rows, [{"src": "Guten Tag.", "mt": "Buongiorno",
-                                         "done": True}])
-        self.assertEqual([call[0] for call in calls], ["asr", "mt"])
-
-    def test_the_row_is_there_before_the_translation_is_finished(self):
-        # Streaming: the page has something to rewrite while the tokens arrive.
-        seen = []
-
-        def translate(src, target, context, on_token=None, model=""):
-            on_token("Buon")
-            seen.extend(session.view(0)["rows"])
-            return "Buongiorno"
-
-        fake = types.SimpleNamespace(transcribe=lambda pcm, language, model="": "Guten Tag.",
-                                     translate=translate)
-        session = meeting_job.LiveSession(fake, "de", "it")
-        session.feed(self.speech() + b"\x00\x00" * 16000)
-        session.close()
-        self.drain(session)
-        self.assertEqual(seen, [{"i": 0, "src": "Guten Tag.", "mt": "Buon",
-                                "done": False}])
-        self.assertEqual(session.rows[0]["mt"], "Buongiorno")
-
-    def test_the_context_of_the_next_line_is_the_previous_pair(self):
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it")
-        self.say(session)
-        self.say(session)
-        session.close()
-        self.drain(session)
-        translations = [call for call in calls if call[0] == "mt"]
-        self.assertEqual(len(translations), 2)
-        self.assertEqual(translations[0][2], [])
-        self.assertEqual(translations[1][2], ["Guten Tag. -> Buongiorno"])
-
-    def test_a_dead_asr_stream_is_opened_again(self):
-        # audio.cpp unloads a model it thinks is idle after two minutes, which
-        # kills the stream it is serving. The old session went on feeding the
-        # dead socket: no rows for the rest of the call, no error anywhere.
-        opened = []
-
-        class DeadStream:
-            def __init__(self, base, model, on_text):
-                self.dead = False
-                self.reason = ""
-                opened.append(self)
-
-            def feed(self, pcm):
-                self.dead = True          # the model went away under us
-                self.reason = "the service closed the stream"
-
-            def close(self):
-                pass
-
-        original = meeting_job.StreamingASR
-        meeting_job.StreamingASR = DeadStream
-        try:
-            fake = types.SimpleNamespace(
-                transcribe=lambda pcm, language, model="": "", translate=lambda *a, **k: "",
-                stream_asr=True, asr="http://127.0.0.1:8090", model="m")
-            session = meeting_job.LiveSession(fake, "de", "it")
-            session.feed(self.speech())
-            session.feed(self.speech())
-            self.assertEqual(len(opened), 2)
-            self.assertEqual(session._stream_restarts, 1)
-        finally:
-            meeting_job.StreamingASR = original
-
-    def test_a_half_sentence_is_translated_when_the_stream_stops(self):
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls, text="und dann"), "de", "it")
-        session.feed(self.speech() + b"\x00\x00" * 16000)
-        session.close()
-        self.drain(session)
-        self.assertIn("mt", [call[0] for call in calls])
-        self.assertEqual(session.rows[0]["mt"], "Buongiorno")
-
-    def test_the_prompt_names_the_language_instead_of_its_code(self):
-        # "the language whose ISO 639-1 code is it" reads as the English pronoun:
-        # the model answered in English. The name fixes it.
-        for code, name in (("it", "Italian"), ("de", "German"), ("en", "English")):
-            prompt = meeting_job.translate_prompt(code)
-            self.assertIn(name, prompt)
-            self.assertNotIn(f"code is {code}", prompt)
-
-    def test_every_row_carries_its_index(self):
-        session = meeting_job.LiveSession(self.fake([]), "de", "it")
-        self.say(session)
-        self.say(session)
-        session.close()
-        self.drain(session)
-        self.assertEqual([row["i"] for row in session.view(0)["rows"]], [0, 1])
-        self.assertEqual([row["i"] for row in session.view(1)["rows"]], [1])
-
-    def test_a_failing_endpoint_is_a_row_not_a_dead_session(self):
-        def transcribe(pcm, language, model=""):
-            raise OSError("connection refused")
-
-        session = meeting_job.LiveSession(
-            types.SimpleNamespace(transcribe=transcribe, translate=lambda *a: "",
-), "de", "it")
-        session.feed(self.speech() + b"\x00\x00" * 16000)
-        session.close()
-        self.drain(session)
-        self.assertIn("connection refused", session.rows[0]["error"])
-
-class LiveLines(unittest.TestCase):
-    """A line is a stretch of speech between two pauses, not one ASR clip."""
-
-    def drain(self, session, limit=5.0):
-        deadline = time.monotonic() + limit
-        while time.monotonic() < deadline and not session.done:
-            time.sleep(0.02)
-        self.assertTrue(session.done)
-
-    def fake(self, calls):
-        return types.SimpleNamespace(
-            transcribe=lambda pcm, language, model="": "",
-            translate=lambda src, target, context, on_token=None, model="": (
-                calls.append(src), "tradotto")[1])
-
-    def test_a_clip_that_stops_for_a_breath_waits_for_the_rest(self):
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it")
-        session._hear("Bei der Bundeswehr gibt es mehr Gewalt,", closed=False)
-        self.assertEqual(calls, [], "half a sentence must not be translated yet")
-        self.assertEqual(len(session.rows), 1)
-        session._hear("und Fehlverhalten als bislang bekannt.", closed=True)
-        self.assertEqual(len(session.rows), 1, "the two clips are one line")
-        self.assertEqual(session.rows[0]["src"],
-                         "Bei der Bundeswehr gibt es mehr Gewalt, und Fehlverhalten "
-                         "als bislang bekannt.")
-        self.assertEqual(calls, [session.rows[0]["src"]])
-
-    def test_a_pause_closes_the_line_so_the_next_one_starts(self):
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it")
-        session._hear("Heute im Studio.", closed=True)
-        session._hear("Ein schönen guten Abend.", closed=True)
-        self.assertEqual([row["src"] for row in session.rows],
-                         ["Heute im Studio.", "Ein schönen guten Abend."])
-        self.assertEqual(len(calls), 2)
-
-    def test_the_cursor_stops_at_a_row_still_being_translated(self):
-        # The page follows the cursor. If the cursor moves past a row the worker
-        # is still translating, that row stays "…" for ever (that was the bug).
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it")
-        session._hear("Heute im Studio.", closed=False)
-        self.assertEqual(session.view(0)["cursor"], 0)
-        session._hear("und dann noch etwas.", closed=True)
-        view = session.view(0)
-        self.assertEqual(view["cursor"], 1)
-        self.assertEqual(view["rows"][0]["mt"], "tradotto")
-
-    def test_an_empty_answer_is_retried_and_then_reported(self):
-        calls = []
-        answers = iter(["Heute im Studio.", "", ""])   # the first line translates
-
-        def translate(src, target, context, on_token=None, model=""):
-            calls.append(list(context))
-            return next(answers)
-
-        session = meeting_job.LiveSession(
-            types.SimpleNamespace(transcribe=lambda pcm, language, model="": "", translate=translate,
-), "de", "it")
-        session._hear("Heute im Studio.", closed=True)
-        session._hear("Ein schönen guten Abend.", closed=True)
-        self.assertEqual(len(calls), 3, "one retry, without the context")
-        self.assertEqual(calls[-1], [])
-        self.assertEqual(session.rows[1]["error"], "the model returned no translation")
-
-    def test_the_cursor_does_not_move_while_a_line_is_streaming(self):
-        # `mt` holds the first token long before the line is finished: a cursor
-        # that keys on it moves on, and the page keeps "aveva affid" for ever.
-        cursors = []
-
-        def translate(src, target, context, on_token=None, model=""):
-            on_token("aveva")
-            cursors.append(session.view(0)["cursor"])
-            on_token("aveva affidato al suo agente pubblicitario Högel.")
-            cursors.append(session.view(0)["cursor"])
-            return "aveva affidato al suo agente pubblicitario Högel."
-
-        session = meeting_job.LiveSession(
-            types.SimpleNamespace(transcribe=lambda pcm, language, model="": "",
-                                  translate=translate), "de", "it")
-        session._hear("Ihr Werbeauftragte Högel in Auftrag gegeben hatte.", closed=True)
-        self.assertEqual(cursors, [0, 0], "the row was abandoned mid-sentence")
-        self.assertEqual(session.view(0)["cursor"], 1)
-        self.assertEqual(session.rows[0]["mt"],
-                         "aveva affidato al suo agente pubblicitario Högel.")
-
-    def test_a_line_that_runs_on_is_cut_at_a_full_stop(self):
-        long_de = ("Ihr Werbeauftragte Högel in Auftrag gegeben hatte. Demnach wird höchstens "
-                   "jeder dritte Fall überhaupt gemeldet. Am häufigsten betroffen sind junge "
-                   "Frauen und nicht heterosexuelle Männer. Verteidigungsminister Pistorius "
-                   "sagte, für solche Vorfälle gebe es Null Toleranz.")
-        calls = []
-        fake = types.SimpleNamespace(
-            transcribe=lambda pcm, language, model="": "",
-            translate=lambda src, target, context, on_token=None, model="": (
-                calls.append(src), "tradotto")[1])
-        session = meeting_job.LiveSession(fake, "de", "it")
-        session._hear(long_de, closed=False)     # no pause, and past 220 characters
-        self.assertTrue(calls, "the long line was not translated at all")
-        self.assertLess(len(calls[0]), len(long_de))
-        self.assertTrue(session.rows[0]["done"])
-        self.assertFalse(session.rows[-1]["done"], "the rest waits in its own line")
-
-    def test_the_view_says_what_the_worker_is_doing(self):
-        # "Nothing on screen" has to be distinguishable from "broken".
-        session = meeting_job.LiveSession(self.fake([]), "de", "it")
-        self.assertEqual(session.view(0)["state"], "idle")
-        self.assertEqual(session.view(0)["buffered"], 0.0)
-        session.feed(b"\x00\x00" * 12000)          # 0.75 s of audio, no pause yet
-        self.assertEqual(session.view(0)["buffered"], 0.8)
-        session._set_state("asr")
-        self.assertEqual(session.view(0)["state"], "asr")
-        self.assertFalse(session.view(0)["done"])
-        session.close()
-        self.drain(session)
-        self.assertTrue(session.view(0)["done"])
-
-    def test_the_model_markers_never_reach_the_page(self):
-        self.assertEqual(
-            meeting_job.clean_live_text("[0.00][S01] Das sind ja dann die drei Tage.[2.48]"),
-            "Das sind ja dann die drei Tage.")
-        self.assertEqual(
-            meeting_job.clean_live_text(" \n Speaker 0:Das sind ja dann die drei Tage."),
-            "Das sind ja dann die drei Tage.")
-        self.assertEqual(
-            meeting_job.clean_live_text("Okay. [Noise] Ja, natürlich [Laughter] weiter."),
-            "Okay. Ja, natürlich weiter.")
-
-    def test_silence_closes_the_line_without_waiting_for_the_asr(self):
-        # Clips are cut at 0.45 s so the ASR sees short, cheap requests; the line
-        # is closed by silence that keeps going, or by a change of voice.
-        calls = []
-        fake = types.SimpleNamespace(
-            transcribe=lambda pcm, language, model="": "Guten Abend.",
-            translate=lambda src, target, context, on_token=None, model="": (
-                calls.append(src), "Buonasera.")[1],
-)
-        session = meeting_job.LiveSession(fake, "de", "it")
-        speech = (4000).to_bytes(2, "little", signed=True) * 16000
-        session.feed(speech + b"\x00\x00" * 16000)     # 1 s of speech, then silence
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not session._pending:
-            time.sleep(0.01)
-        session.feed(b"\x00\x00" * 16000)             # the pause keeps going
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not calls:
-            time.sleep(0.02)
-        self.assertEqual(calls, ["Guten Abend."], "the pause did not close the line")
-        session.close()
-        self.drain(session)
-
-    def test_turn_end_closes_the_line_and_the_next_turn_starts_a_new_one(self):
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
-                                          asr_model="voxtral-mini-transcribe-realtime-3")
-        session._streamed("Guten Tag, wie geht es?", dedupe=False)
-        session._turn_end()                 # the cloud ASR said the turn is over
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and session._pending:
-            time.sleep(0.01)
-        self.assertFalse(session._pending, "turn.end did not close the line")
-        session._streamed("Danke, sehr gut.", dedupe=False)
-        self.assertEqual(len(session.rows), 2)
-        self.assertEqual(session.rows[0]["src"], "Guten Tag, wie geht es?")
-        self.assertEqual(session.rows[1]["src"], "Danke, sehr gut.")
-        session._queue.put(None)
-        self.drain(session)
-        self.assertTrue(session.rows[0]["done"])
-        self.assertEqual(session.view(0)["asr_model"], "voxtral-mini-transcribe-realtime-3")
-
-    def test_voxtral_pieces_do_not_split_a_word(self):
-        # Measured on the realtime API: token pieces cut inside words, and a
-        # piece without its own whitespace continues the word (' Hall','o').
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
-                                          asr_model="voxtral-mini-transcribe-realtime-3")
-        for piece in ("Guten", " Abend", ".", " Hall", "o", "."):
-            session._streamed(piece, dedupe=False)
-        self.assertEqual(session.rows[0]["src"], "Guten Abend. Hallo.")
-
-    def test_whole_segment_streams_keep_the_separator(self):
-        # audio.cpp sends whole segments with no relation to word starts:
-        # they always take the space back.
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
-                                          asr_model="vibevoice_asr_streaming_7b_q8_0")
-        session._streamed("Hall", dedupe=True)
-        session._streamed("o", dedupe=True)
-        self.assertEqual(session.rows[0]["src"], "Hall o")
-
-    def test_a_stale_turn_end_does_not_close_the_next_line(self):
-        calls = []
-        session = meeting_job.LiveSession(self.fake(calls), "de", "it",
-                                          asr_model="voxtral-mini-transcribe-realtime-3")
-        session._streamed("Erstes.", dedupe=False)
-        session._turn_end()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and session._pending:
-            time.sleep(0.01)                # the timer closed row 0
-        session._streamed("Zweites.", dedupe=False)
-        with session._lock:
-            row, text = session._pending_row, session._pending
-        session._close_turn(row - 1)       # the stale timer fires too late
-        with session._lock:
-            self.assertEqual(session._pending, text, "it closed the new line")
-        session._queue.put(None)
-        self.drain(session)
+class BatchProviders(unittest.TestCase):
+    """The batch providers: Mistral uploads and the Unsloth workflow."""
 
     def test_mistral_batch_turns_keep_speakers_and_context_bias(self):
         captured = {}
@@ -1338,7 +869,7 @@ class LiveLines(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             wav = Path(tmp) / "clip.wav"
-            wav.write_bytes(meeting_job.wav_bytes(b"\x00\x00" * 1600))
+            wav.write_bytes(wav_bytes(b"\x00\x00" * 1600))
             original = meeting.urllib.request.urlopen
             meeting.urllib.request.urlopen = fake_open
             try:
@@ -1443,24 +974,6 @@ class LiveLines(unittest.TestCase):
             {"speaker": "S02", "start": 5.0, "end": 8.8, "text": "Bene."},
         ])
 
-    def test_unsloth_model_id_rides_the_namespace(self):
-        self.assertEqual(meeting_job.unsloth_model_id("unsloth.Hy-MT2-7B-GGUF"),
-                         "unsloth/Hy-MT2-7B-GGUF")
-        self.assertEqual(meeting_job.unsloth_model_id("unsloth.Qwen/Qwen3-4B-GGUF"),
-                         "Qwen/Qwen3-4B-GGUF")
-
-    def test_mistral_translator_omits_extra_fields_that_cause_422(self):
-        sent = {}
-        with tempfile.TemporaryDirectory() as tmp:
-            live = meeting_job.Live(
-                "http://127.0.0.1:8090", "m", "http://127.0.0.1:8731",
-                "mistral.ministral-8b-latest")
-            live._ask = lambda payload, on_token=None: (sent.update(payload), "Ciao")[1]
-            result = live.translate("Hallo", "it", [], model="mistral.ministral-8b-latest")
-        self.assertEqual(result, "Ciao")
-        self.assertNotIn("reasoning_effort", sent)
-        self.assertNotIn("chat_template_kwargs", sent)
-
     def test_mistral_turns_chunks_recordings_over_limit(self):
         calls = []
         orig_max = meeting.MISTRAL_MAX_S
@@ -1468,7 +981,7 @@ class LiveLines(unittest.TestCase):
         orig_tx = meeting.transcribe_mistral
         meeting.MISTRAL_MAX_S = 1.0
         meeting.normalize_wav = lambda src, dst: dst.write_bytes(
-            meeting_job.wav_bytes(b"\x00\x00" * 32000))
+            wav_bytes(b"\x00\x00" * 32000))
         meeting.transcribe_mistral = lambda *a, **k: (
             calls.append(a),
             [{"speaker": "speaker_1", "start": 0.2, "end": 0.8, "text": "Teil."}])[1]
@@ -1490,23 +1003,6 @@ class LiveLines(unittest.TestCase):
             {"speaker": 1, "start": 1.2, "end": 1.8, "text": "Teil."},
         ])
 
-    def test_live_session_forwards_per_session_glossary(self):
-        seen = []
-
-        def translate(src, target, context, on_token=None, model="", glossary=""):
-            seen.append(glossary)
-            return "Ciao Andreas."
-
-        live = types.SimpleNamespace(
-            transcribe=lambda pcm, language, model="": "",
-            translate=translate,
-            glossary="Kita")
-        session = meeting_job.LiveSession(live, "de", "it", glossary="Andreas")
-        self.assertEqual(session.glossary, "Kita, Andreas")
-        session._hear("Hallo Andreas.", closed=True)
-        session.close()
-        self.drain(session)
-        self.assertEqual(seen, ["Kita, Andreas"])
 
 
 if __name__ == "__main__":

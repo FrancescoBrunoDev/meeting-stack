@@ -13,14 +13,6 @@ meeting-job               service: REST POST /jobs + MCP POST /mcp, one worker
 meeting-eval              score a transcript against a reference
 dashboard/src/            React + shadcn/ui source of the web UI
 dashboard.html            built, inlined single file — what :8099 serves
-dashboard/src/Live.tsx    the live view: capture, transcript, translation (shadcn
-                          components, same bundle — GET /live serves dashboard.html
-                          and App picks the view from the path). The rows are a fixed
-                          window on the tail (`h-[calc(100svh-3.25rem)]` column,
-                          `flex-1` card, `mt-auto` rows) with a per-row opacity
-                          gradient and `snap-y`; a container mask was tried first and
-                          faded nothing until the rows overflowed it.
-live-feed                 the same live API as a CLI: ffmpeg input (file or device) -> lines
 test_meeting.py
 ```
 
@@ -49,15 +41,9 @@ GPU lock. Everything is an HTTP endpoint the service calls.
   `max_tokens` must be large (65536) AND under `"options"`: at the top level the
   server ignores it and uses 5120, and a tight cap ends in `reached max_tokens
   before EOS`, which loses the transcript instead of truncating it. 38 minutes
-  measured 25 minutes of wall time. Live: the streaming endpoint
-  (streaming by default, `vibevoice_asr_streaming_7b_q8_0`) or one clip per
-  utterance without it.
+  measured 25 minutes of wall time.
 - ASR, cloud: Mistral `/v1/audio/transcriptions` with `diarize=true`
-  (the `voxtral-*` model id routes there); key in
-  `$MISTRAL_API_KEY`. The realtime models are the live ones.
-- Translators: Lemonade `http://127.0.0.1:8731` (`--translate-model`), Mistral's
-  chat models (`mistral.<id>`) and the Bifrost gateway `http://127.0.0.1:8080`
-  (`--mt-gateway`, its `opencode.<id>` models).
+  (the `voxtral-*` model id routes there); key in `$MISTRAL_API_KEY`.
 - Service: one container from `docker-compose.yml` (docker or podman-compose)
   on port 8099 - no podman socket, no device mounts.
 
@@ -121,44 +107,6 @@ and call out over HTTP only. Consequences that bite:
   uses. Text joins consecutive turns by the same speaker into a paragraph;
   Segments keeps one timestamped row each. Both seek the player at their start,
   and the active row/paragraph is highlighted and followed while playing.
-- Live (`/live`, `POST /live/<id>/audio`, `dashboard/src/Live.tsx`): the browser resamples to
-  16 kHz mono PCM16 (`new AudioContext({sampleRate: 16000})` — Safari gives 48 kHz
-  and the page refuses, it would pitch everything) and posts half a second at a
-  time. The server accumulates, cuts on the first pause of 0.45 s
-  (`vad_cut`/`frame_rms`, ~20 lines of stdlib), sends the utterance as one WAV to
-  `--asr`, and translates it with `--translate-model` on `--translate-url`, last
-  two source lines as context and `chat_template_kwargs.enable_thinking=false`
-  (without that the thinking model spends `max_tokens` on reasoning and returns
-  an empty `content`). The row is appended **before** translating and the answer
-  is read as SSE (`stream: true`), each partial written into the row: the page
-  follows the cursor and rewrites the cells of the row it names, which is why
-  `view()` sends `i` with every row — plus `state` (`idle`/`asr`/`mt`) and
-  `buffered` (seconds of audio held back waiting for a pause), because ten silent
-  seconds of speech read as a broken program — and why **the cursor stops at the
-  first row still being translated**: a cursor that moved past an in-flight row left it on
-  "…" for ever, because the worker translates a row that is not the last one.
-  The marker is the row's own `done`, **not** `mt`: with streaming `mt` is
-  non-empty from the first token, and keying on it abandoned rows half way
-  ("aveva affid", "Anche lei ne").
-  Context is the previous `LIVE_CONTEXT` (2) lines as `source -> translation` pairs, and `--live-glossary` pins names. The
-  row is a **line, not a clip**: clips are cut tightly (`LIVE_CUT`, 0.3 s) so the
-  ASR sees short requests and two speakers rarely share one; `_hear` appends each
-  clip's text to `_pending` and the line closes on a **longer pause**
-  (`--live-silence`, 0.8 s — `feed` queues a `CLOSE` marker once the silence
-  outlasts it, so the ASR is not involved). The ASR punctuation is ignored on
-  purpose — every clip ends with a full stop, and trusting it split "…mehr sexualisierte Gewalt." /
-  "und Fehlverhalten als bislang bekannt." into two rows, each translated as its
-  own sentence. A line with no pause is translated after `LIVE_PENDING_CHARS`
-  (220, and then cut at a full stop) or `LIVE_PENDING_HOLD` (10 s), and on close.
-  No speaker labels live: the ASR never names anybody inline.
-  Measured on the box (2.8 s Italian clip, looped): 0.59 s per line with
-  Qwen3.8-27B-GGUF (17 tokens at 35.7 tok/s); on the page the source line shows
-  at 3.4 s, the translation starts 0.3 s later and completes 0.6 s later.
-  `--live-idle` (120 s) closes an abandoned session, which stays readable so
-  the last rows can be collected.
-  A speaker who does not pause for 20 s is cut at the quietest frame. Live
-  capture needs a secure context: `http://127.0.0.1:8099/live` or https, never
-  plain http to another host.
 
 ## Gotchas that already cost time
 
@@ -166,23 +114,20 @@ and call out over HTTP only. Consequences that bite:
   `language=auto` short, noisy turns can come back in whatever language the
   model thinks it heard (25 of 226 turns of the 38:13 German meeting came back
   in Chinese or Dutch on the old Qwen3 path; keep the habit for Mistral).
-- The service runs without a token on this box (empty `MEETING_TOKEN`), by
-  decision: it listens on `0.0.0.0:8099`, so anyone on the LAN or the tailnet can
-  start a job.
+- The token comes from `MEETING_TOKEN` (compose passes it from `.env`). When it
+  is empty the service runs without auth: it listens on `0.0.0.0:8099`, so anyone
+  on the LAN or the tailnet can start a job.
 
 ## Endpoints this stack calls
 
 - Unsloth Studio on `http://ubuntu:8888` - `/v1/audio/inputs` +
-  `/api/inference/audio/transcribe/source` for batch diarization, `/v1/models`
-  and `/api/providers/` for the live translators. Key in `$UNSLOTH_API_KEY`
-  (compose passes it from `.env`).
-- audio.cpp on `http://ubuntu:8090` - live transcription, and the direct batch
-  fallback. Its build/run lives in that project, not here. `/v1/models/load`
-  reloads `moss-transcribe-diarize` when the server unloaded it (the service
-  does this itself on a 404).
+  `/api/inference/audio/transcribe/source` for batch diarization. Key in
+  `$UNSLOTH_API_KEY` (compose passes it from `.env`).
+- audio.cpp on `http://ubuntu:8090` - the direct batch fallback. Its build/run
+  lives in that project, not here. `/v1/models/load` reloads
+  `moss-transcribe-diarize` when the server unloaded it (the service does this
+  itself on a 404).
 - Mistral - key in `$MISTRAL_API_KEY` (compose passes it from `.env`).
-- Lemonade on `:8731` and Bifrost on `:8080` - translators; do not evict their
-  resident models.
 
 ## After changing the service or the image
 
@@ -191,7 +136,7 @@ docker compose up -d --build        # or: podman-compose up -d --build
 curl -s localhost:8099/health
 ```
 
-The compose `command` passes only what differs from the defaults (the directory,
-the model choice, the gateway): the running configuration is the `command` in
+The compose `command` passes only what differs from the defaults (the directory
+and the model choice): the running configuration is the `command` in
 `docker-compose.yml`, the rest is the default contract tested in
 `test_meeting.py`.

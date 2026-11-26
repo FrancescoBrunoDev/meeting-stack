@@ -4,8 +4,7 @@
 #   docker compose up -d --build    # or: podman-compose up -d --build
 #
 # A plain service: no podman socket, no device mounts, no nested containers —
-# all inference (audio.cpp, Unsloth Studio, Mistral, Lemonade, the Bifrost
-# gateway) is reached over HTTP.
+# all inference (audio.cpp, Unsloth Studio, Mistral) is reached over HTTP.
 FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update \

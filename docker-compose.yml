@@ -9,10 +9,9 @@
 #   Required env, set in Coolify:
 #     MEETING_TOKEN     a bearer token (the dashboard is exposed now)
 #     MISTRAL_API_KEY   the key
-#     UNSLOTH_API_KEY   an Unsloth Studio key, for batch diarization and the
-#                       unsloth.* translators
-#     UBUNTU_HOST       the LAN address of the box that serves audio.cpp,
-#                       Lemonade, Bifrost and Unsloth Studio
+#     UNSLOTH_API_KEY   an Unsloth Studio key, for batch diarization
+#     UBUNTU_HOST       the LAN address of the box that serves audio.cpp
+#                       and Unsloth Studio
 #
 #   Optional env (with defaults):
 #     MEETING_PORT      the service's port (8099)
@@ -25,16 +24,6 @@
 #                       cloud alternative; a bare audio.cpp model travels as an
 #                       upload here and the server SEGFAULTS past ~20 minutes of
 #                       recording, so the pipeline refuses it)
-#     LIVE_MODEL        the live session model (vibevoice_asr_streaming_7b_q8_0)
-#     UNSLOTH_API_KEY   also the model gateway: its studio connections carry
-#                       the cloud keys (Mistral, OpenCode Go) and the Lemonade
-#                       models - with it set, translators of every group route
-#                       through the studio and Lemonade/Bifrost are no longer
-#                       addressed directly
-#     TRANSLATE_MODEL   the default translator (unsloth.Hy-MT2-7B-GGUF:
-#                       a translation-specialised 7B on Unsloth Studio,
-#                       ~0.3s a line against ~0.6s+ for the 27B via Lemonade;
-#                       Qwen3.8-27B-GGUF is the Lemonade alternative, no key)
 #
 #   Archive (optional): copy .env.example to .env and fill WEBDAV_URL,
 #   WEBDAV_USER and WEBDAV_PASSWORD. Compose reads .env for interpolation, then
@@ -43,8 +32,8 @@
 #   on the meeting-db volume (GET /files). Without
 #   WEBDAV_URL the ledger still records the files, no copy is made.
 #
-#   --keep-audio and --live-stream are the service defaults; add
-#   --no-keep-audio / --no-live-stream in `command` to turn them off.
+#   --keep-audio is the service default; add --no-keep-audio in `command`
+#   to delete the upload once the job is archived.
 services:
   meeting-job:
     build:
@@ -77,14 +66,11 @@ services:
       - meeting-data:/data
       # the SQLite ledger: one row per received file and its WebDAV copy
       - meeting-db:/db
-    # --live-asr stays empty: the live path uses the same --asr.
     command: >-
       --dir /data
       --port ${MEETING_PORT:-8099}
       --asr http://${UBUNTU_HOST:-192.168.188.60}:${AUDIOCPP_PORT:-8090}
       --model ${BATCH_MODEL:-unsloth.MOSS-Transcribe-Diarize}
-      --translate-model ${TRANSLATE_MODEL:-unsloth.Hy-MT2-7B-GGUF}
-      --live-model ${LIVE_MODEL:-vibevoice_asr_streaming_7b_q8_0}
 volumes:
   meeting-data:
   meeting-db:

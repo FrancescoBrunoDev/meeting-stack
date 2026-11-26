@@ -1,26 +1,18 @@
 # Eco-Remote API
 
-Everything is one HTTP service: `meeting-job` on `http://<host>:8099`. It does two
-different jobs, and they behave differently:
-
-- **batch** — you send a finished recording, it answers with a diarized
-  transcript. Slow, exact, speaker-labelled. This is the record.
-- **live** — you stream microphone audio as it happens, it answers with a growing
-  transcript and its translation. Fast, approximate, **no speaker labels**.
+Everything is one HTTP service: `meeting-job` on `http://<host>:8099`. You send a
+finished recording and it answers with a diarized transcript.
 
 The service itself runs no inference: Unsloth Studio on `:8888` answers the
-default batch transcription (audio.cpp on `:8090` is the direct fallback and the
-live transcriber), Mistral the cloud transcribers and translators, Lemonade on
-`:8731` and the Bifrost gateway on `:8080` the translators. Jobs run one at a
-time in a worker thread; live sessions are independent of them.
+default batch transcription, audio.cpp on `:8090` is the direct fallback, Mistral
+the cloud one. Jobs run one at a time in a worker thread.
 
 ## Auth
 
 `MEETING_TOKEN` empty: no auth at all, anyone who reaches the port can use it.
 When it is set, every route except `GET /health` wants
-`Authorization: Bearer <token>`. The playback route (`GET /jobs/<id>/audio`) and
-the `/live/...` routes also accept `?token=<token>`, because `<audio src>` and an
-open browser tab cannot send headers.
+`Authorization: Bearer <token>`. The playback route (`GET /jobs/<id>/audio`)
+also accepts `?token=<token>`, because `<audio src>` cannot send headers.
 
 ## Batch
 
@@ -100,119 +92,6 @@ uploaded copy** — the file you sent is yours and is not touched. All three ans
 (`audio_base64` + `filename`/`language`/`hotwords`/`names`; no model),
 `meeting_status` (`id`), `meeting_result` (`id`, `format: markdown|json`).
 
-## Live
-
-A session is created by its first audio chunk; the id is yours to choose.
-
-```sh
-# 1. audio: raw PCM, signed 16-bit little-endian, mono, 16 kHz
-curl -X POST "http://host:8099/live/<id>/audio?language=de&to=it" \
-     -H 'content-type: application/octet-stream' --data-binary @chunk.pcm
-
-# 2. poll: rows and what the worker is doing
-curl "http://host:8099/live/<id>?since=0"
-
-# 3. end it (the last line is still translated after this)
-curl -X POST http://host:8099/live/<id>/close
-```
-
-`?language=` is what the speaker talks (a hint), `?to=` is what to translate
-into, `?mt_model=` overrides the translator for this session (omit for the
-service's `--translate-model`), `?asr_model=` overrides the transcriber
-(omit for `--live-model`), and `?glossary=` passes comma-separated names and
-terms for this session (combined with `--live-glossary`, kept unchanged in
-translation and forwarded as `context_bias` to Mistral Realtime). Chunks of any
-size: the page sends 0.5 s.
-
-The poll answers `mt_model` and `asr_model`: the translator and transcriber the
-session is really using, so a client that asked for one can see whether it got it.
-
-`GET /live/models` lists what the box can translate and transcribe with:
-`{"models": [{"id", "recipe"}], "default": "...", "asr_models": [{"id", "recipe"}], "asr_default": "...", "batch_models": [{"id", "recipe"}], "batch_default": "..."}`.
-When `MISTRAL_API_KEY` is set, `asr_models` offers `voxtral-mini-transcribe-realtime-3`
-(WebSocket streaming with end-of-turn detection, not diarization: the rows carry
-no speaker, and a `turn.end` event closes the row and starts a new one)
-alongside `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`;
-`batch_models` offers `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`
-(file transcription with `diarize=true` and `timestamp_granularities=segment`);
-`batch_default` is the model the service is configured with, and the only one
-`POST /jobs` uses. Lemonade does not proxy `/v1/audio/transcriptions`
-or WebSockets for cloud providers, so the service talks to `api.mistral.ai`
-directly.
-
-Cloud models (`recipe: cloud`, e.g. `opencode-go.*`) work too, and the service
-sends what they need: an `x-opencode-session` header, which those providers
-require before they route a request, and `reasoning_effort: "none"`. The second
-one matters — a thinking model spends its token budget on the reasoning and then
-answers with a null message, which Lemonade reports as a `500`. Local backends
-ignore both.
-
-The `id` there is what Lemonade lists, which for a model registered by hand is
-**not** what its backend serves: those answer to `user.<id>`. The service tries
-the listed name and, on a `404 model_not_found`, once more with the prefix, so
-either spelling works. A streamed request reports that 404 inside a 200 stream,
-which is why the check is in the stream reader and not only around the call.
-
-The poll answers:
-
-```json
-{"cursor": 2, "open": true, "state": "asr", "buffered": 0.4,
- "language": "de", "to": "it", "done": false,
- "rows": [{"i": 0, "src": "...", "mt": "...", "done": true},
-          {"i": 1, "src": "...", "mt": "",    "done": false}]}
-```
-
-- `rows[].src` is the transcript, `mt` the translation. **A row with `done:false`
-  is still growing**: poll again and it will be longer.
-- `cursor` is the number of rows that are finished. Read from `since=cursor`.
-- `state` is `idle`, `asr` (transcribing) or `mt` (translating); `buffered` is
-  how many seconds of audio are held waiting for a pause. The page uses both to
-  show what it is doing.
-- `open:false` means the session is closed: no new audio, but the rows are
-  readable for a while (`--live-idle`, 120 s) so a late reader gets the tail.
-- `404` for an unknown session.
-
-### How a line is built
-
-This matters to any client that renders it:
-
-- Audio is transcribed **while it arrives** (audio.cpp streaming endpoint), and
-  the words land in the row as the model emits them — roughly every 3 s of
-  speech. There is no word-by-word stream beyond that: it is the model's pace.
-- A line **ends when the speaker pauses at least 1.5 s *and* the sentence is
-  over** (the text ends with `.`, `!`, `?` or `…`). A pause in the middle of a
-  sentence does not split it, however long it is.
-- A line is also split at a full stop when it grows past 140 characters, so a
-  paragraph stays two or three lines on screen.
-- The translation follows the line: a partial one every 60 characters while it
-  grows, and the final one when the line closes. **The final one replaces the
-  partial**, so `mt` can change as a whole; the words that did not change stay
-  byte-identical.
-- `src` never contains the model's markers: `[0.00]`, `[S01]` and `Speaker 0:`
-  are stripped, as are `[Noise]`/`[Laughter]` tags. A delta that only repeats
-  what the line already says is dropped (the model loops on long audio).
-
-### When a line gets translated
-
-The first translation of a line is asked for as soon as it has ~20 characters,
-not when the line ends: waiting for a pause left the translator idle while the
-page showed a source line with nothing under it (measured: 14.8 s of idle in one
-minute of continuous speech). After that a line is translated again every ~60 new
-characters, and once more when it closes. Only one partial translation is in
-flight at a time, and a queued one always carries the **newest** text of the
-line, so a slow translator does not fall behind by translating text that has
-already moved on.
-
-Expect a delay between the source and its translation of one translation
-request: under a second for a local model, two to three seconds for a cloud one.
-
-### What live is not
-
-- **No speaker labels.** Live attribution would need online clustering; the
-  batch transcript is the labelled truth. A live session is a preview.
-- **Not a record.** The streaming model invents words when the audio is noisy or
-  after a loop. Use batch for anything you keep.
-
 ## Other routes
 
 | route | what |
@@ -221,7 +100,7 @@ request: under a second for a local model, two to three seconds for a cloud one.
 | `GET /files` | the archive ledger, newest first: audio and transcript rows |
 | `GET /archive` | cached WebDAV probe: `configured`, `reachable`, `url`, `error` |
 | `GET /hooks` | announcements, joined with the job whose upload has their file name |
-| `GET /`, `/ui`, `/live` | the dashboard (one bundle, the path picks the view) |
+| `GET /`, `/ui` | the dashboard |
 | `POST /hook` | the recorder announces a finished recording; idempotent |
 
 `POST /hook` takes `{"day":"YYYY-MM-DD","recording":"HH-MM-SS","files":["..."],
@@ -243,8 +122,7 @@ row without failing the transcription.
 
 ## Not part of this service
 
-The ASR and the translators are separate processes the service calls: Unsloth
-Studio on `:8888` (MOSS-Transcribe-Diarize for batch), audio.cpp on `:8090`
-(VibeVoice 7B for live, the same MOSS on the direct batch fallback), Mistral
-(cloud transcription and translation), Lemonade on `:8731` and the Bifrost
-gateway on `:8080` (translators). Nothing in this API exposes them directly.
+The ASR is a separate process the service calls: Unsloth Studio on `:8888`
+(MOSS-Transcribe-Diarize for batch), audio.cpp on `:8090` (the same MOSS on the
+direct batch fallback) or Mistral (cloud transcription). Nothing in this API
+exposes them directly.
