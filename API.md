@@ -25,7 +25,17 @@ curl -X POST "http://host:8099/jobs?filename=meeting.m4a&language=de" \
 
 The body **is** the audio: any format ffmpeg reads. `202` returns the job
 summary (`id`, `status`, ...). The id is a hash of the bytes, so re-uploading the
-same file returns the existing job instead of transcribing it twice.
+same file returns the existing job instead of transcribing it twice; the options
+of that second request replace the stored ones (so a corrected `language` takes
+effect at the next `retry`), while the filename stays the one the archive holds.
+
+`Content-Type` is not looked at. A `multipart/form-data` body is a `400`: no audio
+format starts with `--`, and storing the envelope would leave the client with a
+job over garbage after it deleted its own copy. An upload over `--max-upload`
+(512 MiB) is answered `413` after the body has been read out, so the client
+always sees it. `filename` is worth sending even though it is optional: it is the
+only format hint (`<hash>.bin` without it), the `audio-<name>` archive name and
+the `/hook` join key.
 
 Query parameters are per-job options (all optional):
 
@@ -107,8 +117,11 @@ uploaded copy** — the file you sent is yours and is not touched. All three ans
 "remote_dir":"...","language":"..."}`. It carries no audio and never starts a
 job; it only records that the recorder finished a recording. `GET /hooks` joins
 the announced file names to the uploaded job's `filename` and answers
-`missing_audio` when no upload has arrived. The response keeps the legacy `pair`
-key: it is the recording key (`zoom-YYYYMMDD-HHMMSS`), not a second track.
+`missing_audio` when no upload has arrived. The join is the base name, compared
+exactly: a recorder that re-encodes before uploading announces the name it
+actually sent (`zoom-20261020-123509-mix-16k.mp3`), not the master's. The
+response keeps the legacy `pair` key: it is the recording key
+(`zoom-YYYYMMDD-HHMMSS`), not a second track.
 
 `GET /files` rows carry `job_id`, `track`, `filename`, `size`, `sha256`,
 `received_at`, `status` (`received`, `running`, `queued`, `done`, `error`,

@@ -501,6 +501,32 @@ class JobRoutes(unittest.TestCase):
         self.assertIn(b"fixed", caught.exception.read())
         self.assertEqual(self.jobs.list(), [])
 
+    def test_a_multipart_upload_is_refused_not_stored_as_audio(self):
+        body = (b'--eco123\r\nContent-Disposition: form-data; name="file"; '
+                b'filename="a.mp3"\r\n\r\naudio\r\n--eco123--\r\n')
+        for headers in ({"Content-Type": "multipart/form-data; boundary=eco123"}, {}):
+            request = urllib.request.Request(self.base + "/jobs", data=body, method="POST",
+                                             headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=10)
+            self.assertEqual(caught.exception.code, 400)
+            self.assertIn(b"multipart", caught.exception.read())
+        self.assertEqual(self.jobs.list(), [])
+
+    def test_the_same_bytes_again_keep_the_job_and_apply_the_new_options(self):
+        self.jobs.submit(b"audio", {"language": "de"}, "a.mp3")
+        job = self.jobs.submit(b"audio", {"language": "it"}, "a.mp3")
+        self.assertEqual(len(self.jobs.list()), 1)
+        self.assertEqual(job["options"], {"language": "it"})
+
+    def test_an_upload_over_the_limit_answers_413(self):
+        self.server.max_upload = 8
+        request = urllib.request.Request(self.base + "/jobs", data=b"x" * 4096, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(caught.exception.code, 413)
+        self.assertEqual(self.jobs.list(), [])
+
     def test_mcp_does_not_offer_or_accept_a_model(self):
         tool = next(tool for tool in meeting_job.tools()
                     if tool["name"] == "transcribe_meeting")

@@ -62,6 +62,8 @@ OPTION_FLAGS = (("language", "--language"), ("hotwords", "--hotwords"),
                 ("names", "--names"), ("max_tokens", "--max-tokens"),
                 ("asr_dir", "--asr-dir"), ("asr_remote_dir", "--asr-remote-dir"))
 MODEL_FIXED = "the diarization model is fixed by the service (BATCH_MODEL/--model)"
+MULTIPART = ("send the audio as the request body, not multipart/form-data "
+             "(see API.md); nothing was stored, retry with the bare file")
 # meeting-transcribe wants ints for these; every other flag takes a float or a string.
 INT_OPTIONS = ("max_tokens",)
 
@@ -542,7 +544,12 @@ class Jobs:
                 job = Job(identity, options)
                 self._jobs[identity] = job
             elif job.status != "error":
-                return self._view(job)  # the same file again: nothing to do
+                # The same bytes again: nothing to transcribe, but a corrected
+                # option (the language, a hotword) must not be dropped silently
+                # - it applies from the next retry on.
+                job.options = options or job.options
+                self._persist()
+                return self._view(job)
             path = self.inbox / (identity + safe_suffix(filename))
             path.write_bytes(audio)
             job.tracks["main"] = path
@@ -983,6 +990,14 @@ class Handler(BaseHTTPRequestHandler):
     def _body(self) -> bytes | None:
         length = int(self.headers.get("Content-Length") or 0)
         if length > self.server.max_upload:
+            # Drain first: answering while the client is still writing turns the
+            # 413 into a connection reset it never gets to read.
+            left = length
+            while left > 0:
+                chunk = self.rfile.read(min(262144, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
             self._json(413, {"error": f"upload over {self.server.max_upload} bytes"})
             return None
         return self.rfile.read(length) if length else b""
@@ -1074,6 +1089,14 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/jobs":
             if not body:
                 self._json(400, {"error": "empty body: send the audio as the request body"})
+                return
+            # No audio format starts with "--": that is the envelope of a client
+            # still speaking the old OpenAI route. Refusing it is the difference
+            # between an error it sees and a job over garbage (it deletes its own
+            # copy on a 202).
+            if self.headers.get("Content-Type", "").lower().startswith("multipart/") \
+                    or body.startswith(b"--"):
+                self._json(400, {"error": MULTIPART})
                 return
             query = urllib.parse.parse_qs(parsed.query)
             if "model" in query:
