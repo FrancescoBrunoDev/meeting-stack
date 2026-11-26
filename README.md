@@ -1,4 +1,4 @@
-# meeting-stack
+# Eco-Remote
 
 Diarized transcripts of long meetings. The inference (Unsloth Studio, audio.cpp,
 Mistral, Lemonade) lives on a GPU box; the service is one plain container that
@@ -41,7 +41,7 @@ Studio's transcribe workflow, the same one its own `/audio` page runs: the
 original file is uploaded raw (the studio decodes it, so no normalization and no
 shared directory), then a transcription named by the uploaded input answers as
 NDJSON with timestamped segments carrying the speaker labels. It takes up to 4
-hours (the studio's `max_seconds`). That is why meeting-stack does not use the
+hours (the studio's `max_seconds`). That is why Eco-Remote does not use the
 OpenAI-compatible `/v1/audio/transcriptions` route: it stops at 30 minutes, and
 `verbose_json` drops the speakers anyway.
 

@@ -1,4 +1,4 @@
-# Working on meeting-stack
+# Working on Eco-Remote
 
 Diarized transcripts of long meetings on the Strix Halo box (`ubuntu`, user
 `francesco`). Read `README.md` for the user-facing description; this file is what

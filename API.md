@@ -1,4 +1,4 @@
-# meeting-stack API
+# Eco-Remote API
 
 Everything is one HTTP service: `meeting-job` on `http://<host>:8099`. It does two
 different jobs, and they behave differently:

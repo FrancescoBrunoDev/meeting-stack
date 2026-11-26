@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import ecoIcon from "./eco-icon.png"
 import {
   AlertCircle,
   Check,
@@ -331,8 +332,8 @@ function TopBar({ live }: { live: boolean }) {
   return (
     <header className="sticky top-0 z-20 border-b bg-background/95 backdrop-blur">
       <div className="mx-auto flex w-full max-w-5xl items-center gap-3 px-4 py-2.5">
-        <a href="/" className="text-sm font-semibold tracking-tight">
-          meeting-stack
+        <a href="/" className="flex items-center" aria-label="Eco-Remote" title="Eco-Remote">
+          <img src={ecoIcon} alt="" className="size-7 rounded" />
         </a>
         <nav className="flex items-center gap-1" aria-label="Views">
           <Button asChild variant={live ? "ghost" : "secondary"} size="sm">
