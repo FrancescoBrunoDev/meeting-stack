@@ -43,15 +43,6 @@ from pathlib import Path
 DEFAULT_ASR = "http://ubuntu:8090"  # audio.cpp
 DEFAULT_ASR_MODEL = "moss-transcribe-diarize"
 MAX_TOKENS = 512  # --max-tokens default; the audio.cpp run raises its own anyway
-# Two uploads of the same room (a microphone that also hears the loudspeakers)
-# are one conversation recorded twice. When this much of the shorter track's
-# speech is covered by the other, the second track is deduplicated instead of
-# unioned, so the same words do not come out as two different speakers.
-REDUNDANT_SHARE = 0.6
-# How much of a second-track turn the first track must already cover for it to
-# be the same wall-clock audio rather than a second voice.
-COVERED_SHARE = 0.5
-DUPLICATE_WINDOW_S = 1.5
 ATTEMPTS = 3
 RETRY_S = 1.0
 RETRYABLE = (408, 409, 429, 500, 502, 503, 504)
@@ -554,11 +545,6 @@ def audiocpp_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dic
     return turns
 
 
-def bare(text: str) -> str:
-    """A comparison key: case and punctuation do not make two lines different."""
-    return re.sub(r"[^\wäöüß ]", " ", text.lower()).strip()
-
-
 def timestamp(seconds: float) -> str:
     seconds = int(seconds)
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
@@ -571,129 +557,6 @@ def render_markdown(source: str, turns: list[dict]) -> str:
         lines.append(f"**[{timestamp(turn['start'])}] {who}:** {turn['text']}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
-
-
-def second_track_turns(turns: list[dict], after: int, name: str,
-                       diarized: bool = False) -> list[dict]:
-    """Label the second track so its speaker ids cannot collide with the first's.
-
-    A microphone track that carries one voice -- the recorder's own room --
-    becomes that voice: the id after the last remote speaker and the track's
-    name. When the track holds several voices the ids are only shifted, which
-    keeps 1..N for remote participants and N+1.. for the room; the name is
-    dropped, because several people share it.
-    """
-    if diarized:
-        return [dict(turn, speaker=turn["speaker"] + after)
-                for turn in number_speakers(turns)]
-    return [dict(turn, speaker=after + 1, name=name) for turn in turns]
-
-
-def match_speakers(first: list[dict], second: list[dict], offset: float = 0.0) -> list[dict]:
-    """Give every second-track speaker the first-track speaker it overlaps most.
-
-    Both tracks share a clock, so a voice heard at the same time is the same
-    person. A voice that only speaks where the first track has nothing (the
-    room kept recording) gets a new number after the last one.
-    """
-    shared: dict[tuple, float] = {}
-    for other in second:
-        start, end = other["start"] + offset, other["end"] + offset
-        for turn in first:
-            overlap = min(turn["end"], end) - max(turn["start"], start)
-            if overlap > 0:
-                key = (other["speaker"], turn["speaker"])
-                shared[key] = shared.get(key, 0.0) + overlap
-    free = max((turn["speaker"] for turn in first), default=0)
-    mapping: dict = {}
-    for speaker in sorted({turn["speaker"] for turn in second}):
-        options = [(weight, number) for (own, number), weight in shared.items() if own == speaker]
-        if options:
-            mapping[speaker] = max(options)[1]
-        else:
-            free += 1
-            mapping[speaker] = free
-    return [dict(turn, speaker=mapping[turn["speaker"]]) for turn in second]
-
-
-def speech_seconds(turns: list[dict]) -> float:
-    return sum(max(0.0, turn["end"] - turn["start"]) for turn in turns)
-
-
-def shared_seconds(first: list[dict], second: list[dict]) -> float:
-    return sum(max(0.0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
-               for a in first for b in second)
-
-
-def covered_share(turn: dict, turns: list[dict]) -> float:
-    length = turn["end"] - turn["start"]
-    if length <= 0:
-        return 0.0
-    return shared_seconds([turn], turns) / length
-
-
-def redundant(first: list[dict], second: list[dict], offset: float = 0.0) -> bool:
-    """Whether both tracks carry the same conversation, not two sides of it."""
-    shifted = [dict(turn, start=turn["start"] + offset, end=turn["end"] + offset)
-               for turn in second]
-    shorter = min(speech_seconds(first), speech_seconds(shifted))
-    return shorter > 0 and shared_seconds(first, shifted) / shorter >= REDUNDANT_SHARE
-
-
-def duplicate_turn(turn: dict, first: list[dict]) -> bool:
-    """Whether this second-track turn repeats audio the first track already has."""
-    if covered_share(turn, first) >= COVERED_SHARE:
-        return True
-    words = set(bare(turn["text"]).split())
-    for other in first:
-        if abs(other["start"] - turn["start"]) > DUPLICATE_WINDOW_S:
-            continue
-        theirs = set(bare(other["text"]).split())
-        union = words | theirs
-        if union and len(words & theirs) / len(union) > COVERED_SHARE:
-            return True
-    return False
-
-
-def dedupe_turns(turns: list[dict]) -> list[dict]:
-    """Drop a turn that repeats the words of an earlier, overlapping one.
-
-    The ASR sometimes cuts the same utterance into two overlapping turns for two
-    speaker ids; every clip then transcribes the same words twice. Only
-    runs of three words or more are compared, so a shared "ja" stays two lines.
-    """
-    kept: list[dict] = []
-    for turn in sorted(turns, key=lambda t: (t["start"], t["end"])):
-        words = set(bare(turn["text"]).split())
-        repeated = False
-        for other in kept:
-            if abs(other["start"] - turn["start"]) > DUPLICATE_WINDOW_S:
-                continue
-            if min(turn["end"], other["end"]) <= max(turn["start"], other["start"]):
-                continue
-            theirs = set(bare(other["text"]).split())
-            union = words | theirs
-            if min(len(words), len(theirs)) >= 3 and len(words & theirs) / len(union) > COVERED_SHARE:
-                repeated = True
-                break
-        if not repeated:
-            kept.append(turn)
-    return kept
-
-
-def merge_tracks(first: list[dict], second: list[dict], offset: float = 0.0) -> list[dict]:
-    """Put both tracks on one timeline, the second shifted by `offset` seconds.
-
-    Overlapping turns are kept as they are: two people talking at once are two
-    lines here, not one garbled one, because the channels already separate them.
-    When the tracks are the same room recorded twice, the second track's turns
-    that the first already covers are dropped instead of repeated.
-    """
-    shifted = [dict(turn, start=round(turn["start"] + offset, 3),
-                    end=round(turn["end"] + offset, 3)) for turn in second]
-    if redundant(first, second, offset):
-        shifted = [turn for turn in shifted if not duplicate_turn(turn, first)]
-    return sorted(first + shifted, key=lambda turn: (turn["start"], turn["end"]))
 
 
 PARAGRAPH_CHARS = 400   # a merged turn stays a paragraph, not a wall of text
@@ -709,9 +572,6 @@ def merge_paragraphs(turns: list[dict], cap: float = PARAGRAPH_CHARS,
     middle of a phrase, the speaker unchanged. Same speaker, a small gap and a
     sentence not finished yet means the model drew a line, not the speaker.
 
-    Runs on the finished timeline, after the tracks are merged: a longer first-track
-    turn would otherwise cover more of the microphone and duplicate_turn would drop
-    words that are not duplicates.
     """
     out: list[dict] = []
     for turn in turns:
@@ -732,12 +592,10 @@ def merge_paragraphs(turns: list[dict], cap: float = PARAGRAPH_CHARS,
 
 def track_turns(args, source: Path, workdir: Path, hotwords: str,
                 lenient: bool = False) -> list[dict]:
-    """Transcribe one track; the turns carry text, speakers and timestamps.
+    """Transcribe the recording; the turns carry text, speakers and timestamps.
 
-    `workdir` belongs to this track alone, so the two tracks of one job never
-    overwrite each other's normalized WAV. `lenient` turns an ASR that found no
-    speech into an empty track instead of failing the job; it is for a
-    microphone track that may be silent.
+    `lenient` turns an ASR that found no speech into an empty result instead of
+    failing the job.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     if is_mistral_asr(args.model):
@@ -778,14 +636,6 @@ def main() -> None:
     parser.add_argument("--names", default=None,
                         help='name the speakers, e.g. "1:Anna,2:Bernd"; the names also go '
                              "into the ASR hotwords")
-    parser.add_argument("--second", type=Path, default=None,
-                        help="second track of the same recording (the microphone side), "
-                             "merged onto the same timeline with --second-offset")
-    parser.add_argument("--second-name", default="Me",
-                        help="name of the second track's lone speaker (default Me)")
-    parser.add_argument("--second-offset", type=float, default=0.0,
-                        help="seconds to add to the second track's timestamps when its file "
-                             "starts later than the first (default 0)")
     parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS,
                         help=f"output cap for the audiocpp request (default {MAX_TOKENS}, "
                              "raised internally to {AUDIOCPP_MAX_TOKENS}: a tight cap loses "
@@ -798,9 +648,6 @@ def main() -> None:
     source = args.input.resolve()
     if not source.is_file():
         raise SystemExit(f"No such audio file: {source}")
-    second_source = args.second.resolve() if args.second else None
-    if second_source is not None and not second_source.is_file():
-        raise SystemExit(f"No such audio file: {second_source}")
     names = parse_names(args.names)
     hotwords = ", ".join(part for part in (args.hotwords, ", ".join(names.values())) if part)
     prefix = args.output or source.with_suffix("")
@@ -812,35 +659,8 @@ def main() -> None:
         workdir = Path(temporary)
         labelled = track_turns(args, source, workdir / "main", hotwords)
         duration = wav_seconds(workdir / "main" / "audio.wav")
-        if second_source is not None:
-            # The microphone track may be silent: an empty track, not a dead job.
-            second = track_turns(args, second_source, workdir / "second", hotwords,
-                                 lenient=True)
-            after = max((t["speaker"] for t in labelled), default=0)
-            voices = len({turn["speaker"] for turn in second})
-            if redundant(labelled, second, args.second_offset):
-                # The two tracks each diarized the same room on their own, so
-                # the microphone that hears it again has its own speaker_1,
-                # speaker_2, ... — which would show up as extra speakers the
-                # system track never saw. The shared clock says which
-                # first-track speaker each mic voice is (49% of the mic
-                # track's speech overlapped the system track in the
-                # zoom-20261110 recording), so match them instead of shifting
-                # the ids. Calling them "Me" would be a lie several times.
-                second = match_speakers(labelled, second, args.second_offset)
-            elif voices > 1:
-                second = second_track_turns(second, after, args.second_name, diarized=True)
-            else:
-                second = second_track_turns(second, after, args.second_name)
-            labelled = merge_tracks(labelled, second, args.second_offset)
-            print(f"second track: {len(second)} turns added", file=sys.stderr)
-            second_duration = wav_seconds(workdir / "second" / "audio.wav")
-            if second_duration:
-                duration = max(duration or 0.0, second_duration)
         print(f"{len(labelled)} turns in total", file=sys.stderr)
 
-    labelled = dedupe_turns(labelled)
-    print(f"{len(labelled)} turns after removing repeated cuts", file=sys.stderr)
     before = len(labelled)
     labelled = merge_paragraphs(labelled)
     if len(labelled) < before:
@@ -863,8 +683,6 @@ def main() -> None:
                 # The recording's length, so a client does not have to guess it
                 # from the last turn (which ends where the speech ends).
                 "duration": duration, "turns": result}
-    if second_source is not None:
-        document["second"] = str(second_source)
     Path(f"{prefix}.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
                                       encoding="utf-8")
     Path(f"{prefix}.md").write_text(render_markdown(str(source), result), encoding="utf-8")

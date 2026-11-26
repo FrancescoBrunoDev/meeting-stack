@@ -38,8 +38,9 @@
 #
 #   Archive (optional): copy .env.example to .env and fill WEBDAV_URL,
 #   WEBDAV_USER and WEBDAV_PASSWORD. Compose reads .env for interpolation, then
-#   every received file is PUT to WebDAV/<WEBDAV_DIR>/<job>/<track>-<name> and
-#   tracked in a SQLite ledger on the meeting-db volume (GET /files). Without
+#   every received file is PUT under WebDAV/<WEBDAV_DIR>/<job>/ as
+#   audio-<name>, with transcript.md and .json, and tracked in a SQLite ledger
+#   on the meeting-db volume (GET /files). Without
 #   WEBDAV_URL the ledger still records the files, no copy is made.
 #
 #   --keep-audio and --live-stream are the service defaults; add

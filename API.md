@@ -44,14 +44,12 @@ Query parameters are per-job options (all optional):
 | `names` | `1:Anna,2:Bernd` |
 | `hotwords` | names and jargon to bias the ASR |
 | `max_tokens` | the audiocpp output cap |
-| `second_name`, `second_offset` | the microphone track of a two-track recording |
 | `model` | the model names its provider: `unsloth.*` goes to Unsloth Studio's
   transcribe workflow (up to 4 h, diarized segments), `mistral.voxtral-*` to
   Mistral's with `diarize=true`, anything else to audio.cpp (the unit and
   compose deploy `unsloth.MOSS-Transcribe-Diarize`) |
 
-Two tracks of the same recording are paired by `filename`: upload both with the
-same name and one job covers both.
+The body is one already-mixed recording; there is no second input to pair.
 
 ### Read
 
@@ -62,8 +60,8 @@ curl http://host:8099/jobs/<id>/audio    # the kept upload, range requests work
 curl -X POST http://host:8099/jobs/<id>/retry
 ```
 
-`status` is `waiting` (one of two tracks has arrived), `queued`, `running`,
-`done`, `error` or `cancelled`; `progress` is a human line, not a percentage. When `done`, the job carries `json` and `markdown`:
+`status` is `queued`, `running`, `done`, `error` or `cancelled`; `progress` is
+a human line, not a percentage. When `done`, the job carries `json` and `markdown`:
 
 ```json
 {"source": "...", "model": "moss-transcribe-diarize", "language": "de",
@@ -220,16 +218,20 @@ request: under a second for a local model, two to three seconds for a cloud one.
 | route | what |
 |---|---|
 | `GET /health` | `{"status":"ok","jobs":N,"queue":N,"archive":bool}`, no auth |
-| `GET /files` | the archive ledger, newest first: one row per received file |
+| `GET /files` | the archive ledger, newest first: audio and transcript rows |
+| `GET /archive` | cached WebDAV probe: `configured`, `reachable`, `url`, `error` |
 | `GET /`, `/ui`, `/live` | the dashboard (one bundle, the path picks the view) |
 | `POST /hook` | the recorder announces a finished recording; idempotent |
 
 `GET /files` rows carry `job_id`, `track`, `filename`, `size`, `sha256`,
 `received_at`, `status` (`received`, `running`, `queued`, `done`, `error`,
 `cancelled`), `error`, `archived_at`, `webdav_url` and `archive_error`. The
-ledger is SQLite at `ARCHIVE_DB` (default `<dir>/archive.db`); when `WEBDAV_URL`
-is set the file is also PUT to WebDAV as the job ends, and an archive failure is
-recorded on the row without failing the transcription.
+audio row has `track=audio`; a finished job also has `transcript.md` and
+`transcript.json`. The ledger is SQLite at `ARCHIVE_DB` (default
+`<dir>/archive.db`); when `WEBDAV_URL` is set the job folder
+`<WEBDAV_DIR>/<job_id>/` is created and the audio (`audio-<name>`) and both
+transcripts are PUT there as the job ends. An archive failure is recorded on the
+row without failing the transcription.
 
 ## Not part of this service
 

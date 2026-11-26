@@ -47,31 +47,6 @@ class WordRebuilding(unittest.TestCase):
         # "Satz\nzweiter" would produce "Satzzweiter".
         self.assertEqual(meeting.unwrap("die In\nsel verlassen"), "die In sel verlassen")
 
-class Turns(unittest.TestCase):
-
-    def test_an_utterance_cut_for_two_speakers_is_kept_once(self):
-        turns = [{"speaker": 4, "start": 10.0, "end": 12.0,
-                  "text": "Ja wegen der Zeitabrechnung, aber."},
-                 {"speaker": 3, "start": 10.5, "end": 13.0,
-                  "text": "wegen der Zeitabrechnung, aber ja."}]
-        self.assertEqual(len(meeting.dedupe_turns(turns)), 1)
-
-    def test_different_words_talking_at_once_stay_two_lines(self):
-        turns = [{"speaker": 1, "start": 10.0, "end": 12.0, "text": "ich sage etwas"},
-                 {"speaker": 2, "start": 10.5, "end": 13.0, "text": "und ich etwas anderes"}]
-        self.assertEqual(len(meeting.dedupe_turns(turns)), 2)
-
-    def test_a_shared_single_word_is_not_a_duplicate(self):
-        turns = [{"speaker": 1, "start": 10.0, "end": 11.0, "text": "ja"},
-                 {"speaker": 2, "start": 10.5, "end": 11.5, "text": "ja"}]
-        self.assertEqual(len(meeting.dedupe_turns(turns)), 2)
-
-    def test_the_same_words_far_apart_are_two_turns(self):
-        turns = [{"speaker": 1, "start": 10.0, "end": 11.0, "text": "guten morgen zusammen"},
-                 {"speaker": 1, "start": 30.0, "end": 31.0, "text": "guten morgen zusammen"}]
-        self.assertEqual(len(meeting.dedupe_turns(turns)), 2)
-
-
 class AnnouncedRecordings(unittest.TestCase):
     """POST /hook: a recording is announced once its tracks are on WebDAV."""
 
@@ -117,6 +92,20 @@ class AnnouncedRecordings(unittest.TestCase):
         self.assertEqual(self.hooks.announce({"day": "nope"})[1],
                          "expected day=YYYY-MM-DD and recording=HH-MM-SS")
         self.assertEqual(len(self.hooks.list()), 0)
+
+    def test_an_announcement_joins_the_upload_by_file_name(self):
+        entry, _ = self.hooks.announce({
+            "day": "2026-10-20", "recording": "12-35-09",
+            "files": ["audio/zoom-20261020-123509-mix.mp3"]})
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as jobs_dir:
+            jobs = meeting_job.Jobs(HERE / "meeting-transcribe", Path(jobs_dir))
+            try:
+                job = jobs.submit(b"mixed", {}, "zoom-20261020-123509-mix.mp3")
+                view = meeting_job.hook_view(self.hooks, jobs, entry["pair"])[0]
+                self.assertEqual(view["job"], job["id"])
+                self.assertNotEqual(view["status"], "missing_audio")
+            finally:
+                jobs.stop()
 
     def test_announced_but_never_uploaded_is_visible(self):
         self.hooks.announce({"day": "2026-10-20", "recording": "12-35-09"})
@@ -240,67 +229,33 @@ class MergeParagraphs(unittest.TestCase):
         self.assertEqual(len(meeting.merge_paragraphs(turns)), 2)
 
 
-class TwoTracks(unittest.TestCase):
-    """System track + microphone track: one conversation, two files."""
+class SingleFile(unittest.TestCase):
+    """The recorder sends one mixed file; there is no second input to wait for."""
 
-    def test_the_tracks_are_interleaved_by_time(self):
-        first = [{"speaker": 1, "start": 0.0, "end": 4.0, "text": "hallo"},
-                 {"speaker": 2, "start": 9.0, "end": 12.0, "text": "ja"}]
-        second = [{"speaker": 3, "start": 5.0, "end": 8.0, "text": "guten tag"}]
-        merged = meeting.merge_tracks(first, second)
-        self.assertEqual([t["text"] for t in merged], ["hallo", "guten tag", "ja"])
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        self.jobs = meeting_job.Jobs(Path("/bin/true"), Path(self.dir.name))
+        self.addCleanup(self.jobs.stop)
 
-    def test_an_offset_moves_the_second_track(self):
-        second = [{"speaker": 3, "start": 5.0, "end": 8.0, "text": "guten tag"}]
-        merged = meeting.merge_tracks([], second, offset=2.5)
-        self.assertEqual((merged[0]["start"], merged[0]["end"]), (7.5, 10.5))
+    def test_an_upload_is_queued_immediately(self):
+        job = self.jobs.submit(b"mixed", {}, "meeting.mp3")
+        self.assertNotEqual(job["status"], "waiting")
 
-    def test_the_same_room_recorded_twice_is_not_repeated(self):
-        # A microphone that also hears the loudspeakers: same speech, other
-        # segmentation. Only the tail the system track does not have survives.
-        first = [{"speaker": 1, "start": 0.0, "end": 40.0, "text": "hallo zusammen"}]
-        second = [{"speaker": 5, "start": 0.1, "end": 39.9, "text": "hallo zusammen"},
-                  {"speaker": 5, "start": 41.0, "end": 50.0, "text": "tschüss"}]
-        merged = meeting.merge_tracks(first, second)
-        self.assertEqual([t["text"] for t in merged], ["hallo zusammen", "tschüss"])
+    def test_the_same_bytes_are_one_job(self):
+        first = self.jobs.submit(b"mixed", {}, "meeting.mp3")
+        again = self.jobs.submit(b"mixed", {}, "meeting.mp3")
+        self.assertEqual(first["id"], again["id"])
 
-    def test_tracks_of_the_same_room_are_recognised_as_one(self):
-        first = [{"speaker": 1, "start": 0.0, "end": 10.0, "text": "a"}]
-        same = [{"speaker": 5, "start": 0.1, "end": 9.9, "text": "a"}]
-        other = [{"speaker": 5, "start": 12.0, "end": 20.0, "text": "b"}]
-        self.assertTrue(meeting.redundant(first, same))
-        self.assertFalse(meeting.redundant(first, other))
+    def test_two_recordings_are_two_jobs(self):
+        first = self.jobs.submit(b"one", {}, "meeting.mp3")
+        second = self.jobs.submit(b"two", {}, "meeting.mp3")
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(len(list((Path(self.dir.name) / "inbox").iterdir())), 2)
 
-    def test_crosstalk_on_complementary_tracks_is_kept(self):
-        # Local and remote alternate: little shared speech, so nothing is dropped.
-        first = [{"speaker": 1, "start": 0.0, "end": 10.0, "text": "a"},
-                 {"speaker": 1, "start": 20.0, "end": 30.0, "text": "b"}]
-        second = [{"speaker": 2, "start": 10.5, "end": 20.5, "text": "c"}]
-        merged = meeting.merge_tracks(first, second)
-        self.assertEqual([t["text"] for t in merged], ["a", "c", "b"])
 
-    def test_a_repeated_short_turn_is_dropped_even_without_overlap(self):
-        first = [{"speaker": 1, "start": 5.2, "end": 5.5, "text": "ja"},
-                 {"speaker": 1, "start": 30.0, "end": 40.0, "text": "weiter"}]
-        second = [{"speaker": 2, "start": 5.6, "end": 6.0, "text": "ja"},
-                  {"speaker": 2, "start": 32.0, "end": 38.0, "text": "weiter"}]
-        self.assertEqual([t["text"] for t in meeting.merge_tracks(first, second)], ["ja", "weiter"])
-
-    def test_a_voice_of_the_second_track_gets_the_speaker_it_overlaps(self):
-        first = [{"speaker": 1, "start": 0.0, "end": 10.0, "text": "a"},
-                 {"speaker": 2, "start": 10.0, "end": 20.0, "text": "b"}]
-        second = [{"speaker": 1, "start": 0.0, "end": 9.0, "text": "a"},
-                  {"speaker": 2, "start": 10.0, "end": 19.0, "text": "b"},
-                  {"speaker": 3, "start": 21.0, "end": 25.0, "text": "c"}]
-        matched = meeting.match_speakers(first, second)
-        self.assertEqual([t["speaker"] for t in matched], [1, 2, 3])
-
-    def test_a_microphone_track_is_one_speaker_after_the_remote_ones(self):
-        turns = [{"speaker": 0, "start": 1.0, "end": 2.0, "text": "a"},
-                 {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
-        labelled = meeting.second_track_turns(turns, after=4, name="Me")
-        self.assertEqual([t["speaker"] for t in labelled], [5, 5])
-        self.assertEqual({t["name"] for t in labelled}, {"Me"})
+class AudioCppUploads(unittest.TestCase):
+    """The upload path, used when audio.cpp cannot read a shared directory."""
 
     def test_audio_cpp_upload_when_no_shared_dir(self):
         """No --asr-dir (the service and audio.cpp on different machines):
@@ -370,28 +325,6 @@ class TwoTracks(unittest.TestCase):
             meeting.normalize_wav, meeting.wav_seconds = orig_norm, orig_wav
             meeting.AUDIOCPP_UPLOAD_MAX_BYTES = orig_limit
 
-    def test_a_diarized_second_track_numbsers_after_the_first(self):
-        turns = [{"speaker": 0, "start": 1.0, "end": 2.0, "text": "a"},
-                 {"speaker": 1, "start": 3.0, "end": 4.0, "text": "b"}]
-        labelled = meeting.second_track_turns(turns, after=3, name="Room", diarized=True)
-        self.assertEqual([t["speaker"] for t in labelled], [4, 5])
-
-    def test_a_silent_mic_track_is_not_a_failed_job(self):
-        args = types.SimpleNamespace(model="voxtral-mini-transcribe-3",
-                                     language=None, asr_timeout=10, mistral_key="k")
-        original = meeting.transcribe_mistral
-        meeting.transcribe_mistral = lambda *a, **k: []
-        original_norm = meeting.normalize_wav
-        meeting.normalize_wav = lambda source, out: None
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                turns = meeting.track_turns(args, Path(directory) / "mic.wav",
-                                            Path(directory) / "work", "", lenient=True)
-                self.assertEqual(turns, [])
-        finally:
-            meeting.transcribe_mistral = original
-            meeting.normalize_wav = original_norm
-
 
 class JobSummaryFields(unittest.TestCase):
     """The list endpoint strips the transcript, so it must keep what the table shows."""
@@ -406,51 +339,6 @@ class JobSummaryFields(unittest.TestCase):
         self.assertNotIn("json", summary)
 
 
-class TrackPairing(unittest.TestCase):
-    """The recorder uploads one file per track; they must become one job."""
-
-    def test_the_recorders_file_names_pair_themselves(self):
-        self.assertEqual(meeting_job.track_and_pair("zoom-20261020-205058-system-16k.mp3", {}),
-                         ("main", "zoom-20261020-205058"))
-        self.assertEqual(meeting_job.track_and_pair("zoom-20261020-205058-mic-16k.mp3", {}),
-                         ("second", "zoom-20261020-205058"))
-
-    def test_a_plain_upload_is_its_own_job(self):
-        self.assertEqual(meeting_job.track_and_pair("meeting.m4a", {}), ("main", None))
-
-    def test_query_parameters_win_over_the_file_name(self):
-        self.assertEqual(meeting_job.track_and_pair("x.mp3", {"track": "mic", "pair": "abc"}),
-                         ("second", "abc"))
-
-    def setUp(self):
-        # The worker thread may still be writing when the test ends.
-        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.dir.cleanup)
-        root = Path(self.dir.name)
-        self.jobs = meeting_job.Jobs(Path("/bin/true"), root,                                      pair_wait=10000)
-
-    def test_both_tracks_land_on_one_job(self):
-        first = self.jobs.submit(b"system", {}, "zoom-1-system-16k.mp3")
-        self.assertEqual(first["status"], "waiting")
-        self.assertEqual(self.jobs.queued(), 0)
-        second = self.jobs.submit(b"mic", {}, "zoom-1-mic-16k.mp3")
-        self.assertEqual(second["id"], first["id"])
-        self.assertEqual(second["tracks"], ["main", "second"])
-
-    def test_the_upload_order_does_not_matter(self):
-        first = self.jobs.submit(b"mic", {}, "zoom-2-mic-16k.mp3")
-        self.assertEqual(first["status"], "waiting")
-        second = self.jobs.submit(b"system", {}, "zoom-2-system-16k.mp3")
-        self.assertEqual(second["id"], first["id"])
-        self.assertEqual(second["tracks"], ["main", "second"])
-
-    def test_the_same_track_twice_is_one_job(self):
-        first = self.jobs.submit(b"system", {}, "zoom-3-system-16k.mp3")
-        again = self.jobs.submit(b"system", {}, "zoom-3-system-16k.mp3")
-        self.assertEqual(again["id"], first["id"])
-        self.assertEqual(again["tracks"], ["main"])
-
-
 class Retry(unittest.TestCase):
     """A failed job keeps its upload, so it can be run again without re-uploading."""
 
@@ -458,7 +346,7 @@ class Retry(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.dir.cleanup)
         root = Path(self.dir.name)
-        self.jobs = meeting_job.Jobs(Path("/bin/true"), root,                                      pair_wait=10000)
+        self.jobs = meeting_job.Jobs(Path("/bin/true"), root,                                      )
         # Not submit(): that queues the job and the worker races the test.
         audio = root / "inbox" / "meeting.wav"
         audio.write_bytes(b"audio")
@@ -499,7 +387,7 @@ class Stopping(unittest.TestCase):
         self.worker.write_text("#!/bin/sh\nsleep 30\n")
         self.worker.chmod(0o755)
         self.jobs = meeting_job.Jobs(self.worker, self.root, 
-                                     pair_wait=10000)
+                                     )
         self.addCleanup(self.jobs.stop)
 
     def wait_for(self, predicate, timeout=5.0):
@@ -577,7 +465,7 @@ class JobRoutes(unittest.TestCase):
         self.addCleanup(self.dir.cleanup)
         self.root = Path(self.dir.name)
         self.jobs = meeting_job.Jobs(Path("/bin/true"), self.root,
-                                      pair_wait=10000)
+                                      )
         self.addCleanup(self.jobs.stop)
         self.server = meeting_job.Server(
             ("127.0.0.1", 0), self.jobs,
@@ -630,7 +518,7 @@ class Persistence(unittest.TestCase):
 
     def start(self, **kwargs):
         jobs = meeting_job.Jobs(Path("/bin/true"), self.root, 
-                                pair_wait=10000, **kwargs)
+                                **kwargs)
         self.addCleanup(jobs.stop)
         return jobs
 
@@ -651,12 +539,6 @@ class Persistence(unittest.TestCase):
         self.assertEqual(restored["options"], {"language": "de"})
         self.assertEqual(restored["markdown"], "# transcript\n")
         self.assertTrue(restored["audio"])
-
-    def test_a_job_waiting_for_its_second_track_stays_waiting(self):
-        jobs = self.start()
-        snap = jobs.submit(b"mic", {}, "zoom-1-mic-16k.mp3")
-        self.assertEqual(snap["status"], "waiting")
-        self.assertEqual(self.start().get(snap["id"])["status"], "waiting")
 
     def test_a_job_cut_off_by_the_restart_is_an_error_with_the_audio_kept(self):
         jobs = self.start()
@@ -684,7 +566,7 @@ class Retention(unittest.TestCase):
 
     def start(self, **kwargs):
         jobs = meeting_job.Jobs(Path("/bin/true"), self.root, 
-                                pair_wait=10000, **kwargs)
+                                **kwargs)
         self.addCleanup(jobs.stop)
         return jobs
 
@@ -726,16 +608,19 @@ class Archiving(unittest.TestCase):
         self.root = Path(self.dir.name)
 
     def test_a_received_file_is_recorded_and_archived(self):
-        sent = {}
+        sent = []
 
         class StubWebDAV:
-            def put(self, name, data):
-                sent["name"], sent["data"] = name, data
-                return f"https://dav.example/meeting-stack/{name}"
+            def put(self, name, data, folder=None):
+                sent.append({"name": name, "data": data, "folder": folder})
+                return f"https://dav.example/meeting-stack/{folder}/{name}"
+
+            def folder_url(self, folder):
+                return f"https://dav.example/meeting-stack/{folder}"
 
         archive = meeting_job.Archive(self.root / "archive.db", StubWebDAV())
         audio = b"RIFF a meeting"
-        archive.received("0123456789abcdef", "main", "zoom-1-system-16k.mp3", audio)
+        archive.received("0123456789abcdef", "audio", "zoom-1-system-16k.mp3", audio)
         row = archive.rows()[0]
         self.assertEqual(row["status"], "received")
         self.assertEqual(row["size"], len(audio))
@@ -746,33 +631,40 @@ class Archiving(unittest.TestCase):
         job.tracks["main"].parent.mkdir()
         job.tracks["main"].write_bytes(audio)
         job.status, job.finished = "done", 1.0
+        job.markdown = "# meeting\n"
+        job.json = {"turns": [{"speaker": 1, "start": 0.0, "end": 1.0, "text": "hi"}]}
         archive.finish(job)
 
-        row = archive.rows()[0]
+        row = next(row for row in archive.rows() if row["track"] == "audio")
         self.assertEqual(row["status"], "done")
         self.assertIsNotNone(row["archived_at"])
         self.assertEqual(row["webdav_url"],
-                         "https://dav.example/meeting-stack/main-zoom-1-system-16k.mp3")
-        self.assertEqual(sent,
-                         {"name": "main-zoom-1-system-16k.mp3", "data": audio})
+                         "https://dav.example/meeting-stack/0123456789abcdef/"
+                         "audio-zoom-1-system-16k.mp3")
+        self.assertIn({"name": "audio-zoom-1-system-16k.mp3", "data": audio,
+                       "folder": "0123456789abcdef"}, sent)
+        self.assertEqual([item["name"] for item in sent],
+                         ["audio-zoom-1-system-16k.mp3", "transcript.md",
+                          "transcript.json"])
+        self.assertEqual(len(archive.rows()), 3)  # audio + transcript.md + .json
         self.assertTrue(archive.archived(job.id))
 
     def test_a_webdav_failure_is_kept_on_the_row_not_raised(self):
         class BrokenWebDAV:
-            def put(self, name, data):
+            def put(self, name, data, folder=None):
                 raise urllib.error.URLError("dav is down")
 
         archive = meeting_job.Archive(self.root / "archive.db", BrokenWebDAV())
         audio = self.root / "inbox" / "meeting.mp3"
         audio.parent.mkdir()
         audio.write_bytes(b"audio")
-        archive.received("0123456789abcdef", "main", "meeting.mp3", b"audio")
+        archive.received("0123456789abcdef", "audio", "meeting.mp3", b"audio")
         job = meeting_job.Job("0123456789abcdef", {})
         job.tracks, job.status = {"main": audio}, "done"
         with io.StringIO() as output:  # the archive prints its failure
             with contextlib.redirect_stdout(output):
                 archive.finish(job)
-        row = archive.rows()[0]
+        row = next(row for row in archive.rows() if row["track"] == "audio")
         self.assertEqual(row["status"], "done")
         self.assertIsNone(row["archived_at"])
         self.assertIn("dav is down", row["archive_error"])
@@ -802,32 +694,34 @@ class Archiving(unittest.TestCase):
         try:
             dav = meeting_job.WebDAV("https://dav.example/root", "user", "pass",
                                      "meetings")
-            url = dav.put("main-a b.mp3", b"audio")
+            url = dav.put("main-a b.mp3", b"audio", folder="job1")
             # force is what the status probe uses: it must hit the wire even
             # though the folder was created a moment ago.
             self.assertEqual(dav.ensure(force=True),
                              "https://dav.example/root/meetings")
         finally:
             meeting_job.urllib.request.urlopen = original
-        self.assertEqual([call[0] for call in calls], ["MKCOL", "PUT", "MKCOL"])
+        self.assertEqual([call[0] for call in calls],
+                         ["MKCOL", "MKCOL", "PUT", "MKCOL"])
         self.assertEqual(calls[0][1], "https://dav.example/root/meetings")
-        self.assertEqual(calls[1][1],
-                         "https://dav.example/root/meetings/main-a%20b.mp3")
-        self.assertEqual(url, calls[1][1])
+        self.assertEqual(calls[1][1], "https://dav.example/root/meetings/job1")
+        self.assertEqual(calls[2][1],
+                         "https://dav.example/root/meetings/job1/main-a%20b.mp3")
+        self.assertEqual(url, calls[2][1])
         expected = "Basic " + meeting_job.base64.b64encode(b"user:pass").decode()
-        self.assertEqual(calls[1][2], expected)
+        self.assertEqual(calls[2][2], expected)
 
     def test_without_webdav_the_ledger_still_records_and_keeps(self):
         archive = meeting_job.Archive(self.root / "archive.db")
-        archive.received("0123456789abcdef", "main", "meeting.mp3", b"audio")
+        archive.received("0123456789abcdef", "audio", "meeting.mp3", b"audio")
         self.assertEqual(archive.rows()[0]["status"], "received")
         self.assertTrue(archive.archived("0123456789abcdef"))
         self.assertEqual(archive.job_state("0123456789abcdef")["state"], "off")
 
     def test_the_job_state_walks_from_pending_to_archived(self):
         class StubWebDAV:
-            def put(self, name, data):
-                return f"https://dav.example/meeting-stack/{name}"
+            def put(self, name, data, folder=None):
+                return f"https://dav.example/meeting-stack/{folder}/{name}"
 
             def ensure(self, timeout=None, force=False):
                 return "https://dav.example/meeting-stack"
@@ -835,10 +729,13 @@ class Archiving(unittest.TestCase):
             def target(self):
                 return "https://dav.example/meeting-stack"
 
+            def folder_url(self, folder):
+                return f"https://dav.example/meeting-stack/{folder}"
+
         archive = meeting_job.Archive(self.root / "archive.db", StubWebDAV())
         identity = "0123456789abcdef"
         self.assertIsNone(archive.job_state(identity))
-        archive.received(identity, "main", "meeting.mp3", b"audio")
+        archive.received(identity, "audio", "meeting.mp3", b"audio")
         self.assertEqual(archive.job_state(identity)["state"], "pending")
 
         audio = self.root / "inbox" / "meeting.mp3"
@@ -850,7 +747,10 @@ class Archiving(unittest.TestCase):
         state = archive.job_state(identity)
         self.assertEqual(state["state"], "archived")
         self.assertEqual(state["url"],
-                         "https://dav.example/meeting-stack/main-meeting.mp3")
+                         "https://dav.example/meeting-stack/0123456789abcdef/"
+                         "audio-meeting.mp3")
+        self.assertEqual(state["folder"],
+                         "https://dav.example/meeting-stack/0123456789abcdef")
 
     def test_the_probe_cache_skips_a_second_round_trip(self):
         class CountingWebDAV:
@@ -899,14 +799,14 @@ class Archiving(unittest.TestCase):
         self.assertIn("dav is down", answer["error"])
 
     def test_submit_records_the_upload_before_the_worker_runs(self):
-        jobs = meeting_job.Jobs(Path("/bin/true"), self.root, pair_wait=10000)
+        jobs = meeting_job.Jobs(Path("/bin/true"), self.root)
         self.addCleanup(jobs.stop)
         job = jobs.submit(b"audio", {}, "meeting.mp3")
         rows = jobs.archive.rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["job_id"], job["id"])
         self.assertEqual(rows[0]["filename"], "meeting.mp3")
-        self.assertEqual(rows[0]["track"], "main")
+        self.assertEqual(rows[0]["track"], "audio")
         self.assertEqual(job["archive"]["state"], "off")
 
 class ByteRange(unittest.TestCase):
@@ -1568,66 +1468,6 @@ class LiveLines(unittest.TestCase):
             {"speaker": 1, "start": 0.2, "end": 0.8, "text": "Teil."},
             {"speaker": 1, "start": 1.2, "end": 1.8, "text": "Teil."},
         ])
-
-    def test_mistral_second_track_is_matched_not_shifted(self):
-        """Voxtral diarizes each track separately; the mic track that hears the
-        same room must be matched to the system speakers, not become speaker 4."""
-        import subprocess
-        calls = []
-        real_run = subprocess.run
-
-        def fake_run(cmd, **kw):
-            calls.append(cmd)
-            class R: returncode = 0; stderr = ""
-            return R()
-
-        main_turns = [
-            {"speaker": 1, "start": 0.0, "end": 25.0, "text": "Hallo zusammen."},
-            {"speaker": 2, "start": 10.0, "end": 20.0, "text": "Guten Morgen."},
-        ]
-        mic_turns = [
-            {"speaker": 1, "start": 0.5, "end": 24.0, "text": "Hallo zusammen."},  # same room
-            {"speaker": 2, "start": 30.0, "end": 40.0, "text": "Nur ich hier."},   # mic only
-        ]
-        orig_mt = meeting.mistral_turns
-        orig_norm = meeting.normalize_wav
-        orig_wavs = meeting.wav_seconds
-        state = {"n": 0}
-        def fake_mistral(args, source, workdir, hotwords, lenient):
-            state["n"] += 1
-            return [dict(t) for t in (main_turns if state["n"] == 1 else mic_turns)]
-        meeting.mistral_turns = fake_mistral
-        meeting.normalize_wav = lambda src, dst: None
-        meeting.wav_seconds = lambda p: None
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                args = types.SimpleNamespace(
-                    model="voxtral-mini-transcribe-3",
-                    language="de", diarize_second=False, second_name="Me",
-                    second_offset=0.0, merge_gap=2.0, output=Path(tmp) / "out",
-                    diarization=None, names=None, hotwords="")
-                # replicate the main() second-track branch
-                labelled = meeting.number_speakers(main_turns)
-                second = [dict(t) for t in mic_turns]
-                after = max(t["speaker"] for t in labelled)
-                voices = len({t["speaker"] for t in second})
-                if meeting.redundant(labelled, second, args.second_offset):
-                    second = meeting.match_speakers(labelled, second, args.second_offset)
-                elif voices > 1:
-                    second = meeting.second_track_turns(second, after, args.second_name, diarized=True)
-                else:
-                    second = meeting.second_track_turns(second, after, args.second_name)
-        finally:
-            meeting.mistral_turns = orig_mt
-            meeting.normalize_wav = orig_norm
-            meeting.wav_seconds = orig_wavs
-        speakers = sorted({t["speaker"] for t in second})
-        self.assertEqual(speakers, [1, 3],
-                         "mic voice heard on the system track must map to it, "
-                         "a mic-only voice gets a new number — not a blanket shift to 3,4")
-        by_speaker = {t["speaker"]: t["text"] for t in second}
-        self.assertEqual(by_speaker[1], "Hallo zusammen.")
-        self.assertEqual(by_speaker[3], "Nur ich hier.")
 
     def test_live_session_forwards_per_session_glossary(self):
         seen = []

@@ -78,9 +78,8 @@ from `https://ui.shadcn.com/r/styles/new-york-v4/<name>.json` instead.
 - Never report a number you did not measure. The README's figures (1 m 38 s,
   119 turns, 8 speakers, 0-2290 s of 2293 s) come from a real 38:13 German
   meeting; anything else must be measured or labelled as an estimate.
-- A change to the answer parsing, the turn merging or the two-track matching
-  needs a test in `test_meeting.py` and a run on a real recording before it
-  ships.
+- A change to the answer parsing, the turn merging or the archive layout needs
+  a test in `test_meeting.py` and a run on a real recording before it ships.
 
 ## Runtime: service in a plain container
 
@@ -88,21 +87,14 @@ from `https://ui.shadcn.com/r/styles/new-york-v4/<name>.json` instead.
 and call out over HTTP only. Consequences that bite:
 
 - The normalized WAV must sit where audio.cpp can open it (`--asr-dir`). A
-  temp dir in `/tmp` does not reach the ASR host: the per-track workdir lives
-  under the output dir. The unit does not mount it any more because its batch
+  temp dir in `/tmp` does not reach the ASR host: the workdir lives under the
+  output dir. The unit does not mount it any more because its batch
   model is the studio's; a deployment that picks a bare audio.cpp model needs
   `-v ~/audio:/asr-share` and the two `--asr-dir` flags back.
-- Two-tracks: `meeting-job` derives `pair`/`track` from the recorder's file names
-  (`zoom-<stamp>-{system,mic}-16k.mp3`), parks the job in `waiting` until both
-  tracks arrive (`--pair-wait`, default 900 s), then runs the worker once with
-  `--second`. Both tracks are diarized by the ASR itself. When both are the
-  same room recorded twice (a mic that also hears the loudspeakers),
-  `merge_tracks()` drops the second track's turns the first already covers, and
-  `match_speakers()` maps each mic voice onto the first track's speaker by time
-  overlap. `dedupe_turns()` then drops a repeated cut of the same utterance:
-  that is why the final speaker count can be lower than the ASR's. A silent mic
-  track is tolerated (`lenient`), not a failed job; do not "fix" that as a
-  missing diarization step.
+- Input: one file with both sides already mixed. There is no pairing and no
+  second input; `submit()` is content-addressed and queues immediately. Do not
+  reintroduce a track dictionary: `Job.tracks` is kept as a one-entry
+  `{"main": path}` only for the old persisted jobs.
 - Whisper-era gotchas of the removed one-pass path (words split by a 32
   character wrap, repetition loops) do not apply any more: the words come from
   one answer of MOSS or Mistral, parsed by `parse_diarized()` /
@@ -115,8 +107,8 @@ and call out over HTTP only. Consequences that bite:
   only that route checks the query.
 - Archive: every upload is a row in `<dir>/archive.db` (`Archive`, stdlib
   `sqlite3`), written in `submit()` before the queue sees it. When `WEBDAV_URL`
-  is set, `_run`'s `finally` PUTs each track to
-  `<WEBDAV_URL>/<WEBDAV_DIR>/<job>/<track>-<name>` **before**
+  is set, `_run`'s `finally` PUTs the audio (`audio-<name>`) and both
+  transcripts into `<WEBDAV_URL>/<WEBDAV_DIR>/<job>/` **before**
   `--no-keep-audio` deletes the local copy; a WebDAV failure lands in
   `archive_error` and never fails the job. `GET /files` is the read side. The
   compose credentials come from `.env` (`WEBDAV_*`, gitignored; `.env.example`
@@ -171,9 +163,6 @@ and call out over HTTP only. Consequences that bite:
   `language=auto` short, noisy turns can come back in whatever language the
   model thinks it heard (25 of 226 turns of the 38:13 German meeting came back
   in Chinese or Dutch on the old Qwen3 path; keep the habit for Mistral).
-- Mistral diarizes each track on its own, so a mic track that hears the same
-  room again comes back with its own `speaker_1`, ... - that is what
-  `match_speakers()` is for; do not merge the two tracks' ids by a blanket shift.
 - The service runs without a token on this box (empty `MEETING_TOKEN`), by
   decision: it listens on `0.0.0.0:8099`, so anyone on the LAN or the tailnet can
   start a job.

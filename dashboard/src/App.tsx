@@ -61,6 +61,7 @@ import Live from "@/Live"
 type ArchiveState = {
   state: "off" | "pending" | "archived" | "failed"
   url: string | null
+  folder?: string | null
   error: string | null
   files?: number
 }
@@ -203,7 +204,7 @@ function StatusBadge({ status }: { status: JobSummary["status"] }) {
     return (
       <Badge variant="outline" className="text-muted-foreground">
         <span className="size-1.5 rounded-full bg-current" />
-        waiting for track 2
+        waiting
       </Badge>
     )
   if (status === "running")
@@ -276,15 +277,15 @@ function ArchiveDetail({ archive }: { archive: ArchiveState }) {
       <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
         <CloudCheck className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
         <span className="shrink-0">Archived on WebDAV</span>
-        {archive.url && (
+        {(archive.folder ?? archive.url) && (
           <a
-            href={archive.url}
+            href={(archive.folder ?? archive.url) as string}
             target="_blank"
             rel="noreferrer"
-            title={archive.url}
+            title={archive.folder ?? archive.url ?? undefined}
             className="truncate font-mono text-primary underline-offset-2 hover:underline"
           >
-            {archive.url.split("/").pop()}
+            {archive.folder ? "open job folder" : archive.url?.split("/").pop()}
           </a>
         )}
       </div>
@@ -463,41 +464,25 @@ function Jobs() {
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
-    const files = (form.getAll("file") as File[]).filter((file) => file.size > 0)
-    if (!files.length) return
+    const file = form.get("file") as File | null
+    if (!file || !file.size) return
     const language = String(form.get("language") ?? "auto")
     const model = String(form.get("model") ?? DEFAULT_MODEL)
     const hotwords = String(form.get("hotwords") ?? "").trim()
-    // Two files are the two tracks of one call: same pair key, so the server
-    // queues a single job instead of two unrelated transcripts.
-    const pair = files.length > 1 ? `ui-${Date.now()}` : null
-    const total = files.reduce((sum, file) => sum + file.size, 0)
 
     setUploading(true)
     setUploadError(null)
-    let done = 0
-    let job: JobSummary | null = null
     try {
-      for (const file of files) {
-        const query = new URLSearchParams({ filename: file.name })
-        if (language !== "auto") query.set("language", language)
-        if (model && model !== DEFAULT_MODEL) query.set("model", model)
-        if (hotwords) query.set("hotwords", hotwords)
-        if (pair) {
-          query.set("pair", pair)
-          // The recorder names its tracks; anything else is system first.
-          query.set("track", /-mic\b/i.test(file.name) ? "second" : "main")
-        }
-        const sentFile = done
-        job = await upload(`/jobs?${query}`, file, token, (fraction) =>
-          setSent({ name: file.name, fraction: (sentFile + fraction * file.size) / total })
-        )
-        done += file.size
-        setSent({ name: file.name, fraction: done / total })
-      }
+      const query = new URLSearchParams({ filename: file.name })
+      if (language !== "auto") query.set("language", language)
+      if (model && model !== DEFAULT_MODEL) query.set("model", model)
+      if (hotwords) query.set("hotwords", hotwords)
+      const job = await upload(`/jobs?${query}`, file, token, (fraction) =>
+        setSent({ name: file.name, fraction })
+      )
       if (fileInput.current) fileInput.current.value = ""
       await refresh()
-      if (job) await openJob(job.id)
+      await openJob(job.id)
     } catch (error) {
       setUploadError((error as Error).message)
     } finally {
@@ -516,9 +501,8 @@ function Jobs() {
         <CardHeader>
           <CardTitle>New transcription</CardTitle>
           <CardDescription>
-            One recording, or both tracks of a call: the system track and the
-            microphone one become a single transcript, the microphone side
-            labelled as one speaker.
+            One recording with both sides already mixed in: the model diarizes
+            and transcribes it in a single pass.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -531,7 +515,6 @@ function Jobs() {
                   name="file"
                   type="file"
                   accept="audio/*,video/*"
-                  multiple
                   required
                   ref={fileInput}
                 />

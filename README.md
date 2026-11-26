@@ -161,13 +161,14 @@ audio still there, so the dashboard's retry can run it again.
 ### Archive: WebDAV + SQLite
 
 Every upload is a row in a small SQLite ledger (`archive.db` under `--dir`),
-written the moment the file lands: job id, track, original name, size, SHA-256,
-received time, processing status, and the WebDAV URL once copied. When
-`WEBDAV_URL` is set, the file is PUT to
-`WEBDAV_URL/WEBDAV_DIR/<job>/<track>-<name>` as the job ends; MKCOL creates the
-folders. A WebDAV failure is recorded on the row and does not fail the job: the
-local copy stays (even with `--no-keep-audio`), and `POST /jobs/<id>/retry`
-re-runs the job and retries the archive.
+written the moment the file lands: job id, role (`audio` or transcript),
+original name, size, SHA-256, received time, processing status, and the WebDAV
+URL once copied. When `WEBDAV_URL` is set, the job folder
+`WEBDAV_DIR/<job_id>/` is created and filled as the job ends: the audio as
+`audio-<name>`, plus `transcript.md` and `transcript.json`. A WebDAV failure is
+recorded on the row and does not fail the job: the local copy stays (even with
+`--no-keep-audio`), and `POST /jobs/<id>/retry` re-runs the job and retries the
+archive.
 
 | variable / flag | meaning |
 |---|---|
@@ -176,28 +177,26 @@ re-runs the job and retries the archive.
 | `WEBDAV_DIR` / `--webdav-dir` | folder under the root (default `meeting-stack`) |
 | `ARCHIVE_DB` / `--archive-db` | ledger path (default `<dir>/archive.db`) |
 
-`GET /files` lists the ledger, newest first. The credentials come from `.env`
-(compose `env_file`/interpolation, or `--env-file .env` for a plain
-`podman run` / `docker run`) and the ledger lives on the `meeting-db` volume.
+`GET /archive` probes the WebDAV collection (cached for 30 s); `GET /files`
+lists the ledger, newest first. The dashboard shows the same:
+the `WebDAV ok/off/error` badge in the jobs header, a per-job Archive column
+(`saved`/`failed`) and the job folder link in the transcript dialog. The
+credentials come from `.env` (compose `env_file`/interpolation, or
+`--env-file .env` for a plain `podman run` / `docker run`) and the ledger lives
+on the `meeting-db` volume.
 
-### Two tracks, one transcript
+### One mixed recording
 
-`zoom-audio-capture` records a call as two files, the system output (everybody
-else) and the microphone (you). POST them both and they become **one job**:
+The recorder sends a single file with both sides already mixed (the system
+output and the microphone). Upload it once:
 
 ```sh
-curl --data-binary @zoom-20261020-205058-system-16k.mp3 \
-     "http://box:8099/jobs?filename=zoom-20261020-205058-system-16k.mp3" -H "Authorization: Bearer $TOKEN"
-curl --data-binary @zoom-20261020-205058-mic-16k.mp3 \
-     "http://box:8099/jobs?filename=zoom-20261020-205058-mic-16k.mp3" -H "Authorization: Bearer $TOKEN"
-# -> the same job id, twice
+curl --data-binary @zoom-20261020-205058-mix.mp3 \
+     "http://box:8099/jobs?filename=zoom-20261020-205058-mix.mp3" -H "Authorization: Bearer $TOKEN"
 ```
 
-The recording key and the track come out of the file name
-(`zoom-<stamp>-{system,mic}-16k.mp3`), so the recorder needs to know nothing
-about pairing; `?pair=<key>&track=main|second` does the same explicitly, which
-is what the dashboard sends. A job with one track stays `waiting` for the other
-until `--pair-wait` seconds pass (default 900), then runs with what arrived.
+The ASR diarizes and transcribes it in one pass: no second input, no pairing,
+no `waiting` state. The dashboard's upload field takes one file too.
 
 ### Announced recordings (`POST /hook`)
 
@@ -207,38 +206,15 @@ the recorder saying *this recording is complete, and here is where it lives*:
 ```sh
 curl -d '{"id":"2026-10-20/12-35-09","day":"2026-10-20","recording":"12-35-09",
           "remote_dir":"https://dav/BSB/Registrazioni/2026-10-20/12-35-09/",
-          "files":["audio/zoom-20261020-123509-system-16k.mp3"]}' http://box:8099/hook
+          "files":["audio/zoom-20261020-123509-mix.mp3"]}' http://box:8099/hook
 # -> {"ok":true,"pair":"zoom-20261020-123509","status":"missing_audio",...}
 ```
 
-`GET /hooks` lists every announcement joined with the job its uploads produced.
-`status` is the job status, or `missing_audio` when the announcement has no
-upload behind it — the state that otherwise stays invisible until `--pair-wait`
-gives up. Announcements are idempotent (the same body twice is a 200 and bumps
-`count`) and stored in `hooks.json` under `--dir`, so they survive a restart
-while the job list does not.
-
-Both tracks are diarized by the ASR itself. The system track's
-`Speaker 1…N` are the remote participants; a microphone track that carries
-only the recorder's room comes back as *one* speaker and is labelled `Me`
-(`--second-name`). A mic track that holds several voices keeps its own labels,
-shifted after the system ones — unless both tracks recorded the same room, in
-which case the shared clock matches each mic voice to the first track's speaker
-(see below).
-
-The two timelines are interleaved, and crosstalk stays two lines instead of one
-garbled one, because the channels already separated it. When both tracks are
-the same room recorded twice (a microphone that also hears the loudspeakers),
-the second track's turns already covered by the first are dropped instead of
-repeated; only speech the system track does not have (the room kept recording,
-or a local voice the call did not carry) is added. `--second-offset` shifts the
-microphone track if its file starts later than the system one.
-
-Running the worker by hand means the same thing:
-
-```sh
-./meeting-transcribe system.mp3 --second mic.mp3 --output out/meeting
-```
+`GET /hooks` lists every announcement joined with the job whose upload has the
+same file name. `status` is the job status, or `missing_audio` when the
+announcement has no upload behind it. Announcements are idempotent (the same
+body twice is a 200 and bumps `count`) and stored in `hooks.json` under `--dir`,
+so they survive a restart while the job list does not.
 
 MCP (`POST /mcp`, stateless JSON-RPC 2.0 — `initialize`, `tools/list`,
 `tools/call`, `ping`):
@@ -426,10 +402,6 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
   `/v1/audio/transcriptions` route stops at 30 minutes. Measured: 43 minutes of
   audio in ~15 minutes of wall time, speakers included. `--job-timeout` (4 h)
   is the service-side cap for one job.
-- `--second FILE` — the microphone track of a two-track recording; see above.
-  `--second-name` (default `Me`), `--second-offset`.
-- `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the
-  other track before running anyway.
 - `--retain-audio-days 30` (on `meeting-job`) — delete kept uploads older than
   this; `0` keeps them forever. Only done and failed jobs are candidates.
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
@@ -446,6 +418,6 @@ python3 -m unittest test_meeting -v
 ```
 
 They cover the pure functions — the audio.cpp, Unsloth Studio and Mistral
-answer parsing, the turn merge and dedupe, the two-track matching, the live line
-building — and assert that the standalone defaults stay on the keyless audio.cpp
-path while `unsloth.*` is the studio's one-upload NDJSON workflow.
+answer parsing, the paragraph merge, the archive ledger and WebDAV paths, the
+live line building — and assert that the standalone defaults stay on the keyless
+audio.cpp path while `unsloth.*` is the studio's one-upload NDJSON workflow.

@@ -70,12 +70,7 @@ SUFFIX = re.compile(r"\.[a-z0-9]{1,5}$")
 OPTION_FLAGS = (("language", "--language"), ("hotwords", "--hotwords"),
                 ("names", "--names"), ("max_tokens", "--max-tokens"),
                 ("model", "--model"),
-                ("second_name", "--second-name"),
-                ("asr_dir", "--asr-dir"), ("asr_remote_dir", "--asr-remote-dir"),
-                ("second_offset", "--second-offset"))
-# Query parameters this server consumes itself and never forwards to the worker.
-CONSUMED_OPTIONS = ("pair", "track")
-PAIR_NAME = re.compile(r"^(?P<key>.+?)-(system|mic)(-16k)?\.[a-z0-9]{1,5}$", re.IGNORECASE)
+                ("asr_dir", "--asr-dir"), ("asr_remote_dir", "--asr-remote-dir"))
 # meeting-transcribe wants ints for these; every other flag takes a float or a string.
 INT_OPTIONS = ("max_tokens",)
 
@@ -119,31 +114,36 @@ class WebDAV:
         self.timeout = timeout
         self._folders: set[str] = set()
 
-    def put(self, name: str, data: bytes) -> str:
-        """Archive one file; returns the URL it was written to."""
-        self.ensure()
-        url = self._url(self._parts() + [name])
+    def put(self, name: str, data: bytes, folder: str | None = None) -> str:
+        """Archive one file under `folder`; returns the URL it was written to."""
+        self.ensure(folder=folder)
+        url = self._url(self._parts() + ([folder] if folder else []) + [name])
         self._request("PUT", url, data)
         return url
 
-    def ensure(self, timeout: float | None = None, force: bool = False) -> str:
-        """Make the archive folder; return its URL. A 405 means it was there.
+    def ensure(self, timeout: float | None = None, force: bool = False,
+               folder: str | None = None) -> str:
+        """Make the archive folder (and `folder` under it); return its URL.
 
-        force skips the created-folder cache, which is what the status probe
-        needs: otherwise a check after the first one would never touch the wire.
+        A 405 means it was there. force skips the created-folder cache, which is
+        what the status probe needs: otherwise a check after the first one would
+        never touch the wire.
         """
-        parts = self._parts()
+        parts = self._parts() + ([folder] if folder else [])
         # PUT does not create parents: MKCOL each folder once, then remember it.
         for depth in range(1, len(parts) + 1):
-            folder = self._url(parts[:depth])
-            if force or folder not in self._folders:
-                self._mkcol(folder, timeout=timeout)
-                self._folders.add(folder)
-        return self.target()
+            target = self._url(parts[:depth])
+            if force or target not in self._folders:
+                self._mkcol(target, timeout=timeout)
+                self._folders.add(target)
+        return self._url(parts) if parts else self.base
 
     def target(self) -> str:
         parts = self._parts()
         return self._url(parts) if parts else self.base
+
+    def folder_url(self, folder: str) -> str:
+        return self._url(self._parts() + [folder])
 
     def _parts(self) -> list[str]:
         return [part for part in self.directory.split("/") if part]
@@ -202,7 +202,7 @@ class Archive:
             self._conn.commit()
 
     def received(self, job_id: str, track: str, filename: str, audio: bytes) -> None:
-        """Insert the file, or refresh it when the same track is uploaded again."""
+        """Insert the audio row, or refresh it when the same file is uploaded again."""
         if self._conn is None:
             return
         self._write(
@@ -210,7 +210,8 @@ class Archive:
             " VALUES (?, ?, ?, ?, ?, ?, 'received')"
             " ON CONFLICT(job_id, track) DO UPDATE SET filename=excluded.filename,"
             " size=excluded.size, sha256=excluded.sha256,"
-            " received_at=excluded.received_at, status='received', error=NULL",
+            " received_at=excluded.received_at, status='received', error=NULL,"
+            " archived_at=NULL, webdav_url=NULL, archive_error=NULL",
             (job_id, track, Path(filename).name, len(audio),
              hashlib.sha256(audio).hexdigest(), time.time()))
 
@@ -221,27 +222,50 @@ class Archive:
                     (status, error, job_id))
 
     def finish(self, job: "Job") -> None:
-        """Mark each track's outcome, then archive it if WebDAV is configured."""
+        """Record the transcript beside the audio, then archive the job folder."""
         if self._conn is None:
             return
         self.status(job.id, job.status, job.error)
+        artifacts = []
+        if job.markdown:
+            artifacts.append(("transcript.md", job.markdown.encode()))
+        if job.json is not None:
+            artifacts.append(("transcript.json",
+                              json.dumps(job.json, ensure_ascii=False).encode()))
+        for track, data in artifacts:
+            self._store(job.id, track, track, data, "done")
         if self.webdav is None:
             return
-        for track, path in job.tracks.items():
-            self._archive(job.id, track, path)
+        for path in job.tracks.values():
+            if path.is_file():
+                self._put(job.id, "audio", path.read_bytes())
+        for track, data in artifacts:
+            self._put(job.id, track, data)
 
-    def _archive(self, job_id: str, track: str, path: Path) -> None:
-        if not path.is_file():
-            return
+    def _store(self, job_id: str, track: str, filename: str, data: bytes,
+               status: str) -> None:
+        self._write(
+            "INSERT INTO files (job_id, track, filename, size, sha256, received_at, status)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(job_id, track) DO UPDATE SET filename=excluded.filename,"
+            " size=excluded.size, sha256=excluded.sha256, status=excluded.status,"
+            " error=NULL, archived_at=NULL, webdav_url=NULL, archive_error=NULL",
+            (job_id, track, filename, len(data), hashlib.sha256(data).hexdigest(),
+             time.time(), status))
+
+    def _put(self, job_id: str, track: str, data: bytes) -> None:
         with self._lock:
             row = self._conn.execute("SELECT filename FROM files"
                                      " WHERE job_id=? AND track=?",
                                      (job_id, track)).fetchone()
-        name = f"{track}-{Path(row['filename']).name}" if row else f"{track}-{path.name}"
+        if row is None:
+            return
+        name = (f"audio-{Path(row['filename']).name}" if track == "audio"
+                else Path(row["filename"]).name)
         # shortcut: one PUT in memory, and the worker waits for it; stream it and
         # move it off-thread if uploads grow past a few hundred MB.
         try:
-            url = self.webdav.put(name, path.read_bytes())
+            url = self.webdav.put(name, data, folder=job_id)
         except Exception as error:  # never let the archive take a job down
             detail = f"{type(error).__name__}: {error}"[:300]
             self._write("UPDATE files SET archive_error=?"
@@ -253,7 +277,7 @@ class Archive:
                         (time.time(), url, job_id, track))
 
     def archived(self, job_id: str) -> bool:
-        """True when every track has its WebDAV copy, or WebDAV is not configured."""
+        """True when every file has its WebDAV copy, or WebDAV is not configured."""
         if self._conn is None or self.webdav is None:
             return True
         with self._lock:
@@ -282,6 +306,7 @@ class Archive:
             state = "pending"
         return {"state": state,
                 "url": next((row["webdav_url"] for row in rows if row["webdav_url"]), None),
+                "folder": self.webdav.folder_url(job_id) if self.webdav else None,
                 "error": next((row["archive_error"] for row in rows if row["archive_error"]), None),
                 "files": len(rows)}
 
@@ -338,24 +363,6 @@ def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
         return None
     return first, min(last, size - 1)
 
-def track_and_pair(filename: str | None, options: dict) -> tuple[str, str | None]:
-    """Which track this upload is, and which recording it belongs to.
-
-    zoom-audio-capture uploads one file per track, named
-    `zoom-YYYYMMDD-HHMMSS-{system,mic}-16k.mp3`, so the recording key and the
-    track come out of the name: the two files become one job even though the
-    recorder knows nothing about pairing. `track=` and `pair=` override that,
-    which is what a browser upload uses.
-    """
-    track = str(options.get("track") or "").lower()
-    match = PAIR_NAME.match(Path(filename or "").name)
-    pair = options.get("pair")
-    if match:
-        pair = pair or match.group("key")
-        track = track or match.group(2).lower()
-    return ("second" if track in ("second", "mic") else "main"), (
-        str(pair) if pair else None)
-
 def safe_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if SUFFIX.fullmatch(suffix) else ".bin"
@@ -366,8 +373,7 @@ def recording_pair(day: str, recording: str) -> str | None:
     """('<2026-10-20>', '<12-35-09>') -> 'zoom-20261020-123509'.
 
     The recorder announces a recording with the day and time of its folder; the
-    uploads arrive named `zoom-YYYYMMDD-HHMMSS-{system,mic}-16k.mp3`, so the two
-    have to agree on one key to be the same thing.
+    upload arrives with its own file name, so the two have to agree on one key.
     """
     match = RECORDING_STAMP.match(f"{day}/{recording}".strip())
     if not match:
@@ -379,8 +385,8 @@ class Hooks:
 
     The audio still arrives through POST /jobs - this only remembers the
     announcement, so a recording that was announced and never uploaded can be
-    seen instead of being guessed after --pair-wait. On disk, because the job
-    list is in memory but a skipped announcement is not worth losing.
+    seen. On disk, because the job list is in memory but a skipped announcement
+    is not worth losing.
     """
 
     def __init__(self, path: Path) -> None:
@@ -437,15 +443,18 @@ class Hooks:
             return [dict(entry) for entry in self._items.values()]
 
 def hook_view(hooks: Hooks, jobs: Jobs, pair: str | None = None) -> list[dict]:
-    """Every announcement joined with the job its audio produced, if any."""
+    """Every announcement joined with the job whose upload matches its file, if any."""
     entries = [hooks.get(pair)] if pair else hooks.list()
+    candidates = jobs.list()
     views = []
     for entry in entries:
         if entry is None:
             continue
-        job = jobs.get(job_id(f"pair:{entry['pair']}".encode()))
+        announced = {Path(name).name for name in entry.get("files") or []}
+        job = next((candidate for candidate in candidates
+                    if candidate.get("filename") in announced), None)
         if job is None:
-            # Announced as ready, never uploaded: the recorder has the files,
+            # Announced as ready, never uploaded: the recorder has the file,
             # the worker does not - that is the state worth seeing.
             state = "missing_audio"
         else:
@@ -456,9 +465,9 @@ def hook_view(hooks: Hooks, jobs: Jobs, pair: str | None = None) -> list[dict]:
 class Job:
     def __init__(self, identity: str, options: dict) -> None:
         self.id = identity
-        # One recording, one or two files: "main" is diarized and transcribed,
-        # "second" is the microphone side, labelled as a single speaker.
+        # One recording, already mixed: the ASR diarizes and transcribes it.
         self.tracks: dict[str, Path] = {}
+        self.filename: str | None = None
         self.options = options
         self.status = "queued"
         self.error: str | None = None
@@ -471,13 +480,8 @@ class Job:
 
     @property
     def audio(self) -> Path | None:
-        """The track to diarize: the system one when both arrived, else what there is."""
-        return self.tracks.get("main") or next(iter(self.tracks.values()), None)
-
-    @property
-    def second(self) -> Path | None:
-        """The microphone side, only when a system track is there to pair it with."""
-        return self.tracks.get("second") if "main" in self.tracks else None
+        """The uploaded recording."""
+        return next(iter(self.tracks.values()), None)
 
     @property
     def duration(self) -> float | None:
@@ -494,7 +498,7 @@ class Job:
         return {"id": self.id, "status": self.status, "error": self.error,
                 "options": self.options, "created": self.created,
                 "started": self.started, "finished": self.finished,
-                "progress": self.progress,
+                "progress": self.progress, "filename": self.filename,
                 "json": self.json, "markdown": self.markdown,
                 "tracks": sorted(self.tracks),
                 # Length of the recording, not how long the job took.
@@ -509,7 +513,7 @@ class Jobs:
                  timeout: float = 14400, asr: str = "http://ubuntu:8090",
                  model: str = "moss-transcribe-diarize",
                  asr_dir: str | None = None, asr_remote_dir: str | None = None,
-                 pair_wait: float = 900, retain_days: float = 30,
+                 retain_days: float = 30,
                  archive_db: Path | None = None,
                  webdav: WebDAV | None = None) -> None:
         self.meeting = Path(meeting).resolve()
@@ -517,7 +521,6 @@ class Jobs:
         self.model = model
         self.asr_dir = asr_dir
         self.asr_remote_dir = asr_remote_dir
-        self.pair_wait = pair_wait
         self.inbox = root / "inbox"
         self.out = root / "out"
         self.jobs_file = root / "jobs.json"
@@ -537,47 +540,26 @@ class Jobs:
         self._load()
         self.prune()
         threading.Thread(target=self._work, daemon=True).start()
-        threading.Thread(target=self._pair_watch, daemon=True).start()
 
     def submit(self, audio: bytes, options: dict, filename: str | None = None) -> dict:
-        track, pair = track_and_pair(filename, options)
-        options = {key: value for key, value in options.items()
-                   if key not in CONSUMED_OPTIONS}
-        # A pair is one recording identified by its name, so both tracks land on
-        # the same job however they are ordered; a lone upload stays content-addressed.
-        identity = job_id(f"pair:{pair}".encode()) if pair else job_id(audio)
+        identity = job_id(audio)
         with self._lock:
             job = self._jobs.get(identity)
             if job is None:
                 job = Job(identity, options)
                 self._jobs[identity] = job
-            elif track in job.tracks and job.status != "error":
+            elif job.status != "error":
                 return self._view(job)  # the same file again: nothing to do
-            elif job.status == "running":
-                return self._view(job)  # too late: this run already started
-            elif job.status == "done" and not all(path.is_file() for path in job.tracks.values()):
-                # The first run already finished and its audio is gone: a late
-                # track cannot redo it, so the good result stays.
-                return self._view(job)
-            path = self.inbox / (identity + (f"-{track}" if pair else "")
-                                 + safe_suffix(filename))
+            path = self.inbox / (identity + safe_suffix(filename))
             path.write_bytes(audio)
-            job.tracks[track] = path
-            self.archive.received(job.id, track, filename or path.name, audio)
+            job.tracks["main"] = path
+            job.filename = Path(filename or path.name).name
             job.options = options or job.options
-            self._schedule(job, pair)
-            return self._view(job)
-
-    def _schedule(self, job: Job, pair: str | None) -> None:
-        """Queue the job, or park it until the other track of its recording arrives."""
-        if pair and "main" not in job.tracks:
-            job.status = "waiting"  # only the microphone side is here yet
-        elif pair and "second" not in job.tracks and job.started is None:
-            job.status = "waiting"  # the microphone side may still be uploading
-        else:
+            self.archive.received(job.id, "audio", job.filename, audio)
             job.status = "queued"
             self._queue.put(job)
-        self._persist()
+            self._persist()
+            return self._view(job)
 
     def _persist(self) -> None:
         """Keep the job list on disk: a restart empties the queue, not the list."""
@@ -585,7 +567,7 @@ class Jobs:
             records = [{"id": job.id, "status": job.status, "error": job.error,
                         "options": job.options, "created": job.created,
                         "started": job.started, "finished": job.finished,
-                        "progress": job.progress,
+                        "progress": job.progress, "filename": job.filename,
                         "tracks": {name: str(path) for name, path in job.tracks.items()}}
                        for job in self._jobs.values()]
             try:
@@ -611,6 +593,7 @@ class Jobs:
                 job.status = str(record.get("status") or "error")
                 job.error = record.get("error") or None
                 job.progress = record.get("progress") or None
+                job.filename = record.get("filename") or None
                 job.created = float(record.get("created") or 0.0)
                 job.started = record.get("started")
                 job.finished = record.get("finished")
@@ -641,7 +624,8 @@ class Jobs:
             job.status, job.error = "error", f"unknown job status {job.status!r}"
         if job.status != "done" and not any(path.is_file() for path in job.tracks.values()):
             job.status, job.error = "error", "the uploaded audio is gone"
-        elif job.status == "queued":
+        elif job.status in ("waiting", "queued"):
+            job.status = "queued"  # an old two-track wait; the file is all we need
             self._queue.put(job)
 
     def prune(self) -> int:
@@ -667,24 +651,6 @@ class Jobs:
                 except OSError:
                     continue
         return removed
-
-    def _pair_watch(self) -> None:
-        """Run a job whose other track never came: one track still beats no transcript."""
-        pruned = time.time()
-        while True:
-            time.sleep(5)
-            if time.time() - pruned >= 3600:
-                pruned = time.time()
-                self.prune()
-            with self._lock:
-                queued = False
-                for job in self._jobs.values():
-                    if job.status == "waiting" and time.time() - job.created >= self.pair_wait:
-                        job.status = "queued"
-                        self._queue.put(job)
-                        queued = True
-                if queued:
-                    self._persist()
 
     def _view(self, job: Job) -> dict:
         view = job.snapshot()
@@ -847,8 +813,6 @@ class Jobs:
             command += ["--asr-dir", self.asr_dir]
         if self.asr_remote_dir:
             command += ["--asr-remote-dir", self.asr_remote_dir]
-        if job.second is not None:
-            command += ["--second", str(job.second)]
         # A per-job option appended below wins: argparse keeps the last value.
         for key, flag in OPTION_FLAGS:
             if job.options.get(key) is not None:
@@ -2550,8 +2514,8 @@ class Handler(BaseHTTPRequestHandler):
             job = self.server.jobs.submit(body, options, query.get("filename", [None])[0])
             self._json(202, self._summary(job))
         elif parsed.path == "/hook":
-            # The recorder calls this once per recording, after every track is
-            # on WebDAV. Idempotent on purpose: a retry or a startup sweep sends
+            # The recorder calls this once per recording, after the mixed file
+            # is on WebDAV. Idempotent on purpose: a retry or a startup sweep sends
             # the same body again, and that must stay a 200.
             try:
                 payload = json.loads(body or b"{}")
@@ -2633,7 +2597,8 @@ class Handler(BaseHTTPRequestHandler):
     def _summary(job: dict) -> dict:
         return {key: job.get(key) for key in ("id", "status", "error", "created",
                                               "started", "finished", "options", "progress",
-                                              "tracks", "duration", "audio", "archive")}
+                                              "tracks", "duration", "audio", "archive",
+                                              "filename")}
 
 class Server(ThreadingHTTPServer):
     def __init__(self, address, jobs: Jobs, hooks: Hooks, token: str,
@@ -2671,9 +2636,6 @@ def main() -> None:
                         help="largest audio upload in bytes (default 512 MiB)")
     parser.add_argument("--job-timeout", type=float, default=14400,
                         help="seconds one transcription may take (default 14400)")
-    parser.add_argument("--pair-wait", type=float, default=900,
-                        help="seconds to wait for the second track of a two-track recording "
-                             "before transcribing the one that arrived (default 900)")
     parser.add_argument("--no-keep-audio", action="store_false", dest="keep_audio",
                         help="delete the uploaded audio after the job instead of keeping it "
                              "for the dashboard's player (kept by default, pruned after "
@@ -2732,7 +2694,6 @@ def main() -> None:
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
                 args.asr, args.model,
                 args.asr_dir, args.asr_remote_dir,
-                pair_wait=args.pair_wait,
                 retain_days=args.retain_audio_days,
                 archive_db=args.archive_db.expanduser() if args.archive_db else None,
                 webdav=webdav)
