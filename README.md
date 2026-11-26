@@ -125,7 +125,10 @@ audio.cpp model from another machine travels as a multipart upload, and the
 server **segfaults past ~20 minutes of recording** (measured: 11 min whole, 43
 min crash), so the pipeline refuses the bigger ones with an actionable error.
 A shared filesystem (`--asr-dir`) restores the path mode for any length. The
-cache dir is a volume, so jobs and transcripts survive redeploys.
+cache dir and the SQLite ledger are volumes, so jobs, transcripts and the file
+history survive redeploys. WebDAV is optional: copy `.env.example` to `.env` and
+fill `WEBDAV_URL`, `WEBDAV_USER` and `WEBDAV_PASSWORD` (see [Archive](#archive-webdav--sqlite));
+without it the ledger still records every upload, no copy is made.
 
 That is the live deployment today: Coolify on `raspberrypi2:8099`, with
 `tailscale serve --bg --https=443 8099` over it — so the same service answers
@@ -153,6 +156,28 @@ that is still queued or running is never touched, and the job list itself is
 saved in `jobs.json` under `--dir`: restarting the service keeps the list and
 the finished transcripts, and marks a job that was mid-run as an error with its
 audio still there, so the dashboard's retry can run it again.
+
+### Archive: WebDAV + SQLite
+
+Every upload is a row in a small SQLite ledger (`archive.db` under `--dir`),
+written the moment the file lands: job id, track, original name, size, SHA-256,
+received time, processing status, and the WebDAV URL once copied. When
+`WEBDAV_URL` is set, the file is PUT to
+`WEBDAV_URL/WEBDAV_DIR/<job>/<track>-<name>` as the job ends; MKCOL creates the
+folders. A WebDAV failure is recorded on the row and does not fail the job: the
+local copy stays (even with `--no-keep-audio`), and `POST /jobs/<id>/retry`
+re-runs the job and retries the archive.
+
+| variable / flag | meaning |
+|---|---|
+| `WEBDAV_URL` / `--webdav-url` | the WebDAV collection, e.g. `https://dav/BSB/Registrazioni` |
+| `WEBDAV_USER`, `WEBDAV_PASSWORD` | Basic auth (`--webdav-user`, `--webdav-password`) |
+| `WEBDAV_DIR` / `--webdav-dir` | folder under the root (default `meeting-stack`) |
+| `ARCHIVE_DB` / `--archive-db` | ledger path (default `<dir>/archive.db`) |
+
+`GET /files` lists the ledger, newest first. In compose the credentials come
+from `.env` and the ledger lives on the `meeting-db` volume; in the systemd unit
+put the same variables in `meeting-job.env`.
 
 ### Two tracks, one transcript
 

@@ -6,6 +6,9 @@
 #   install -d -m 700 ~/.config/meeting-stack
 #   printf 'UNSLOTH_API_KEY=%s\nMISTRAL_API_KEY=%s\n' "$KEY" "$MISTRAL_KEY" \
 #     > ~/.config/meeting-stack/meeting-job.env
+#   printf 'WEBDAV_URL=%s\nWEBDAV_USER=%s\nWEBDAV_PASSWORD=%s\n' \
+#     "$WEBDAV_URL" "$WEBDAV_USER" "$WEBDAV_PASSWORD" \
+#     >> ~/.config/meeting-stack/meeting-job.env
 #   chmod 600 ~/.config/meeting-stack/meeting-job.env
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now meeting-job.service
@@ -21,8 +24,10 @@
 # Lemonade on :8731, Mistral or the Bifrost gateway on :8080 (--mt-gateway).
 # The uploads are kept by default (the dashboard plays the recording next to
 # the transcript; pruned after --retain-audio-days, default 30, 0 keeps them;
-# --no-keep-audio deletes them). Send language=de: with language=auto short
-# turns can come back in whatever language the model thinks it heard.
+# --no-keep-audio deletes them). Every upload is also recorded in a SQLite
+# ledger (archive.db in the cache dir) and, when WEBDAV_URL is set in
+# meeting-job.env, PUT to WebDAV under WEBDAV_DIR. Send language=de: with
+# language=auto short turns can come back in whatever language the model heard.
 [Unit]
 Description=Diarized meeting transcription (REST + MCP + dashboard, container)
 After=network-online.target
@@ -38,6 +43,11 @@ ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   -e HOME=%h \
   -e MEETING_TOKEN \
   -e MISTRAL_API_KEY \
+  -e WEBDAV_URL \
+  -e WEBDAV_USER \
+  -e WEBDAV_PASSWORD \
+  -e WEBDAV_DIR \
+  -e ARCHIVE_DB \
   -e UNSLOTH_API_KEY \
   localhost/meeting-job:latest \
   --dir %h/.cache/mcp-meeting-transcribe \

@@ -219,9 +219,17 @@ request: under a second for a local model, two to three seconds for a cloud one.
 
 | route | what |
 |---|---|
-| `GET /health` | `{"status":"ok","jobs":N,"queue":N}`, no auth |
+| `GET /health` | `{"status":"ok","jobs":N,"queue":N,"archive":bool}`, no auth |
+| `GET /files` | the archive ledger, newest first: one row per received file |
 | `GET /`, `/ui`, `/live` | the dashboard (one bundle, the path picks the view) |
 | `POST /hook` | the recorder announces a finished recording; idempotent |
+
+`GET /files` rows carry `job_id`, `track`, `filename`, `size`, `sha256`,
+`received_at`, `status` (`received`, `running`, `queued`, `done`, `error`,
+`cancelled`), `error`, `archived_at`, `webdav_url` and `archive_error`. The
+ledger is SQLite at `ARCHIVE_DB` (default `<dir>/archive.db`); when `WEBDAV_URL`
+is set the file is also PUT to WebDAV as the job ends, and an archive failure is
+recorded on the row without failing the transcription.
 
 ## Not part of this service
 

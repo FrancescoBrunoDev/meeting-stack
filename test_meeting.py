@@ -7,6 +7,8 @@ everything that can be wrong without them: parsing their answers, merging and
 deduplicating turns, matching two tracks, building the live lines, and the
 defaults that decide which path runs.
 """
+import contextlib
+import hashlib
 import io
 import importlib.util
 import json
@@ -17,6 +19,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
 import urllib.request
 import wave
 from pathlib import Path
@@ -712,6 +715,118 @@ class Retention(unittest.TestCase):
         self.assertEqual(jobs.prune(), 0)
         self.assertTrue(path.is_file())
 
+
+class Archiving(unittest.TestCase):
+    """Every upload is a row in the SQLite ledger and, when configured, a WebDAV copy."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+
+    def test_a_received_file_is_recorded_and_archived(self):
+        sent = {}
+
+        class StubWebDAV:
+            def put(self, name, data):
+                sent["name"], sent["data"] = name, data
+                return f"https://dav.example/meeting-stack/{name}"
+
+        archive = meeting_job.Archive(self.root / "archive.db", StubWebDAV())
+        audio = b"RIFF a meeting"
+        archive.received("0123456789abcdef", "main", "zoom-1-system-16k.mp3", audio)
+        row = archive.rows()[0]
+        self.assertEqual(row["status"], "received")
+        self.assertEqual(row["size"], len(audio))
+        self.assertEqual(row["sha256"], hashlib.sha256(audio).hexdigest())
+
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.tracks = {"main": self.root / "inbox" / "meeting.mp3"}
+        job.tracks["main"].parent.mkdir()
+        job.tracks["main"].write_bytes(audio)
+        job.status, job.finished = "done", 1.0
+        archive.finish(job)
+
+        row = archive.rows()[0]
+        self.assertEqual(row["status"], "done")
+        self.assertIsNotNone(row["archived_at"])
+        self.assertEqual(row["webdav_url"],
+                         "https://dav.example/meeting-stack/main-zoom-1-system-16k.mp3")
+        self.assertEqual(sent,
+                         {"name": "main-zoom-1-system-16k.mp3", "data": audio})
+        self.assertTrue(archive.archived(job.id))
+
+    def test_a_webdav_failure_is_kept_on_the_row_not_raised(self):
+        class BrokenWebDAV:
+            def put(self, name, data):
+                raise urllib.error.URLError("dav is down")
+
+        archive = meeting_job.Archive(self.root / "archive.db", BrokenWebDAV())
+        audio = self.root / "inbox" / "meeting.mp3"
+        audio.parent.mkdir()
+        audio.write_bytes(b"audio")
+        archive.received("0123456789abcdef", "main", "meeting.mp3", b"audio")
+        job = meeting_job.Job("0123456789abcdef", {})
+        job.tracks, job.status = {"main": audio}, "done"
+        with io.StringIO() as output:  # the archive prints its failure
+            with contextlib.redirect_stdout(output):
+                archive.finish(job)
+        row = archive.rows()[0]
+        self.assertEqual(row["status"], "done")
+        self.assertIsNone(row["archived_at"])
+        self.assertIn("dav is down", row["archive_error"])
+        self.assertTrue(audio.is_file())
+        self.assertFalse(archive.archived(job.id))
+
+    def test_webdav_makes_the_folders_then_puts_the_quoted_name(self):
+        calls = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_open(request, timeout=0):
+            calls.append((request.get_method(), request.full_url,
+                          request.headers.get("Authorization")))
+            if request.get_method() == "MKCOL":
+                # 405 = the collection already exists, which is not an error.
+                raise urllib.error.HTTPError(request.full_url, 405, "exists", {}, None)
+            return Response()
+
+        original = meeting_job.urllib.request.urlopen
+        meeting_job.urllib.request.urlopen = fake_open
+        try:
+            dav = meeting_job.WebDAV("https://dav.example/root", "user", "pass",
+                                     "meetings")
+            url = dav.put("main-a b.mp3", b"audio")
+        finally:
+            meeting_job.urllib.request.urlopen = original
+        self.assertEqual([call[0] for call in calls], ["MKCOL", "PUT"])
+        self.assertEqual(calls[0][1], "https://dav.example/root/meetings")
+        self.assertEqual(calls[-1][1],
+                         "https://dav.example/root/meetings/main-a%20b.mp3")
+        self.assertEqual(url, calls[-1][1])
+        expected = "Basic " + meeting_job.base64.b64encode(b"user:pass").decode()
+        self.assertEqual(calls[-1][2], expected)
+
+    def test_without_webdav_the_ledger_still_records_and_keeps(self):
+        archive = meeting_job.Archive(self.root / "archive.db")
+        archive.received("0123456789abcdef", "main", "meeting.mp3", b"audio")
+        self.assertEqual(archive.rows()[0]["status"], "received")
+        self.assertTrue(archive.archived("0123456789abcdef"))
+
+    def test_submit_records_the_upload_before_the_worker_runs(self):
+        jobs = meeting_job.Jobs(Path("/bin/true"), self.root, pair_wait=10000)
+        self.addCleanup(jobs.stop)
+        job = jobs.submit(b"audio", {}, "meeting.mp3")
+        rows = jobs.archive.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["job_id"], job["id"])
+        self.assertEqual(rows[0]["filename"], "meeting.mp3")
+        self.assertEqual(rows[0]["track"], "main")
 
 class ByteRange(unittest.TestCase):
     """`GET /jobs/<id>/audio` must answer 206 to a player that seeks."""

@@ -114,6 +114,16 @@ and call out over HTTP only. Consequences that bite:
   pruned. `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
   bearer token in the query string, because `<audio src>` cannot send headers —
   only that route checks the query.
+- Archive: every upload is a row in `<dir>/archive.db` (`Archive`, stdlib
+  `sqlite3`), written in `submit()` before the queue sees it. When `WEBDAV_URL`
+  is set, `_run`'s `finally` PUTs each track to
+  `<WEBDAV_URL>/<WEBDAV_DIR>/<job>/<track>-<name>` **before**
+  `--no-keep-audio` deletes the local copy; a WebDAV failure lands in
+  `archive_error` and never fails the job. `GET /files` is the read side. The
+  compose credentials come from `.env` (`WEBDAV_*`, gitignored; `.env.example`
+  is committed); the unit takes them from `meeting-job.env`. The DB is
+  `/data/archive.db` on the `meeting-db` volume in compose, `<dir>/archive.db`
+  under systemd.
 - Transcript dialog (`dashboard/src/App.tsx`): the finished job opens beside its
   audio with a **Text / Segments** switch, the shape Unsloth Studio's audio page
   uses. Text joins consecutive turns by the same speaker into a paragraph;

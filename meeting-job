@@ -48,6 +48,7 @@ import os
 import queue
 import re
 import signal
+import sqlite3
 import ssl
 import struct
 import socket
@@ -88,6 +89,168 @@ def write_atomic(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+ARCHIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS files (
+    job_id TEXT NOT NULL,
+    track TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    received_at REAL NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    archived_at REAL,
+    webdav_url TEXT,
+    archive_error TEXT,
+    PRIMARY KEY (job_id, track)
+)
+"""
+
+class WebDAV:
+    """The one WebDAV write this service needs: make the folders, PUT the file."""
+
+    def __init__(self, url: str, user: str = "", password: str = "",
+                 directory: str = "meeting-stack", timeout: float = 120) -> None:
+        self.base = url.rstrip("/")
+        self.user = user
+        self.password = password
+        self.directory = directory.strip("/")
+        self.timeout = timeout
+        self._folders: set[str] = set()
+
+    def put(self, name: str, data: bytes) -> str:
+        """Archive one file; returns the URL it was written to."""
+        parts = [part for part in self.directory.split("/") if part] + [name]
+        # PUT does not create parents: MKCOL each folder once, then remember it.
+        for depth in range(1, len(parts)):
+            folder = self._url(parts[:depth])
+            if folder not in self._folders:
+                self._mkcol(folder)
+                self._folders.add(folder)
+        url = self._url(parts)
+        self._request("PUT", url, data)
+        return url
+
+    def _url(self, parts: list[str]) -> str:
+        return f"{self.base}/" + "/".join(
+            urllib.parse.quote(part, safe="") for part in parts)
+
+    def _mkcol(self, url: str) -> None:
+        try:
+            self._request("MKCOL", url)
+        except urllib.error.HTTPError as error:
+            if error.code != 405:  # 405: the collection is already there
+                raise
+
+    def _request(self, method: str, url: str, data: bytes | None = None) -> None:
+        request = urllib.request.Request(url, data=data, method=method)
+        if self.user or self.password:
+            token = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+            request.add_header("Authorization", f"Basic {token}")
+        if data is not None:
+            request.add_header("Content-Type", "application/octet-stream")
+        with urllib.request.urlopen(request, timeout=self.timeout):
+            pass
+
+
+class Archive:
+    """The file ledger (SQLite) and the WebDAV copy of every upload.
+
+    A file is recorded the moment it lands, marked running/done/error with its
+    job, and PUT to WebDAV when the job ends. A WebDAV failure is recorded on
+    the row and never fails the job: the local file is still there.
+    """
+
+    def __init__(self, db: Path | None, webdav: WebDAV | None = None) -> None:
+        self.db = Path(db) if db is not None else None
+        self.webdav = webdav
+        self._lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = None
+        if self.db is not None:
+            self.db.parent.mkdir(parents=True, exist_ok=True)
+            # One connection, used under the lock: the handler threads read the
+            # ledger while the worker writes it.
+            self._conn = sqlite3.connect(self.db, timeout=10, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute(ARCHIVE_SCHEMA)
+            self._conn.commit()
+
+    def _write(self, sql: str, params: tuple) -> None:
+        with self._lock:
+            self._conn.execute(sql, params)
+            self._conn.commit()
+
+    def received(self, job_id: str, track: str, filename: str, audio: bytes) -> None:
+        """Insert the file, or refresh it when the same track is uploaded again."""
+        if self._conn is None:
+            return
+        self._write(
+            "INSERT INTO files (job_id, track, filename, size, sha256, received_at, status)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'received')"
+            " ON CONFLICT(job_id, track) DO UPDATE SET filename=excluded.filename,"
+            " size=excluded.size, sha256=excluded.sha256,"
+            " received_at=excluded.received_at, status='received', error=NULL",
+            (job_id, track, Path(filename).name, len(audio),
+             hashlib.sha256(audio).hexdigest(), time.time()))
+
+    def status(self, job_id: str, status: str, error: str | None = None) -> None:
+        if self._conn is None:
+            return
+        self._write("UPDATE files SET status=?, error=? WHERE job_id=?",
+                    (status, error, job_id))
+
+    def finish(self, job: "Job") -> None:
+        """Mark each track's outcome, then archive it if WebDAV is configured."""
+        if self._conn is None:
+            return
+        self.status(job.id, job.status, job.error)
+        if self.webdav is None:
+            return
+        for track, path in job.tracks.items():
+            self._archive(job.id, track, path)
+
+    def _archive(self, job_id: str, track: str, path: Path) -> None:
+        if not path.is_file():
+            return
+        with self._lock:
+            row = self._conn.execute("SELECT filename FROM files"
+                                     " WHERE job_id=? AND track=?",
+                                     (job_id, track)).fetchone()
+        name = f"{track}-{Path(row['filename']).name}" if row else f"{track}-{path.name}"
+        # shortcut: one PUT in memory, and the worker waits for it; stream it and
+        # move it off-thread if uploads grow past a few hundred MB.
+        try:
+            url = self.webdav.put(name, path.read_bytes())
+        except (OSError, urllib.error.URLError) as error:
+            detail = f"{type(error).__name__}: {error}"[:300]
+            self._write("UPDATE files SET archive_error=?"
+                        " WHERE job_id=? AND track=?", (detail, job_id, track))
+            print(f"archive: {job_id}/{track} not on WebDAV: {detail}", flush=True)
+        else:
+            self._write("UPDATE files SET archived_at=?, webdav_url=?, archive_error=NULL"
+                        " WHERE job_id=? AND track=?",
+                        (time.time(), url, job_id, track))
+
+    def archived(self, job_id: str) -> bool:
+        """True when every track has its WebDAV copy, or WebDAV is not configured."""
+        if self._conn is None or self.webdav is None:
+            return True
+        with self._lock:
+            missing = self._conn.execute(
+                "SELECT COUNT(*) FROM files WHERE job_id=? AND archived_at IS NULL",
+                (job_id,)).fetchone()[0]
+        return missing == 0
+
+    def rows(self, limit: int = 500) -> list[dict]:
+        """The ledger, newest first, for GET /files."""
+        if self._conn is None:
+            return []
+        with self._lock:
+            return [dict(row) for row in self._conn.execute(
+                "SELECT * FROM files ORDER BY received_at DESC LIMIT ?", (limit,))]
+
 
 def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     """Parse a single `Range: bytes=a-b` against a file of `size` bytes.
@@ -283,7 +446,9 @@ class Jobs:
                  timeout: float = 14400, asr: str = "http://ubuntu:8090",
                  model: str = "moss-transcribe-diarize",
                  asr_dir: str | None = None, asr_remote_dir: str | None = None,
-                 pair_wait: float = 900, retain_days: float = 30) -> None:
+                 pair_wait: float = 900, retain_days: float = 30,
+                 archive_db: Path | None = None,
+                 webdav: WebDAV | None = None) -> None:
         self.meeting = Path(meeting).resolve()
         self.asr = asr
         self.model = model
@@ -298,6 +463,7 @@ class Jobs:
         self.timeout = timeout
         self.inbox.mkdir(parents=True, exist_ok=True)
         self.out.mkdir(parents=True, exist_ok=True)
+        self.archive = Archive(archive_db or (root / "archive.db"), webdav)
         self._jobs: dict[str, Job] = {}
         # RLock: a state change is persisted while the submitter holds the lock.
         self._lock = threading.RLock()
@@ -334,6 +500,7 @@ class Jobs:
                                  + safe_suffix(filename))
             path.write_bytes(audio)
             job.tracks[track] = path
+            self.archive.received(job.id, track, filename or path.name, audio)
             job.options = options or job.options
             self._schedule(job, pair)
             return job.snapshot()
@@ -389,6 +556,7 @@ class Jobs:
             except (KeyError, TypeError, ValueError):
                 continue
             self._restore(job)
+            self.archive.status(job.id, job.status, job.error)
             self._jobs[job.id] = job
         self._persist()
 
@@ -487,6 +655,7 @@ class Jobs:
             if not all(path.is_file() for path in job.tracks.values()):
                 return job.snapshot()
             job.status, job.error, job.progress = "queued", None, None
+            self.archive.status(job.id, "queued")
             job.started = job.finished = None
             job.json = job.markdown = None  # the previous result is not this run's
             self._queue.put(job)
@@ -508,6 +677,7 @@ class Jobs:
                 return job.snapshot()
             # A stopped job is not a failed one: an old message would lie.
             job.status, job.error, job.progress = "cancelled", None, None
+            self.archive.status(job.id, "cancelled")
             with self._current_lock:
                 process = self._current if self._current_job is job else None
             if process is None:
@@ -571,10 +741,23 @@ class Jobs:
         with self._current_lock:
             self._current_job = job
         job.status, job.started = "running", time.time()
+        self.archive.status(job.id, "running")
         self._persist()
         try:
             self._transcribe(job)
         finally:
+            job.finished = job.finished or time.time()
+            # Archive before deleting: --no-keep-audio still leaves the WebDAV copy.
+            self.archive.finish(job)
+            # A failed WebDAV upload keeps the local file: deleting it would lose
+            # the recording, and the row already says the copy is missing.
+            if (not self.keep_audio and job.status == "done"
+                    and self.archive.archived(job.id)):
+                for track in job.tracks.values():
+                    try:
+                        track.unlink()
+                    except OSError:
+                        pass
             with self._current_lock:
                 self._current_job = None
             self._persist()
@@ -648,14 +831,10 @@ class Jobs:
             with self._current_lock:
                 self._current = None
             job.finished = time.time()
-            # Keep the audio of a failed job so it can be resubmitted (same bytes
-            # mean the same id, and submit() requeues an errored job).
-            if not self.keep_audio and job.status == "done":
-                for track in job.tracks.values():
-                    try:
-                        track.unlink()
-                    except OSError:
-                        pass
+            # A failed job keeps its audio so it can be resubmitted (same bytes
+            # mean the same id, and submit() requeues an errored job). The
+            # archive and the --no-keep-audio deletion live in _run's finally:
+            # they must see the status after every path, including a cancel.
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> None:
@@ -2191,12 +2370,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             self._json(200, {"status": "ok", "jobs": len(self.server.jobs.list()),
-                             "queue": self.server.jobs.queued()})
+                             "queue": self.server.jobs.queued(),
+                             "archive": self.server.jobs.archive.webdav is not None})
             return
         if not self._authorized():
             self._json(401, {"error": "missing or wrong bearer token"})
             return
-        if path == "/hooks":
+        if path == "/files":
+            self._json(200, {"files": self.server.jobs.archive.rows()})
+        elif path == "/hooks":
             self._json(200, {"hooks": hook_view(self.server.hooks, self.server.jobs)})
         elif path.startswith("/hooks/"):
             views = hook_view(self.server.hooks, self.server.jobs,
@@ -2458,13 +2640,32 @@ def main() -> None:
     parser.add_argument("--live-glossary", default="",
                         help="names and terms the live translation must leave unchanged, "
                              "comma separated (default: none)")
+    parser.add_argument("--archive-db", type=Path,
+                        default=(Path(os.environ["ARCHIVE_DB"])
+                                 if os.environ.get("ARCHIVE_DB") else None),
+                        help="SQLite ledger of received files and their WebDAV copies "
+                             "(default $ARCHIVE_DB or <dir>/archive.db)")
+    parser.add_argument("--webdav-url", default=os.environ.get("WEBDAV_URL", ""),
+                        help="WebDAV collection to archive uploads into; empty records them "
+                             "in the ledger without copying (default $WEBDAV_URL)")
+    parser.add_argument("--webdav-user", default=os.environ.get("WEBDAV_USER", ""),
+                        help="WebDAV user (default $WEBDAV_USER)")
+    parser.add_argument("--webdav-password", default=os.environ.get("WEBDAV_PASSWORD", ""),
+                        help="WebDAV password (default $WEBDAV_PASSWORD)")
+    parser.add_argument("--webdav-dir", default=os.environ.get("WEBDAV_DIR", "meeting-stack"),
+                        help="folder under the WebDAV root (default meeting-stack)")
     args = parser.parse_args()
 
+    webdav = (WebDAV(args.webdav_url, args.webdav_user, args.webdav_password,
+                     args.webdav_dir)
+              if args.webdav_url else None)
     jobs = Jobs(args.meeting, args.dir.expanduser(), args.keep_audio, args.job_timeout,
                 args.asr, args.model,
                 args.asr_dir, args.asr_remote_dir,
                 pair_wait=args.pair_wait,
-                retain_days=args.retain_audio_days)
+                retain_days=args.retain_audio_days,
+                archive_db=args.archive_db.expanduser() if args.archive_db else None,
+                webdav=webdav)
     hooks = Hooks(args.dir.expanduser() / "hooks.json")
     live = Live(args.asr, args.model, args.translate_url, args.translate_model,
                 args.live_idle, args.live_glossary, args.live_silence,
@@ -2478,6 +2679,8 @@ def main() -> None:
           f"{' streaming' if live.stream_asr else ' per clip'}", flush=True)
     print(f"meeting-job on http://{args.host}:{args.port}  ({auth})", flush=True)
     print(f"live translation: {translate}", flush=True)
+    print(f"archive: {'WebDAV ' + args.webdav_url if webdav else 'ledger only (set WEBDAV_URL)'}",
+          flush=True)
 
     def shutdown(signum, frame) -> None:
         jobs.stop()
