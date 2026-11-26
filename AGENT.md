@@ -21,7 +21,6 @@ dashboard/src/Live.tsx    the live view: capture, transcript, translation (shadc
                           gradient and `snap-y`; a container mask was tried first and
                           faded nothing until the rows overflowed it.
 live-feed                 the same live API as a CLI: ffmpeg input (file or device) -> lines
-systemd/meeting-job.service
 test_meeting.py
 ```
 
@@ -59,8 +58,8 @@ GPU lock. Everything is an HTTP endpoint the service calls.
 - Translators: Lemonade `http://127.0.0.1:8731` (`--translate-model`), Mistral's
   chat models (`mistral.<id>`) and the Bifrost gateway `http://127.0.0.1:8080`
   (`--mt-gateway`, its `opencode.<id>` models).
-- Service: user unit `meeting-job.service` on port 8099 - a plain
-  `podman run`, no podman socket, no device mounts.
+- Service: one container from `docker-compose.yml` (docker or podman-compose)
+  on port 8099 - no podman socket, no device mounts.
 
 ## The dashboard
 
@@ -121,9 +120,7 @@ and call out over HTTP only. Consequences that bite:
   `--no-keep-audio` deletes the local copy; a WebDAV failure lands in
   `archive_error` and never fails the job. `GET /files` is the read side. The
   compose credentials come from `.env` (`WEBDAV_*`, gitignored; `.env.example`
-  is committed); the unit takes them from `meeting-job.env`. The DB is
-  `/data/archive.db` on the `meeting-db` volume in compose, `<dir>/archive.db`
-  under systemd.
+  is committed). The DB is `/data/archive.db` on the `meeting-db` volume.
 - Transcript dialog (`dashboard/src/App.tsx`): the finished job opens beside its
   audio with a **Text / Segments** switch, the shape Unsloth Studio's audio page
   uses. Text joins consecutive turns by the same speaker into a paragraph;
@@ -186,24 +183,23 @@ and call out over HTTP only. Consequences that bite:
 - Unsloth Studio on `http://ubuntu:8888` - `/v1/audio/inputs` +
   `/api/inference/audio/transcribe/source` for batch diarization, `/v1/models`
   and `/api/providers/` for the live translators. Key in `$UNSLOTH_API_KEY`
-  (the unit forwards it from `meeting-job.env`).
+  (compose passes it from `.env`).
 - audio.cpp on `http://ubuntu:8090` - live transcription, and the direct batch
   fallback. Its build/run lives in that project, not here. `/v1/models/load`
   reloads `moss-transcribe-diarize` when the server unloaded it (the service
   does this itself on a 404).
-- Mistral - key in `$MISTRAL_API_KEY` (`~/.config/meeting-job.env` via the unit).
+- Mistral - key in `$MISTRAL_API_KEY` (compose passes it from `.env`).
 - Lemonade on `:8731` and Bifrost on `:8080` - translators; do not evict their
   resident models.
 
-## After changing the service or the unit
+## After changing the service or the image
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user restart meeting-job.service
+docker compose up -d --build        # or: podman-compose up -d --build
 curl -s localhost:8099/health
 ```
 
-The unit passes only what differs from the defaults (the directory, the model
-choice, the gateway): the running configuration is
-visible in `systemctl --user cat meeting-job.service`, the rest is the
-default contract tested in `test_meeting.py`.
+The compose `command` passes only what differs from the defaults (the directory,
+the model choice, the gateway): the running configuration is the `command` in
+`docker-compose.yml`, the rest is the default contract tested in
+`test_meeting.py`.

@@ -1,15 +1,11 @@
 # meeting-job + the dashboard, in one container.
 #
 #   podman build -t localhost/meeting-job .
-#   podman run --rm --network=host \
-#     -v ~/.cache/mcp-meeting-transcribe:~/.cache/mcp-meeting-transcribe \
-#     -v ~/audio:/asr-share \
-#     -e HOME=$HOME -e MISTRAL_API_KEY=$MISTRAL_API_KEY \
-#     localhost/meeting-job --dir ~/.cache/mcp-meeting-transcribe --asr-dir /asr-share
+#   docker compose up -d --build    # or: podman-compose up -d --build
 #
 # A plain service: no podman socket, no device mounts, no nested containers —
-# all inference (audio.cpp, Mistral, Lemonade, the Bifrost gateway) is reached
-# over HTTP.
+# all inference (audio.cpp, Unsloth Studio, Mistral, Lemonade, the Bifrost
+# gateway) is reached over HTTP.
 FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update \

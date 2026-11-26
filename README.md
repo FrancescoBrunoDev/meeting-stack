@@ -100,20 +100,21 @@ podman socket, no device mounts, no nested containers. All inference is reached
 over HTTP (audio.cpp, Mistral, Lemonade for the translations, the Bifrost
 gateway).
 
+The deployment is `docker-compose.yml`: it builds the image and runs it with
+the config in `.env`.
+
 ```sh
-podman build -t localhost/meeting-job .     # Containerfile in this repo
-install -m 644 systemd/meeting-job.service ~/.config/systemd/user/
-install -d -m 700 ~/.config/meeting-stack
-printf 'MEETING_TOKEN=%s\nMISTRAL_API_KEY=%s\nUNSLOTH_API_KEY=%s\n' \
-  "$(openssl rand -hex 24)" "$MISTRAL_API_KEY" "$UNSLOTH_API_KEY" \
-  > ~/.config/meeting-stack/meeting-job.env
-chmod 600 ~/.config/meeting-stack/meeting-job.env
-systemctl --user daemon-reload && systemctl --user enable --now meeting-job.service
+cp .env.example .env        # fill MEETING_TOKEN, MISTRAL_API_KEY, UNSLOTH_API_KEY, UBUNTU_HOST
+docker compose up -d --build        # or: podman-compose up -d --build
 ```
 
-### Docker Compose / Coolify, on another machine
+A plain `podman run` / `docker run` needs the same flags by hand: `--env-file
+.env`, the `meeting-data:/data` and `meeting-db:/db` volumes, `-p 8099:8099`,
+and the `command` from the compose file.
 
-`docker-compose.yml` deploys the same image on any docker host — e.g. a
+### Docker Compose / Coolify
+
+`docker-compose.yml` deploys the same image on any docker/podman host — e.g. a
 Coolify server in the same LAN as this box. Every deploy choice is an
 environment variable: `MEETING_TOKEN`, `MISTRAL_API_KEY`, `UNSLOTH_API_KEY` and
 `UBUNTU_HOST` (the LAN address of this box; audio.cpp `:8090`, Unsloth Studio
@@ -175,9 +176,9 @@ re-runs the job and retries the archive.
 | `WEBDAV_DIR` / `--webdav-dir` | folder under the root (default `meeting-stack`) |
 | `ARCHIVE_DB` / `--archive-db` | ledger path (default `<dir>/archive.db`) |
 
-`GET /files` lists the ledger, newest first. In compose the credentials come
-from `.env` and the ledger lives on the `meeting-db` volume; in the systemd unit
-put the same variables in `meeting-job.env`.
+`GET /files` lists the ledger, newest first. The credentials come from `.env`
+(compose `env_file`/interpolation, or `--env-file .env` for a plain
+`podman run` / `docker run`) and the ledger lives on the `meeting-db` volume.
 
 ### Two tracks, one transcript
 
@@ -433,7 +434,7 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
   this; `0` keeps them forever. Only done and failed jobs are candidates.
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
-The systemd unit runs the Unsloth Studio path: `--model
+The compose deployment runs the Unsloth Studio path: `--model
 unsloth.MOSS-Transcribe-Diarize` with `UNSLOTH_API_KEY`, uploads kept, live
 streaming from audio.cpp on `http://ubuntu:8090`, translation through Lemonade
 and the Bifrost gateway.
