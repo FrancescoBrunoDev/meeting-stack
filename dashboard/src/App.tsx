@@ -652,6 +652,7 @@ function TranscriptDialog({
 }) {
   const [copied, setCopied] = useState(false)
   const [active, setActive] = useState(-1)
+  const [view, setView] = useState<"text" | "segments">("text")
   const [seekTick, setSeekTick] = useState(0)
   const [audioFailed, setAudioFailed] = useState(false)
   const audio = useRef<HTMLAudioElement | null>(null)
@@ -661,6 +662,28 @@ function TranscriptDialog({
 
   const markdown = job?.markdown ?? ""
   const turns = useMemo(() => job?.json?.turns ?? [], [job?.json])
+  // Text view: consecutive turns by the same speaker read as one paragraph,
+  // the way the Unsloth Studio transcript shows them (Text / Segments).
+  const paragraphs = useMemo(() => {
+    const out: Turn[] = []
+    for (const turn of turns) {
+      const last = out[out.length - 1]
+      if (last && last.speaker === turn.speaker && last.name === turn.name) {
+        last.text += ` ${turn.text}`
+        last.end = turn.end
+      } else {
+        out.push({ ...turn })
+      }
+    }
+    return out
+  }, [turns])
+  const activeParagraph = useMemo(() => {
+    const turn = turns[active]
+    if (!turn) return -1
+    let index = -1
+    for (let i = 0; i < paragraphs.length && paragraphs[i].start <= turn.start; i++) index = i
+    return index
+  }, [active, turns, paragraphs])
   const downloadUrl = useMemo(
     () => (markdown ? URL.createObjectURL(new Blob([markdown], { type: "text/markdown" })) : ""),
     [markdown]
@@ -701,7 +724,7 @@ function TranscriptDialog({
         top: box.scrollTop + offset - box.clientHeight * 0.25,
         behavior: "smooth",
       })
-  }, [active, seekTick])
+  }, [active, seekTick, view])
 
   useEffect(() => {
     const element = audio.current
@@ -776,34 +799,72 @@ function TranscriptDialog({
         <div ref={scroller} className="min-h-0 flex-1 overflow-y-auto">
           {job?.status === "done" ? (
             turns.length ? (
-              <ol className="space-y-0.5 p-4">
-                {turns.map((turn, index) => (
-                  <li key={index}>
-                    <button
+              <div className="p-4">
+                <div className="mb-3 flex items-center gap-1">
+                  {(["text", "segments"] as const).map((mode) => (
+                    <Button
+                      key={mode}
                       type="button"
-                      ref={index === active ? activeLine : undefined}
-                      onClick={() => playFrom(turn)}
-                      className={cn(
-                        "block w-full rounded-md px-2 py-1 text-left transition-colors hover:bg-accent/60",
-                        index === active && "bg-primary text-primary-foreground"
-                      )}
+                      size="sm"
+                      variant={view === mode ? "secondary" : "ghost"}
+                      className="capitalize"
+                      onClick={() => setView(mode)}
                     >
-                      <span
+                      {mode}
+                    </Button>
+                  ))}
+                </div>
+                {view === "text" ? (
+                  <div className="space-y-2">
+                    {paragraphs.map((paragraph, index) => (
+                      <button
+                        key={index}
+                        type="button"
+                        ref={index === activeParagraph ? activeLine : undefined}
+                        onClick={() => playFrom(paragraph)}
                         className={cn(
-                          "mr-2 font-mono text-xs tabular-nums",
-                          index === active ? "text-primary-foreground/70" : "text-muted-foreground"
+                          "block w-full rounded-md px-2 py-1 text-left transition-colors hover:bg-accent/60",
+                          index === activeParagraph && "bg-primary text-primary-foreground"
                         )}
                       >
-                        {timecode(turn.start)}
-                      </span>
-                      <span className="text-sm font-medium">
-                        {turn.name ?? `Speaker ${turn.speaker}`}
-                      </span>{" "}
-                      <span className="text-sm">{turn.text}</span>
-                    </button>
-                  </li>
-                ))}
-              </ol>
+                        <span className="text-sm font-medium">
+                          {paragraph.name ?? `Speaker ${paragraph.speaker}`}
+                        </span>{" "}
+                        <span className="text-sm">{paragraph.text}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <ol className="space-y-0.5">
+                    {turns.map((turn, index) => (
+                      <li key={index}>
+                        <button
+                          type="button"
+                          ref={index === active ? activeLine : undefined}
+                          onClick={() => playFrom(turn)}
+                          className={cn(
+                            "block w-full rounded-md px-2 py-1 text-left transition-colors hover:bg-accent/60",
+                            index === active && "bg-primary text-primary-foreground"
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              "mr-2 font-mono text-xs tabular-nums",
+                              index === active ? "text-primary-foreground/70" : "text-muted-foreground"
+                            )}
+                          >
+                            {timecode(turn.start)}
+                          </span>
+                          <span className="text-sm font-medium">
+                            {turn.name ?? `Speaker ${turn.speaker}`}
+                          </span>{" "}
+                          <span className="text-sm">{turn.text}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </div>
             ) : (
               <pre className="p-6 font-mono text-[13px] leading-relaxed whitespace-pre-wrap">
                 {markdown}

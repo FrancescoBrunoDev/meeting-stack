@@ -1,8 +1,8 @@
 # meeting-stack
 
-Diarized transcripts of long meetings. The inference (audio.cpp, Mistral,
-Lemonade) lives on a GPU box; the service is one plain container that deploys
-anywhere that can reach it.
+Diarized transcripts of long meetings. The inference (Unsloth Studio, audio.cpp,
+Mistral, Lemonade) lives on a GPU box; the service is one plain container that
+deploys anywhere that can reach it.
 
 Two tools, a service and a web page.
 
@@ -18,25 +18,34 @@ Two tools, a service and a web page.
   [Live](#live-audio-in-a-translated-line-out)).
 - **`dashboard.html`** — the web UI `meeting-job` serves at `/` (and `/ui`):
   upload with a progress bar, live job list, and the transcript in a dialog next
-  to an audio player — the sentence being spoken is highlighted and followed
-  while it plays, and clicking a line seeks there. Built from `dashboard/`, one
+  to an audio player — Text (paragraphs per speaker) or Segments (one timestamped
+  line each), the sentence being spoken is highlighted and followed while it
+  plays, and clicking a line seeks there. Built from `dashboard/`, one
   self-contained file, no CDN at runtime.
 
 ## How it works
 
 ```
-audio ──> ffmpeg: 16 kHz mono WAV
-              │
-              ├──> one request to audio.cpp (moss-transcribe-diarize)
-              │     MOSS-Transcribe-Diarize: words, speaker labels, timestamps
-              │
-              └──> one request to Mistral (voxtral-*, diarize=true)
-                    words, speaker labels, timestamps
-                                  │
-                                  └──> turns ──> markdown + json
+audio ──> Unsloth Studio transcribe workflow (unsloth.*, default)
+       │     raw upload -> /api/inference/audio/transcribe/source
+       │     NDJSON: segments with words, speaker labels, timestamps
+       │     the studio decodes the file: no ffmpeg, no --asr-dir, up to 4 h
+       ├──> audio.cpp (moss-transcribe-diarize), 16 kHz mono WAV from ffmpeg
+       └──> Mistral (voxtral-*, diarize=true)
+                          │
+                          └──> turns ──> markdown + json
 ```
 
-No inference runs in this stack. The local path is one request to
+No inference runs in this stack. The service deployment's batch path is Unsloth
+Studio's transcribe workflow, the same one its own `/audio` page runs: the
+original file is uploaded raw (the studio decodes it, so no normalization and no
+shared directory), then a transcription named by the uploaded input answers as
+NDJSON with timestamped segments carrying the speaker labels. It takes up to 4
+hours (the studio's `max_seconds`). That is why meeting-stack does not use the
+OpenAI-compatible `/v1/audio/transcriptions` route: it stops at 30 minutes, and
+`verbose_json` drops the speakers anyway.
+
+The direct local path is one request to
 [audio.cpp](https://github.com/ggml-org/audio.cpp) serving
 `moss-transcribe-diarize`: the model answers the words *and* the speaker labels
 *and* the timestamps, so nothing is cut, no diarizer runs, and no edge that is
@@ -56,19 +65,25 @@ service.
 
 ## Requirements
 
+- [Unsloth Studio](https://github.com/unslothai/unsloth) on
+  `http://ubuntu:8888`, serving `MOSS-Transcribe-Diarize`, with its API key in
+  `UNSLOTH_API_KEY` (default batch path)
 - [audio.cpp](https://github.com/ggml-org/audio.cpp) on `http://ubuntu:8090`
-  serving `moss-transcribe-diarize`, and a directory it can read the normalized
-  WAV from (`--asr-dir`): it takes a path, not an upload
+  for the live transcriber and the direct `moss-transcribe-diarize` fallback;
+  that fallback needs a directory it can read the normalized WAV from
+  (`--asr-dir`): it takes a path, not an upload
 - `MISTRAL_API_KEY` for the cloud path (batch `mistral.voxtral-*`, the cloud
   translators, live realtime)
-- **podman or docker** for the service container, **ffmpeg** for the normalization
+- **podman or docker** for the service container, **ffmpeg** for the
+  normalization on the audio.cpp/Mistral paths
 
 ## Usage
 
 ```sh
 ./meeting-transcribe meeting.m4a \
+    --model unsloth.MOSS-Transcribe-Diarize          # Unsloth Studio (UNSLOTH_API_KEY)
+./meeting-transcribe meeting.m4a \
     --model moss-transcribe-diarize --asr-dir ~/audio
-./meeting-transcribe meeting.m4a                      # the same, by default
 ./meeting-transcribe meeting.wav --names "1:Anna,2:Bernd"   # names also bias Mistral
 ./meeting-transcribe meeting.m4a --model mistral.voxtral-mini-transcribe-3    # goes to Mistral
 ```
@@ -89,7 +104,8 @@ gateway).
 podman build -t localhost/meeting-job .     # Containerfile in this repo
 install -m 644 systemd/meeting-job.service ~/.config/systemd/user/
 install -d -m 700 ~/.config/meeting-stack
-printf 'MEETING_TOKEN=%s\nMISTRAL_API_KEY=%s\n' "$(openssl rand -hex 24)" "$MISTRAL_API_KEY" \
+printf 'MEETING_TOKEN=%s\nMISTRAL_API_KEY=%s\nUNSLOTH_API_KEY=%s\n' \
+  "$(openssl rand -hex 24)" "$MISTRAL_API_KEY" "$UNSLOTH_API_KEY" \
   > ~/.config/meeting-stack/meeting-job.env
 chmod 600 ~/.config/meeting-stack/meeting-job.env
 systemctl --user daemon-reload && systemctl --user enable --now meeting-job.service
@@ -99,17 +115,17 @@ systemctl --user daemon-reload && systemctl --user enable --now meeting-job.serv
 
 `docker-compose.yml` deploys the same image on any docker host — e.g. a
 Coolify server in the same LAN as this box. Every deploy choice is an
-environment variable: `MEETING_TOKEN`, `MISTRAL_API_KEY` and `UBUNTU_HOST`
-(the LAN address of this box; audio.cpp `:8090`, Lemonade `:8731` and Bifrost
-`:8080` all hang off it) must be set, the rest — `MEETING_PORT`,
-`AUDIOCPP/LEMONADE/BIFROST_PORT`, `BATCH/LIVE/TRANSLATE_MODEL` — carries a
-default in the file. Batch defaults to `mistral.voxtral-small-transcribe-3`:
-an audio.cpp model travels as a multipart upload from another machine, and
-the server **segfaults past ~20 minutes of recording** (measured: 11 min
-whole, 43 min crash), so the pipeline refuses the bigger ones with an
-actionable error. A shared filesystem (`--asr-dir`) restores the path mode
-for any length. The cache dir is a volume, so jobs and transcripts survive
-redeploys.
+environment variable: `MEETING_TOKEN`, `MISTRAL_API_KEY`, `UNSLOTH_API_KEY` and
+`UBUNTU_HOST` (the LAN address of this box; audio.cpp `:8090`, Unsloth Studio
+`:8888`, Lemonade `:8731` and Bifrost `:8080` all hang off it) must be set, the
+rest — `MEETING_PORT`, `AUDIOCPP/LEMONADE/BIFROST_PORT`,
+`BATCH/LIVE/TRANSLATE_MODEL` — carries a default in the file. Batch defaults to
+`unsloth.MOSS-Transcribe-Diarize`, which needs only the studio's key. A bare
+audio.cpp model from another machine travels as a multipart upload, and the
+server **segfaults past ~20 minutes of recording** (measured: 11 min whole, 43
+min crash), so the pipeline refuses the bigger ones with an actionable error.
+A shared filesystem (`--asr-dir`) restores the path mode for any length. The
+cache dir is a volume, so jobs and transcripts survive redeploys.
 
 That is the live deployment today: Coolify on `raspberrypi2:8099`, with
 `tailscale serve --bg --https=443 8099` over it — so the same service answers
@@ -361,7 +377,7 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
 
 ## Flags worth knowing
 
-- A model audiocpp serves (default) — one request to
+- A model audio.cpp serves (the `meeting-transcribe` default, no key needed) — one request to
   [audio.cpp](https://github.com/ggml-org/audio.cpp) with
   `MOSS-Transcribe-Diarize`, which returns the speaker labels and the
   timestamps itself. It needs `--asr-dir`, the directory audio.cpp reads the
@@ -377,14 +393,13 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
   `MISTRAL_API_KEY`. `mistral.voxtral-*` is the prefixed id the API and the
   dashboard speak.
 - An `unsloth.*` model (e.g. `unsloth.MOSS-Transcribe-Diarize`) — Unsloth
-  Studio's transcribe workflow on `$UNSLOTH_URL` (default `http://ubuntu:8888`)
-  with `$UNSLOTH_API_KEY`: the same audio.cpp diarizers, but the original file
-  travels as one raw upload (the studio decodes it — no normalization, no
-  shared directory) and the workflow accepts **up to 4 hours**, where
-  audio.cpp's own multipart receive segfaults past ~20 minutes. Measured: 43
-  minutes of audio in 10 minutes of wall time, speakers included. `--job-timeout`
-  (4 h) is the service-side cap for one job; the studio's own answer for a
-  longer recording is a clean 413, not a crash.
+  Studio's transcribe workflow on `$UNSLOTH_URL` (default
+  `http://ubuntu:8888`) with `$UNSLOTH_API_KEY`: the original file travels as
+  one raw upload (the studio decodes it — no normalization, no shared
+  directory) and the workflow accepts up to 4 hours, where the OpenAI
+  `/v1/audio/transcriptions` route stops at 30 minutes. Measured: 43 minutes of
+  audio in ~15 minutes of wall time, speakers included. `--job-timeout` (4 h)
+  is the service-side cap for one job.
 - `--second FILE` — the microphone track of a two-track recording; see above.
   `--second-name` (default `Me`), `--second-offset`.
 - `--pair-wait 900` (on `meeting-job`) — how long a one-track job waits for the
@@ -393,9 +408,10 @@ streaming, on by default, or one clip per utterance with `--no-live-stream`).
   this; `0` keeps them forever. Only done and failed jobs are candidates.
 - `--model`, `--asr` — point the pipeline at another model or endpoint.
 
-The systemd unit runs the audio.cpp path: `--asr http://ubuntu:8090 --model
-moss-transcribe-diarize`, uploads kept, live streaming from the same
-endpoint, translation through Lemonade and the Bifrost gateway.
+The systemd unit runs the Unsloth Studio path: `--model
+unsloth.MOSS-Transcribe-Diarize` with `UNSLOTH_API_KEY`, uploads kept, live
+streaming from audio.cpp on `http://ubuntu:8090`, translation through Lemonade
+and the Bifrost gateway.
 
 ## Tests
 
@@ -403,6 +419,7 @@ endpoint, translation through Lemonade and the Bifrost gateway.
 python3 -m unittest test_meeting -v
 ```
 
-They cover the pure functions — the audio.cpp and Mistral answer parsing, the
-turn merge and dedupe, the two-track matching, the live line building — and
-assert that the defaults stay on the audio.cpp path.
+They cover the pure functions — the audio.cpp, Unsloth Studio and Mistral
+answer parsing, the turn merge and dedupe, the two-track matching, the live line
+building — and assert that the standalone defaults stay on the keyless audio.cpp
+path while `unsloth.*` is the studio's one-upload NDJSON workflow.

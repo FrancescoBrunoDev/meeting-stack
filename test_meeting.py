@@ -1263,6 +1263,69 @@ class LiveLines(unittest.TestCase):
         ])
         self.assertEqual(meeting.number_speakers(meeting.unsloth_answer_turns(answer))[1]["speaker"], 2)
 
+    def test_unsloth_batch_is_the_studios_transcribe_workflow(self):
+        """One upload, then the workflow's NDJSON answer. This is the path the
+        studio's own /audio page runs, and it takes up to 4 hours."""
+        captured = []
+        events = [
+            {"type": "progress", "phase": "transcribing"},
+            {"type": "complete", "segments": [
+                {"start": 0.2, "end": 4.6, "text": " Ciao. ", "speaker": "S01"},
+                {"start": 5.0, "end": 8.8, "text": "Bene.", "speaker": "S02"},
+            ]},
+        ]
+
+        class FakeResponse:
+            def __init__(self, payload=None, lines=None):
+                self.payload, self.lines = payload, lines or []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode()
+
+            def __iter__(self):
+                return iter(json.dumps(event).encode() for event in self.lines)
+
+        def fake_open(req, timeout=0):
+            captured.append({"url": req.full_url,
+                             "auth": req.headers.get("Authorization"),
+                             "body": req.data.decode("utf-8", "replace")})
+            if "audio/inputs" in req.full_url:
+                return FakeResponse({"id": "input_1"})
+            return FakeResponse(lines=events)
+
+        original = meeting.urllib.request.urlopen
+        meeting.urllib.request.urlopen = fake_open
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / "meeting.mp3"
+                src.write_bytes(b"audio")
+                turns = meeting.transcribe_unsloth(
+                    "http://studio:8888", "secret", src,
+                    "unsloth.MOSS-Transcribe-Diarize", "de", 10)
+        finally:
+            meeting.urllib.request.urlopen = original
+        self.assertEqual(len(captured), 2)
+        self.assertIn("/v1/audio/inputs?name=meeting.mp3", captured[0]["url"])
+        self.assertEqual(captured[0]["auth"], "Bearer secret")
+        self.assertEqual(captured[1]["url"],
+                         "http://studio:8888/api/inference/audio/transcribe/source")
+        body = json.loads(captured[1]["body"])
+        self.assertEqual(body["source"], {"input_id": "input_1"})
+        self.assertEqual(body["model"],
+                         "audio-cpp/audio.cpp-gguf/MOSS-Transcribe-Diarize-GGUF")
+        self.assertTrue(body["speakers"])
+        self.assertEqual(body["language"], "de")
+        self.assertEqual(turns, [
+            {"speaker": "S01", "start": 0.2, "end": 4.6, "text": "Ciao."},
+            {"speaker": "S02", "start": 5.0, "end": 8.8, "text": "Bene."},
+        ])
+
     def test_unsloth_model_id_rides_the_namespace(self):
         self.assertEqual(meeting_job.unsloth_model_id("unsloth.Hy-MT2-7B-GGUF"),
                          "unsloth/Hy-MT2-7B-GGUF")

@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Diarized transcript of a long meeting, from audio.cpp or Mistral.
+"""Diarized transcript of a long meeting, from Unsloth Studio, audio.cpp or Mistral.
 
-No inference runs here. Local: audio.cpp serves a transcription model that
-diarizes itself (MOSS-Transcribe-Diarize — one request for the whole file, it
-answers the speaker labels, the timestamps and the words). Cloud: Mistral's
-/v1/audio/transcriptions answers the same with diarize=true.
+No inference runs here. Unsloth Studio runs the audio.cpp diarizers through its
+transcribe workflow (the same path its own /audio page uses): the original file
+is uploaded raw and the studio decodes it, then a transcription answers as
+NDJSON with timestamped segments carrying the speaker labels. It takes up to 4
+hours. audio.cpp can also be called directly: it reads the audio from a path,
+not an upload, so the normalized WAV has to sit where the server can open it
+(--asr-dir, seen from the server as --asr-remote-dir when the two differ).
+Cloud: Mistral's /v1/audio/transcriptions answers the same with diarize=true.
 
+    ./meeting-transcribe meeting.m4a --model unsloth.MOSS-Transcribe-Diarize
     ./meeting-transcribe meeting.m4a \
         --model moss-transcribe-diarize --asr-dir /asr-share
     ./meeting-transcribe meeting.wav --model mistral.voxtral-mini-transcribe-3
 
-audio.cpp reads the audio from a path, not an upload, so the normalized WAV
-has to sit where the server can open it (--asr-dir, seen from the server as
---asr-remote-dir when the two differ). Mistral's context window is 65,536
-tokens (~34 min): longer recordings go in MISTRAL_MAX_S chunks.
+Mistral's context window is 65,536 tokens (~34 min): longer recordings go in
+MISTRAL_MAX_S chunks.
 
 Everything is stdlib; the audio decoding and resampling happen in ffmpeg.
 """
@@ -31,6 +34,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import wave
@@ -311,7 +315,7 @@ UNSLOTH_MODELS = {
 
 
 def is_unsloth_asr(model: str) -> bool:
-    """The id names its provider: unsloth.* is the studio's transcribe workflow."""
+    """The id names its provider: unsloth.* is the studio's OpenAI audio endpoint."""
     return (model or "").startswith("unsloth.")
 
 
@@ -321,8 +325,9 @@ def unsloth_studio_id(model: str) -> str:
 
 
 def unsloth_answer_turns(answer: dict) -> list[dict]:
-    """The complete event's segments become turns; the speakers arrive as
-    'S01' ids, which number_speakers relabels in order of first appearance."""
+    """The workflow's complete event's segments become turns; the speakers
+    arrive as 'S01' labels, which number_speakers relabels in order of first
+    appearance."""
     turns = []
     for segment in answer.get("segments") or []:
         text = str(segment.get("text") or "").strip()
@@ -342,8 +347,8 @@ def transcribe_unsloth(url: str, key: str, source: Path, model: str,
     Two requests: the original file as a raw upload (the studio decodes it, so
     no 16 kHz normalization and no shared directory), then a transcription
     named by id that answers as NDJSON - heartbeats, progress, one 'complete'.
-    The workflow takes up to 4 hours of audio, where audio.cpp's own multipart
-    receive segfaults past ~20 minutes (measured: 43 min in 10 min wall here).
+    This is the path the studio's own /audio page runs, and it takes up to 4
+    hours (the OpenAI /v1/audio/transcriptions route stops at 30 minutes).
     """
     if not key:
         raise SystemExit("UNSLOTH_API_KEY is required for unsloth.* models")
@@ -479,8 +484,8 @@ def mistral_turns(args, source: Path, workdir: Path, hotwords: str,
 
 
 def unsloth_turns(args, source: Path, workdir: Path, lenient: bool) -> list[dict]:
-    """Diarize+transcribe through the studio's workflow: no normalization
-    (it decodes the upload itself), no shared directory, up to 4 hours."""
+    """Diarize+transcribe through the studio's workflow: no normalization (it
+    decodes the upload itself), no shared directory, up to 4 hours."""
     base = (getattr(args, "unsloth_url", "")
             or os.environ.get("UNSLOTH_URL", "http://ubuntu:8888")).rstrip("/")
     key = getattr(args, "unsloth_key", "") or os.environ.get("UNSLOTH_API_KEY", "")

@@ -33,10 +33,20 @@ live in the archived `halogen-runner` repo and are out of scope.
 No inference is managed here: no model-server launcher, no image pipeline, no
 GPU lock. Everything is an HTTP endpoint the service calls.
 
-- ASR, batch and live: audio.cpp `http://ubuntu:8090` with
-  `moss-transcribe-diarize` (one request for the whole meeting; the model answers
-  words, speakers and timestamps). It takes a path (not an upload) and 16 kHz
-  mono WAV, hence `--asr-dir`/`--asr-remote-dir` and ffmpeg in the image.
+- ASR, batch (default): Unsloth Studio `http://ubuntu:8888` with
+  `audio-cpp/audio.cpp-gguf/MOSS-Transcribe-Diarize-GGUF` (the service id is
+  `unsloth.MOSS-Transcribe-Diarize`), key in `$UNSLOTH_API_KEY`. The studio's
+  transcribe workflow, the same path its `/audio` page uses: upload the file to
+  `/v1/audio/inputs`, then POST `/api/inference/audio/transcribe/source` with
+  `speakers: true` and read NDJSON until `complete`. Up to 4 hours
+  (`max_seconds` from `/api/inference/audio/stt/capabilities`); the
+  OpenAI-compatible `/v1/audio/transcriptions` route stops at 30 minutes. The
+  studio decodes the file itself, so no ffmpeg, no normalized WAV and no
+  `--asr-dir`.
+- ASR, direct audio.cpp: `http://ubuntu:8090` with `moss-transcribe-diarize`
+  (one request for the whole meeting; the model answers words, speakers and
+  timestamps). It takes a path (not an upload) and 16 kHz mono WAV, hence
+  `--asr-dir`/`--asr-remote-dir` and ffmpeg in the image.
   `max_tokens` must be large (65536) AND under `"options"`: at the top level the
   server ignores it and uses 5120, and a tight cap ends in `reached max_tokens
   before EOS`, which loses the transcript instead of truncating it. 38 minutes
@@ -78,9 +88,11 @@ from `https://ui.shadcn.com/r/styles/new-york-v4/<name>.json` instead.
 `meeting-job` and the dashboard run in `localhost/meeting-job`, host network,
 and call out over HTTP only. Consequences that bite:
 
-- The normalized WAV must sit where audio.cpp can open it (`--asr-dir`; the unit
-  mounts `~/audio:/asr-share`). A temp dir in `/tmp` does not reach the ASR
-  host: the per-track workdir lives under the output dir.
+- The normalized WAV must sit where audio.cpp can open it (`--asr-dir`). A
+  temp dir in `/tmp` does not reach the ASR host: the per-track workdir lives
+  under the output dir. The unit does not mount it any more because its batch
+  model is the studio's; a deployment that picks a bare audio.cpp model needs
+  `-v ~/audio:/asr-share` and the two `--asr-dir` flags back.
 - Two-tracks: `meeting-job` derives `pair`/`track` from the recorder's file names
   (`zoom-<stamp>-{system,mic}-16k.mp3`), parks the job in `waiting` until both
   tracks arrive (`--pair-wait`, default 900 s), then runs the worker once with
@@ -102,6 +114,11 @@ and call out over HTTP only. Consequences that bite:
   pruned. `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
   bearer token in the query string, because `<audio src>` cannot send headers —
   only that route checks the query.
+- Transcript dialog (`dashboard/src/App.tsx`): the finished job opens beside its
+  audio with a **Text / Segments** switch, the shape Unsloth Studio's audio page
+  uses. Text joins consecutive turns by the same speaker into a paragraph;
+  Segments keeps one timestamped row each. Both seek the player at their start,
+  and the active row/paragraph is highlighted and followed while playing.
 - Live (`/live`, `POST /live/<id>/audio`, `dashboard/src/Live.tsx`): the browser resamples to
   16 kHz mono PCM16 (`new AudioContext({sampleRate: 16000})` — Safari gives 48 kHz
   and the page refuses, it would pitch everything) and posts half a second at a
@@ -156,9 +173,14 @@ and call out over HTTP only. Consequences that bite:
 
 ## Endpoints this stack calls
 
-- audio.cpp on `http://ubuntu:8090` - its build/run lives in that project, not
-  here. `/v1/models/load` reloads `moss-transcribe-diarize` when the server
-  unloaded it (the service does this itself on a 404).
+- Unsloth Studio on `http://ubuntu:8888` - `/v1/audio/inputs` +
+  `/api/inference/audio/transcribe/source` for batch diarization, `/v1/models`
+  and `/api/providers/` for the live translators. Key in `$UNSLOTH_API_KEY`
+  (the unit forwards it from `meeting-job.env`).
+- audio.cpp on `http://ubuntu:8090` - live transcription, and the direct batch
+  fallback. Its build/run lives in that project, not here. `/v1/models/load`
+  reloads `moss-transcribe-diarize` when the server unloaded it (the service
+  does this itself on a 404).
 - Mistral - key in `$MISTRAL_API_KEY` (`~/.config/meeting-job.env` via the unit).
 - Lemonade on `:8731` and Bifrost on `:8080` - translators; do not evict their
   resident models.
@@ -171,7 +193,7 @@ systemctl --user restart meeting-job.service
 curl -s localhost:8099/health
 ```
 
-The unit passes only what differs from the defaults (the directory, the
-asr-dir share, the model choices, the gateway): the running configuration is
+The unit passes only what differs from the defaults (the directory, the model
+choice, the gateway): the running configuration is
 visible in `systemctl --user cat meeting-job.service`, the rest is the
 default contract tested in `test_meeting.py`.

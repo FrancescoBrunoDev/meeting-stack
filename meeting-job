@@ -730,7 +730,7 @@ UNSLOTH_BATCH_MODELS = ("unsloth.MOSS-Transcribe-Diarize",)
 
 
 def is_unsloth_asr(model: str) -> bool:
-    """The id names its provider: unsloth.* is the studio's transcribe workflow."""
+    """The id names its provider: unsloth.* is the studio's OpenAI audio endpoint."""
     return (model or "").startswith("unsloth.")
 MISTRAL_LIVE_MODELS = ("voxtral-mini-transcribe-realtime-3", *MISTRAL_BATCH_MODELS)
 AUDIOCPP_MODELS = {
@@ -2403,8 +2403,8 @@ def main() -> None:
     parser.add_argument("--meeting", type=Path, default=HERE / "meeting-transcribe",
                         help="the worker script (default meeting-transcribe next to this one)")
     parser.add_argument("--asr", default="http://ubuntu:8090",
-                        help="audio.cpp base URL the worker transcribes through "
-                             "(default http://ubuntu:8090)")
+                        help="audio.cpp base URL for the live transcriber and the direct "
+                             "batch fallback (default http://ubuntu:8090)")
     parser.add_argument("--model", default="moss-transcribe-diarize",
                         help="ASR model the endpoint serves "
                              "(default moss-transcribe-diarize)")

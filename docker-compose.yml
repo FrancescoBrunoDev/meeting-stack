@@ -9,7 +9,8 @@
 #   Required env, set in Coolify:
 #     MEETING_TOKEN     a bearer token (the dashboard is exposed now)
 #     MISTRAL_API_KEY   the key
-#     UNSLOTH_API_KEY   an Unsloth Studio key, for the unsloth.* translators
+#     UNSLOTH_API_KEY   an Unsloth Studio key, for batch diarization and the
+#                       unsloth.* translators
 #     UBUNTU_HOST       the LAN address of the box that serves audio.cpp,
 #                       Lemonade, Bifrost and Unsloth Studio
 #
@@ -17,12 +18,13 @@
 #     MEETING_PORT      the service's port (8099)
 #     AUDIOCPP_PORT     audio.cpp (8090)
 #     BATCH_MODEL       the default transcription model
-#                       (mistral.voxtral-small-transcribe-3; an audio.cpp model
-#                       travels as an upload from here, and the server
-#                       SEGFAULTS past ~20 minutes of recording - the pipeline
-#                       refuses it. unsloth.MOSS-Transcribe-Diarize - the same
-#                       diarizer through Unsloth Studio's workflow, with
-#                       UNSLOTH_API_KEY - takes up to 4 hours of upload)
+#                       (unsloth.MOSS-Transcribe-Diarize: MOSS through Unsloth
+#                       Studio's OpenAI-compatible /v1/audio/transcriptions,
+#                       with UNSLOTH_API_KEY; the studio decodes the upload and
+#                       answers diarized segments. mistral.voxtral-small-transcribe-3
+#                       is the cloud alternative; a bare audio.cpp model travels
+#                       as an upload here and the server SEGFAULTS past ~20
+#                       minutes of recording, so the pipeline refuses it)
 #     LIVE_MODEL        the live session model (vibevoice_asr_streaming_7b_q8_0)
 #     UNSLOTH_API_KEY   also the model gateway: its studio connections carry
 #                       the cloud keys (Mistral, OpenCode Go) and the Lemonade
@@ -64,7 +66,7 @@ services:
       --dir /data
       --port ${MEETING_PORT:-8099}
       --asr http://${UBUNTU_HOST}:${AUDIOCPP_PORT:-8090}
-      --model ${BATCH_MODEL:-mistral.voxtral-small-transcribe-3}
+      --model ${BATCH_MODEL:-unsloth.MOSS-Transcribe-Diarize}
       --translate-model ${TRANSLATE_MODEL:-unsloth.Hy-MT2-7B-GGUF}
       --live-model ${LIVE_MODEL:-vibevoice_asr_streaming_7b_q8_0}
 volumes:

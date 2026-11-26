@@ -4,7 +4,7 @@
 #   podman build -t localhost/meeting-job ~/Github/meeting-stack
 #   install -m 644 systemd/meeting-job.service ~/.config/systemd/user/
 #   install -d -m 700 ~/.config/meeting-stack
-#   printf 'MEETING_TOKEN=%s\nMISTRAL_API_KEY=%s\n' "$(openssl rand -hex 24)" "$KEY" \
+#   printf 'UNSLOTH_API_KEY=%s\nMISTRAL_API_KEY=%s\n' "$KEY" "$MISTRAL_KEY" \
 #     > ~/.config/meeting-stack/meeting-job.env
 #   chmod 600 ~/.config/meeting-stack/meeting-job.env
 #   systemctl --user daemon-reload
@@ -13,18 +13,16 @@
 #
 # A plain podman service: no podman socket, no device mounts, no nesting —
 # the container only serves HTTP and shells out to ffmpeg. All inference is
-# somebody else's: the batch ASR is MOSS-Transcribe-Diarize through audio.cpp
-# on http://ubuntu:8090 (one request for the whole meeting; it answers the
-# speaker labels and the timestamps itself; `--asr-dir` is the share audio.cpp
-# reads the normalized WAV from, ~/audio mounted at the same path it has on
-# host); a voxtral-* model goes to Mistral's cloud API (needs MISTRAL_API_KEY).
-# Live transcription is audio.cpp's streaming endpoint; translation is
+# somebody else's: batch diarization is MOSS-Transcribe-Diarize through Unsloth
+# Studio on http://ubuntu:8888 (one multipart request; the studio decodes the
+# file and returns timestamped segments carrying the speaker labels). A
+# voxtral-* model goes to Mistral's cloud API (needs MISTRAL_API_KEY). Live
+# transcription is audio.cpp's streaming endpoint on :8090; translation is
 # Lemonade on :8731, Mistral or the Bifrost gateway on :8080 (--mt-gateway).
 # The uploads are kept by default (the dashboard plays the recording next to
 # the transcript; pruned after --retain-audio-days, default 30, 0 keeps them;
-# --no-keep-audio deletes them). Send
-# language=de: with language=auto Qwen3-ASR answers short turns in a foreign
-# language (25 of 226 turns of a German meeting came back in Chinese).
+# --no-keep-audio deletes them). Send language=de: with language=auto short
+# turns can come back in whatever language the model thinks it heard.
 [Unit]
 Description=Diarized meeting transcription (REST + MCP + dashboard, container)
 After=network-online.target
@@ -37,22 +35,16 @@ EnvironmentFile=-%h/.config/meeting-job.env
 ExecStart=/usr/bin/podman run --rm --replace --name meeting-job --network=host \
   --security-opt no-new-privileges \
   -v %h/.cache/mcp-meeting-transcribe:%h/.cache/mcp-meeting-transcribe:rw \
-  -v %h/audio:/asr-share:rw \
   -e HOME=%h \
   -e MEETING_TOKEN \
   -e MISTRAL_API_KEY \
+  -e UNSLOTH_API_KEY \
   localhost/meeting-job:latest \
   --dir %h/.cache/mcp-meeting-transcribe \
-  --asr-dir /asr-share --asr-remote-dir /opt/audiocpp \
+  --model unsloth.MOSS-Transcribe-Diarize \
   --translate-model Qwen3.8-27B-GGUF \
   --live-model vibevoice_asr_streaming_7b_q8_0 \
   --mt-gateway http://127.0.0.1:8080
-# audio.cpp reads only 16 kHz mono WAV, so meeting-transcribe normalizes with
-# ffmpeg. Measured on a 38-minute German meeting: 429 turns in 25 minutes of
-# wall time, prompt 30365 tokens. The max_tokens cap must be generous and must
-# travel under "options" — at 24000 the model ends in "reached max_tokens before
-# EOS" and the transcript is lost, not truncated; at 65536 (what the UI used) it
-# finishes. That cap is memory: the decode cache is prompt + max_tokens.
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

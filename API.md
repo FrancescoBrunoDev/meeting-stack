@@ -8,10 +8,11 @@ different jobs, and they behave differently:
 - **live** — you stream microphone audio as it happens, it answers with a growing
   transcript and its translation. Fast, approximate, **no speaker labels**.
 
-The service itself runs no inference: audio.cpp on `:8090` answers the batch
-and live transcription, Mistral the cloud transcribers and translators,
-Lemonade on `:8731` and the Bifrost gateway on `:8080` the translators. Jobs
-run one at a time in a worker thread; live sessions are independent of them.
+The service itself runs no inference: Unsloth Studio on `:8888` answers the
+default batch transcription (audio.cpp on `:8090` is the direct fallback and the
+live transcriber), Mistral the cloud transcribers and translators, Lemonade on
+`:8731` and the Bifrost gateway on `:8080` the translators. Jobs run one at a
+time in a worker thread; live sessions are independent of them.
 
 ## Auth
 
@@ -44,9 +45,10 @@ Query parameters are per-job options (all optional):
 | `hotwords` | names and jargon to bias the ASR |
 | `max_tokens` | the audiocpp output cap |
 | `second_name`, `second_offset` | the microphone track of a two-track recording |
-| `model` | the model names its provider: `mistral.voxtral-*` goes to
-  Mistral's `/v1/audio/transcriptions` with `diarize=true`, anything else to
-  audio.cpp |
+| `model` | the model names its provider: `unsloth.*` goes to Unsloth Studio's
+  transcribe workflow (up to 4 h, diarized segments), `mistral.voxtral-*` to
+  Mistral's with `diarize=true`, anything else to audio.cpp (the unit and
+  compose deploy `unsloth.MOSS-Transcribe-Diarize`) |
 
 Two tracks of the same recording are paired by `filename`: upload both with the
 same name and one job covers both.
@@ -223,7 +225,8 @@ request: under a second for a local model, two to three seconds for a cloud one.
 
 ## Not part of this service
 
-The ASR and the translators are separate processes the service calls:
-audio.cpp on `:8090` (MOSS for batch, VibeVoice 7B for live), Mistral (cloud
-transcription and translation), Lemonade on `:8731` and the Bifrost gateway on
-`:8080` (translators). Nothing in this API exposes them directly.
+The ASR and the translators are separate processes the service calls: Unsloth
+Studio on `:8888` (MOSS-Transcribe-Diarize for batch), audio.cpp on `:8090`
+(VibeVoice 7B for live, the same MOSS on the direct batch fallback), Mistral
+(cloud transcription and translation), Lemonade on `:8731` and the Bifrost
+gateway on `:8080` (translators). Nothing in this API exposes them directly.
