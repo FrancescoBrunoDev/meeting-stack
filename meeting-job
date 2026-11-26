@@ -4,11 +4,12 @@
 Meetings take minutes and Hermes' tools have a fixed deadline, so nothing here
 blocks: a caller submits audio, gets a job id, and polls (or reads the result
 later). One worker thread runs `meeting-transcribe` at a time. No inference is
-managed here: the ASR is audio.cpp (which diarizes itself) or Mistral, the
-translators are Lemonade, Mistral or the Bifrost gateway, all over HTTP.
+managed here: the ASR is Unsloth Studio's transcribe workflow, audio.cpp (which
+diarizes itself) or Mistral, the translators are Lemonade, Mistral or the
+Bifrost gateway, all over HTTP.
 
-Defaults: MOSS-Transcribe-Diarize through audio.cpp; a voxtral-* model goes to
-Mistral instead: the model id names its provider.
+The model id names its provider: unsloth.* goes to the studio, mistral.voxtral-*
+to Mistral, anything else to audio.cpp.
 
     ./meeting-job --dir /mnt/cache/mcp-meeting-transcribe --token secret
 
@@ -676,9 +677,9 @@ class Jobs:
     def retry(self, identity: str | None) -> dict | None:
         """Run a finished job again from the audio still in the inbox.
 
-        Returns the job unchanged when it is not finished (already queued,
-        waiting or running) or when the audio is gone, so a double click on the
-        dashboard's retry button cannot put the same job in the queue twice.
+        Returns the job unchanged when it is not finished (already queued or
+        running) or when the audio is gone, so a double click on the dashboard's
+        retry button cannot put the same job in the queue twice.
         """
         with self._lock:
             job = self._jobs.get(identity or "")
@@ -998,7 +999,7 @@ def unsloth_model_id(model: str) -> str:
 
 
 def is_mistral_asr(model: str) -> bool:
-    """The model id names its provider: voxtral-* is Mistral, anything else audio.cpp."""
+    """The model id names its provider: voxtral-* is Mistral's."""
     return (model or "").removeprefix("mistral.").startswith("voxtral-")
 
 
@@ -2254,14 +2255,15 @@ def tools() -> list[dict]:
                         "instead for large files. Returns a job id and its status.",
          "inputSchema": {"type": "object", "properties": {
              "audio_base64": {"type": "string", "description": "the recording, base64-encoded"},
-             "filename": {"type": "string", "description": "original name, for the format hint"},
+             "filename": {"type": "string", "description": "original name: format hint, archive name and /hook join key"},
              "language": {"type": "string", "description": "force a language, e.g. de or German"},
              "hotwords": {"type": "string", "description": "names and jargon to bias the ASR"},
              "names": {"type": "string", "description": "speaker names, e.g. 1:Anna,2:Bernd"},
              "model": {"type": "string",
-                       "description": "ASR model: voxtral-* goes to Mistral's "
-                                      "/v1/audio/transcriptions with diarize=true, anything else "
-                                      "to audio.cpp (default moss-transcribe-diarize)"}},
+                       "description": "ASR model: unsloth.* goes to Unsloth Studio's "
+                                      "transcribe workflow, mistral.voxtral-* to Mistral with "
+                                      "diarize=true, anything else to audio.cpp (default: "
+                                      "the service's --model)"}},
              "required": ["audio_base64"]}},
         {"name": "meeting_status",
          "description": "Status of a transcription job by id.",

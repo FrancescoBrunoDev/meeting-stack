@@ -88,7 +88,7 @@ and call out over HTTP only. Consequences that bite:
 
 - The normalized WAV must sit where audio.cpp can open it (`--asr-dir`). A
   temp dir in `/tmp` does not reach the ASR host: the workdir lives under the
-  output dir. The unit does not mount it any more because its batch
+  output dir. The compose service does not mount it because the deployed batch
   model is the studio's; a deployment that picks a bare audio.cpp model needs
   `-v ~/audio:/asr-share` and the two `--asr-dir` flags back.
 - Input: one file with both sides already mixed. There is no pairing and no
@@ -101,8 +101,8 @@ and call out over HTTP only. Consequences that bite:
   `transcribe_mistral()`.
 - Uploaded audio is kept (the default) so the dashboard can play it. The
   uploads are pruned after `--retain-audio-days` (default 30; `0` disables),
-  hourly and at startup; a queued, waiting or running job's audio is never
-  pruned. `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
+  hourly and at startup; a queued or running job's audio is never pruned.
+  `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
   bearer token in the query string, because `<audio src>` cannot send headers —
   only that route checks the query.
 - Archive: every upload is a row in `<dir>/archive.db` (`Archive`, stdlib

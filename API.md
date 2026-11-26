@@ -16,11 +16,11 @@ time in a worker thread; live sessions are independent of them.
 
 ## Auth
 
-`MEETING_TOKEN` empty (the current state): no auth at all, anyone who reaches the
-port can use it. When it is set, every route except `GET /health` wants
-`Authorization: Bearer <token>`. The two audio routes (`GET /jobs/<id>/audio`,
-`/live/...`) also accept `?token=<token>`, because `<audio src>` and an open
-browser tab cannot send headers.
+`MEETING_TOKEN` empty: no auth at all, anyone who reaches the port can use it.
+When it is set, every route except `GET /health` wants
+`Authorization: Bearer <token>`. The playback route (`GET /jobs/<id>/audio`) and
+the `/live/...` routes also accept `?token=<token>`, because `<audio src>` and an
+open browser tab cannot send headers.
 
 ## Batch
 
@@ -28,7 +28,7 @@ browser tab cannot send headers.
 
 ```sh
 curl -X POST "http://host:8099/jobs?filename=meeting.m4a&language=de" \
-     -H 'content-type: audio/octet-stream' --data-binary @meeting.m4a
+     -H 'content-type: application/octet-stream' --data-binary @meeting.m4a
 ```
 
 The body **is** the audio: any format ffmpeg reads. `202` returns the job
@@ -39,17 +39,17 @@ Query parameters are per-job options (all optional):
 
 | name | meaning |
 |---|---|
-| `filename` | original name, only used for the format hint |
+| `filename` | original name: the format hint, the `audio-<name>` archive name, and the join key for `/hook` |
 | `language` | force the spoken language, e.g. `de` |
 | `names` | `1:Anna,2:Bernd` |
 | `hotwords` | names and jargon to bias the ASR |
 | `max_tokens` | the audiocpp output cap |
 | `model` | the model names its provider: `unsloth.*` goes to Unsloth Studio's
   transcribe workflow (up to 4 h, diarized segments), `mistral.voxtral-*` to
-  Mistral's with `diarize=true`, anything else to audio.cpp (the unit and
-  compose deploy `unsloth.MOSS-Transcribe-Diarize`) |
+  Mistral's with `diarize=true`, anything else to audio.cpp (compose deploys
+  `unsloth.MOSS-Transcribe-Diarize`) |
 
-The body is one already-mixed recording; there is no second input to pair.
+The body is one already-mixed recording; there is no second input.
 
 ### Read
 
@@ -70,8 +70,8 @@ a human line, not a percentage. When `done`, the job carries `json` and `markdow
 ```
 
 `duration` is the length of the recording, not how long the job took. Turns are
-sorted; `speaker` is an integer, and `name` appears when `names` was given. Two
-tracks can overlap on purpose (two people talking at once are two lines).
+sorted; `speaker` is an integer, and `name` appears when `names` was given. Turns
+can overlap on purpose: two people talking at once are two lines.
 
 A turn is **a paragraph, not the model's segment**. MOSS closes a segment every
 ~5 seconds whatever is being said, so consecutive segments of the same speaker
@@ -89,9 +89,9 @@ curl -X DELETE http://host:8099/jobs/<id>         # forget it
 
 `stop` takes a job out of the queue, or kills the worker running it, and leaves
 it `cancelled` — not `error`, because nothing went wrong. The upload is kept, so
-`retry` can start it again; that also works for a `done` or an `error` job. A job
-that is queued, waiting or running is returned unchanged by `retry`, so a double
-click cannot queue it twice. `DELETE` removes the job, its transcript **and its
+`retry` can start it again; that also works for a `done`, `error` or `cancelled`
+job. A job that is queued or running is returned unchanged by `retry`, so a
+double click cannot queue it twice. `DELETE` removes the job, its transcript **and its
 uploaded copy** — the file you sent is yours and is not touched. All three answer
 `404` for an unknown id.
 
@@ -220,8 +220,16 @@ request: under a second for a local model, two to three seconds for a cloud one.
 | `GET /health` | `{"status":"ok","jobs":N,"queue":N,"archive":bool}`, no auth |
 | `GET /files` | the archive ledger, newest first: audio and transcript rows |
 | `GET /archive` | cached WebDAV probe: `configured`, `reachable`, `url`, `error` |
+| `GET /hooks` | announcements, joined with the job whose upload has their file name |
 | `GET /`, `/ui`, `/live` | the dashboard (one bundle, the path picks the view) |
 | `POST /hook` | the recorder announces a finished recording; idempotent |
+
+`POST /hook` takes `{"day":"YYYY-MM-DD","recording":"HH-MM-SS","files":["..."],
+"remote_dir":"...","language":"..."}`. It carries no audio and never starts a
+job; it only records that the recorder finished a recording. `GET /hooks` joins
+the announced file names to the uploaded job's `filename` and answers
+`missing_audio` when no upload has arrived. The response keeps the legacy `pair`
+key: it is the recording key (`zoom-YYYYMMDD-HHMMSS`), not a second track.
 
 `GET /files` rows carry `job_id`, `track`, `filename`, `size`, `sha256`,
 `received_at`, `status` (`received`, `running`, `queued`, `done`, `error`,
