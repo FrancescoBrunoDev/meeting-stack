@@ -196,7 +196,8 @@ curl --data-binary @zoom-20261020-205058-mix.mp3 \
 ```
 
 The ASR diarizes and transcribes it in one pass: no second input, no pairing,
-no `waiting` state. The dashboard's upload field takes one file too.
+no `waiting` state. The dashboard's upload field takes one file too. The model is
+not an upload option: it is the service's `--model` (compose `BATCH_MODEL`).
 
 ### Announced recordings (`POST /hook`)
 
@@ -221,7 +222,7 @@ MCP (`POST /mcp`, stateless JSON-RPC 2.0 — `initialize`, `tools/list`,
 
 | tool | arguments |
 |---|---|
-| `transcribe_meeting` | `audio_base64`, `filename`, `language`, `hotwords`, `names`, `model` |
+| `transcribe_meeting` | `audio_base64`, `filename`, `language`, `hotwords`, `names` |
 | `meeting_status` | `id` |
 | `meeting_result` | `id`, `format` (`markdown` or `json`) |
 

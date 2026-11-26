@@ -44,10 +44,9 @@ Query parameters are per-job options (all optional):
 | `names` | `1:Anna,2:Bernd` |
 | `hotwords` | names and jargon to bias the ASR |
 | `max_tokens` | the audiocpp output cap |
-| `model` | the model names its provider: `unsloth.*` goes to Unsloth Studio's
-  transcribe workflow (up to 4 h, diarized segments), `mistral.voxtral-*` to
-  Mistral's with `diarize=true`, anything else to audio.cpp (compose deploys
-  `unsloth.MOSS-Transcribe-Diarize`) |
+
+The model is not a request option: the service uses its `--model` (compose
+`BATCH_MODEL`). A `model` query parameter is a `400`.
 
 The body is one already-mixed recording; there is no second input.
 
@@ -98,8 +97,8 @@ uploaded copy** — the file you sent is yours and is not touched. All three ans
 ### MCP
 
 `POST /mcp` speaks JSON-RPC 2.0 with three tools: `transcribe_meeting`
-(`audio_base64` + the same options), `meeting_status` (`id`), `meeting_result`
-(`id`, `format: markdown|json`).
+(`audio_base64` + `filename`/`language`/`hotwords`/`names`; no model),
+`meeting_status` (`id`), `meeting_result` (`id`, `format: markdown|json`).
 
 ## Live
 
@@ -135,8 +134,9 @@ When `MISTRAL_API_KEY` is set, `asr_models` offers `voxtral-mini-transcribe-real
 no speaker, and a `turn.end` event closes the row and starts a new one)
 alongside `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`;
 `batch_models` offers `voxtral-mini-transcribe-3` and `voxtral-small-transcribe-3`
-for `POST /jobs?model=...` (file transcription with `diarize=true` and
-`timestamp_granularities=segment`). Lemonade does not proxy `/v1/audio/transcriptions`
+(file transcription with `diarize=true` and `timestamp_granularities=segment`);
+`batch_default` is the model the service is configured with, and the only one
+`POST /jobs` uses. Lemonade does not proxy `/v1/audio/transcriptions`
 or WebSockets for cloud providers, so the service talks to `api.mistral.ai`
 directly.
 

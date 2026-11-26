@@ -39,7 +39,6 @@ import {
 import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
 import { Label } from "@/components/ui/label"
-import { ModelGroups } from "@/components/model-groups"
 import {
   Select,
   SelectContent,
@@ -99,7 +98,6 @@ type Job = JobSummary & {
 }
 
 const LANGUAGES = ["auto", "it", "de", "en", "fr", "es"]
-const DEFAULT_MODEL = "__default__"
 
 // XHR instead of fetch: only XHR reports upload progress.
 function upload(url: string, file: File, token: string, onProgress: (fraction: number) => void) {
@@ -363,7 +361,6 @@ function Jobs() {
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [selected, setSelected] = useState<Job | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [batchModels, setBatchModels] = useState<{ id: string; recipe?: string }[]>([])
   const fileInput = useRef<HTMLInputElement>(null)
 
   const api = useCallback(
@@ -401,23 +398,6 @@ function Jobs() {
     const timer = setInterval(refresh, 5000)
     return () => clearInterval(timer)
   }, [refresh])
-
-  useEffect(() => {
-    let alive = true
-    api("/live/models")
-      .then((answer) => alive && setBatchModels(answer.batch_models ?? []))
-      .catch((failure) => {
-        if (alive) {
-          setBatchModels([])
-          // "service default" alone in the dropdown reads as "no models";
-          // a refused request (the token is missing or wrong) must say so.
-          setAuthError((failure as Error).message)
-        }
-      })
-    return () => {
-      alive = false
-    }
-  }, [api])
 
   async function openJob(id: string) {
     setSelectedId(id)
@@ -468,7 +448,6 @@ function Jobs() {
     const file = form.get("file") as File | null
     if (!file || !file.size) return
     const language = String(form.get("language") ?? "auto")
-    const model = String(form.get("model") ?? DEFAULT_MODEL)
     const hotwords = String(form.get("hotwords") ?? "").trim()
 
     setUploading(true)
@@ -476,7 +455,6 @@ function Jobs() {
     try {
       const query = new URLSearchParams({ filename: file.name })
       if (language !== "auto") query.set("language", language)
-      if (model && model !== DEFAULT_MODEL) query.set("model", model)
       if (hotwords) query.set("hotwords", hotwords)
       const job = await upload(`/jobs?${query}`, file, token, (fraction) =>
         setSent({ name: file.name, fraction })
@@ -532,18 +510,6 @@ function Jobs() {
                         {code === "auto" ? "Auto-detect" : code.toUpperCase()}
                       </SelectItem>
                     ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="grid w-full gap-2 sm:w-52">
-                <Label htmlFor="model">Model</Label>
-                <Select name="model" defaultValue={DEFAULT_MODEL}>
-                  <SelectTrigger id="model" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={DEFAULT_MODEL}>service default</SelectItem>
-                    <ModelGroups models={batchModels} />
                   </SelectContent>
                 </Select>
               </div>

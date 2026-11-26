@@ -70,8 +70,8 @@ PROTOCOL_LATEST = "2025-06-18"
 SUFFIX = re.compile(r"\.[a-z0-9]{1,5}$")
 OPTION_FLAGS = (("language", "--language"), ("hotwords", "--hotwords"),
                 ("names", "--names"), ("max_tokens", "--max-tokens"),
-                ("model", "--model"),
                 ("asr_dir", "--asr-dir"), ("asr_remote_dir", "--asr-remote-dir"))
+MODEL_FIXED = "the diarization model is fixed by the service (BATCH_MODEL/--model)"
 # meeting-transcribe wants ints for these; every other flag takes a float or a string.
 INT_OPTIONS = ("max_tokens",)
 
@@ -543,6 +543,8 @@ class Jobs:
         threading.Thread(target=self._work, daemon=True).start()
 
     def submit(self, audio: bytes, options: dict, filename: str | None = None) -> dict:
+        options = dict(options or {})
+        options.pop("model", None)  # the service owns the batch model; see --model
         identity = job_id(audio)
         with self._lock:
             job = self._jobs.get(identity)
@@ -2258,12 +2260,7 @@ def tools() -> list[dict]:
              "filename": {"type": "string", "description": "original name: format hint, archive name and /hook join key"},
              "language": {"type": "string", "description": "force a language, e.g. de or German"},
              "hotwords": {"type": "string", "description": "names and jargon to bias the ASR"},
-             "names": {"type": "string", "description": "speaker names, e.g. 1:Anna,2:Bernd"},
-             "model": {"type": "string",
-                       "description": "ASR model: unsloth.* goes to Unsloth Studio's "
-                                      "transcribe workflow, mistral.voxtral-* to Mistral with "
-                                      "diarize=true, anything else to audio.cpp (default: "
-                                      "the service's --model)"}},
+             "names": {"type": "string", "description": "speaker names, e.g. 1:Anna,2:Bernd"}},
              "required": ["audio_base64"]}},
         {"name": "meeting_status",
          "description": "Status of a transcription job by id.",
@@ -2279,6 +2276,8 @@ def tools() -> list[dict]:
 
 def call_tool(jobs: Jobs, name: str, arguments: dict) -> str:
     if name == "transcribe_meeting":
+        if "model" in arguments:
+            raise ToolError(MODEL_FIXED)
         encoded = arguments.get("audio_base64")
         if not isinstance(encoded, str) or not encoded:
             raise ToolError("audio_base64 is required")
@@ -2505,6 +2504,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "empty body: send the audio as the request body"})
                 return
             query = urllib.parse.parse_qs(parsed.query)
+            if "model" in query:
+                self._json(400, {"error": MODEL_FIXED})
+                return
             options = {}
             for key, value in query.items():
                 if key == "filename":

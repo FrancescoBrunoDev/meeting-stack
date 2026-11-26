@@ -95,6 +95,9 @@ and call out over HTTP only. Consequences that bite:
   second input; `submit()` is content-addressed and queues immediately. Do not
   reintroduce a track dictionary: `Job.tracks` is kept as a one-entry
   `{"main": path}` only for the old persisted jobs.
+- The batch model is not a per-job option: `POST /jobs` rejects `model`, MCP
+  does not expose it, and `OPTION_FLAGS` has no model. It comes from `--model`
+  (compose `BATCH_MODEL`); the dashboard has no model picker.
 - Whisper-era gotchas of the removed one-pass path (words split by a 32
   character wrap, repetition loops) do not apply any more: the words come from
   one answer of MOSS or Mistral, parsed by `parse_diarized()` /

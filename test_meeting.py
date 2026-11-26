@@ -3,10 +3,11 @@
 transcript.
 
 The ASRs (audio.cpp, Mistral) are external, so what is tested here is
-everything that can be wrong without them: parsing their answers, merging and
-deduplicating turns, matching two tracks, building the live lines, and the
-defaults that decide which path runs.
+everything that can be wrong without them: parsing their answers, merging
+paragraphs and turns, building the live lines, and the defaults that decide
+which path runs.
 """
+import base64
 import contextlib
 import hashlib
 import io
@@ -163,6 +164,9 @@ class Defaults(unittest.TestCase):
 
     def test_an_empty_audio_cpp_answer_is_no_turns(self):
         self.assertEqual(meeting.parse_diarized(""), [])
+
+    def test_the_batch_model_is_not_a_per_job_option(self):
+        self.assertNotIn("model", {key for key, _ in meeting_job.OPTION_FLAGS})
 
     def test_the_model_names_its_provider(self):
         self.assertTrue(meeting.is_mistral_asr("voxtral-mini-transcribe-3"))
@@ -506,6 +510,23 @@ class JobRoutes(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 self.call(path, method)
             self.assertEqual(caught.exception.code, 404)
+
+    def test_a_model_query_parameter_is_rejected(self):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.call("/jobs?model=mistral.voxtral-small-transcribe-3", "POST", b"audio")
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn(b"fixed", caught.exception.read())
+        self.assertEqual(self.jobs.list(), [])
+
+    def test_mcp_does_not_offer_or_accept_a_model(self):
+        tool = next(tool for tool in meeting_job.tools()
+                    if tool["name"] == "transcribe_meeting")
+        self.assertNotIn("model", tool["inputSchema"]["properties"])
+        with self.assertRaises(meeting_job.ToolError):
+            meeting_job.call_tool(
+                self.jobs, "transcribe_meeting",
+                {"audio_base64": base64.b64encode(b"audio").decode(),
+                 "model": "mistral.voxtral-small-transcribe-3"})
 
 
 class Persistence(unittest.TestCase):
