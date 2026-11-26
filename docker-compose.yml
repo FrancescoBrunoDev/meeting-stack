@@ -53,6 +53,8 @@ services:
     restart: unless-stopped
     environment:
       - HOME=/data
+      - MEETING_TOKEN=${MEETING_TOKEN:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
       - UNSLOTH_URL=http://${UBUNTU_HOST:-192.168.188.60}:8888
       - UNSLOTH_API_KEY=${UNSLOTH_API_KEY:-}
       - WEBDAV_URL=${WEBDAV_URL:-}

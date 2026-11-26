@@ -121,36 +121,53 @@ class WebDAV:
 
     def put(self, name: str, data: bytes) -> str:
         """Archive one file; returns the URL it was written to."""
-        parts = [part for part in self.directory.split("/") if part] + [name]
-        # PUT does not create parents: MKCOL each folder once, then remember it.
-        for depth in range(1, len(parts)):
-            folder = self._url(parts[:depth])
-            if folder not in self._folders:
-                self._mkcol(folder)
-                self._folders.add(folder)
-        url = self._url(parts)
+        self.ensure()
+        url = self._url(self._parts() + [name])
         self._request("PUT", url, data)
         return url
+
+    def ensure(self, timeout: float | None = None, force: bool = False) -> str:
+        """Make the archive folder; return its URL. A 405 means it was there.
+
+        force skips the created-folder cache, which is what the status probe
+        needs: otherwise a check after the first one would never touch the wire.
+        """
+        parts = self._parts()
+        # PUT does not create parents: MKCOL each folder once, then remember it.
+        for depth in range(1, len(parts) + 1):
+            folder = self._url(parts[:depth])
+            if force or folder not in self._folders:
+                self._mkcol(folder, timeout=timeout)
+                self._folders.add(folder)
+        return self.target()
+
+    def target(self) -> str:
+        parts = self._parts()
+        return self._url(parts) if parts else self.base
+
+    def _parts(self) -> list[str]:
+        return [part for part in self.directory.split("/") if part]
 
     def _url(self, parts: list[str]) -> str:
         return f"{self.base}/" + "/".join(
             urllib.parse.quote(part, safe="") for part in parts)
 
-    def _mkcol(self, url: str) -> None:
+    def _mkcol(self, url: str, timeout: float | None = None) -> None:
         try:
-            self._request("MKCOL", url)
+            self._request("MKCOL", url, timeout=timeout)
         except urllib.error.HTTPError as error:
             if error.code != 405:  # 405: the collection is already there
                 raise
 
-    def _request(self, method: str, url: str, data: bytes | None = None) -> None:
+    def _request(self, method: str, url: str, data: bytes | None = None,
+                 timeout: float | None = None) -> None:
         request = urllib.request.Request(url, data=data, method=method)
         if self.user or self.password:
             token = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
             request.add_header("Authorization", f"Basic {token}")
         if data is not None:
             request.add_header("Content-Type", "application/octet-stream")
-        with urllib.request.urlopen(request, timeout=self.timeout):
+        with urllib.request.urlopen(request, timeout=timeout or self.timeout):
             pass
 
 
@@ -167,6 +184,8 @@ class Archive:
         self.webdav = webdav
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
+        self._check: dict | None = None
+        self._checked = 0.0
         if self.db is not None:
             self.db.parent.mkdir(parents=True, exist_ok=True)
             # One connection, used under the lock: the handler threads read the
@@ -223,7 +242,7 @@ class Archive:
         # move it off-thread if uploads grow past a few hundred MB.
         try:
             url = self.webdav.put(name, path.read_bytes())
-        except (OSError, urllib.error.URLError) as error:
+        except Exception as error:  # never let the archive take a job down
             detail = f"{type(error).__name__}: {error}"[:300]
             self._write("UPDATE files SET archive_error=?"
                         " WHERE job_id=? AND track=?", (detail, job_id, track))
@@ -242,6 +261,50 @@ class Archive:
                 "SELECT COUNT(*) FROM files WHERE job_id=? AND archived_at IS NULL",
                 (job_id,)).fetchone()[0]
         return missing == 0
+
+    def job_state(self, job_id: str) -> dict | None:
+        """What the dashboard shows for one job: archived, failed, pending or off."""
+        if self._conn is None:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT archived_at, webdav_url, archive_error FROM files"
+                " WHERE job_id=? ORDER BY track", (job_id,)).fetchall()
+        if not rows:
+            return None
+        if all(row["archived_at"] for row in rows):
+            state = "archived"
+        elif any(row["archive_error"] for row in rows):
+            state = "failed"
+        elif self.webdav is None:
+            state = "off"
+        else:
+            state = "pending"
+        return {"state": state,
+                "url": next((row["webdav_url"] for row in rows if row["webdav_url"]), None),
+                "error": next((row["archive_error"] for row in rows if row["archive_error"]), None),
+                "files": len(rows)}
+
+    def check(self, max_age: float = 30) -> dict:
+        """Probe WebDAV (MKCOL the folder) at most once per max_age seconds."""
+        if self.webdav is None:
+            return {"configured": False, "reachable": None, "error": None, "url": None}
+        now = time.time()
+        with self._lock:
+            if self._check is not None and now - self._checked < max_age:
+                return self._check
+        try:
+            # A dashboard probe must not hang, and must hit the wire every time.
+            url = self.webdav.ensure(timeout=10, force=True)
+        except Exception as error:  # a status probe must answer, not 500
+            result = {"configured": True, "reachable": False,
+                      "error": f"{type(error).__name__}: {error}"[:300],
+                      "url": self.webdav.target()}
+        else:
+            result = {"configured": True, "reachable": True, "error": None, "url": url}
+        with self._lock:
+            self._check, self._checked = result, now
+        return result
 
     def rows(self, limit: int = 500) -> list[dict]:
         """The ledger, newest first, for GET /files."""
@@ -489,13 +552,13 @@ class Jobs:
                 job = Job(identity, options)
                 self._jobs[identity] = job
             elif track in job.tracks and job.status != "error":
-                return job.snapshot()  # the same file again: nothing to do
+                return self._view(job)  # the same file again: nothing to do
             elif job.status == "running":
-                return job.snapshot()  # too late: this run already started
+                return self._view(job)  # too late: this run already started
             elif job.status == "done" and not all(path.is_file() for path in job.tracks.values()):
                 # The first run already finished and its audio is gone: a late
                 # track cannot redo it, so the good result stays.
-                return job.snapshot()
+                return self._view(job)
             path = self.inbox / (identity + (f"-{track}" if pair else "")
                                  + safe_suffix(filename))
             path.write_bytes(audio)
@@ -503,7 +566,7 @@ class Jobs:
             self.archive.received(job.id, track, filename or path.name, audio)
             job.options = options or job.options
             self._schedule(job, pair)
-            return job.snapshot()
+            return self._view(job)
 
     def _schedule(self, job: Job, pair: str | None) -> None:
         """Queue the job, or park it until the other track of its recording arrives."""
@@ -623,10 +686,15 @@ class Jobs:
                 if queued:
                     self._persist()
 
+    def _view(self, job: Job) -> dict:
+        view = job.snapshot()
+        view["archive"] = self.archive.job_state(job.id)
+        return view
+
     def get(self, identity: str | None) -> dict | None:
         with self._lock:
             job = self._jobs.get(identity or "")
-            return job.snapshot() if job else None
+            return self._view(job) if job else None
 
     def audio_path(self, identity: str | None) -> Path | None:
         """The uploaded audio, if the job exists and the file was kept."""
@@ -637,7 +705,7 @@ class Jobs:
 
     def list(self) -> list[dict]:
         with self._lock:
-            return [job.snapshot() for job in self._jobs.values()]
+            return [self._view(job) for job in self._jobs.values()]
 
     def retry(self, identity: str | None) -> dict | None:
         """Run a finished job again from the audio still in the inbox.
@@ -651,16 +719,16 @@ class Jobs:
             if job is None:
                 return None
             if job.status not in ("done", "error", "cancelled"):
-                return job.snapshot()
+                return self._view(job)
             if not all(path.is_file() for path in job.tracks.values()):
-                return job.snapshot()
+                return self._view(job)
             job.status, job.error, job.progress = "queued", None, None
             self.archive.status(job.id, "queued")
             job.started = job.finished = None
             job.json = job.markdown = None  # the previous result is not this run's
             self._queue.put(job)
             self._persist()
-            return job.snapshot()
+            return self._view(job)
 
     def cancel(self, identity: str | None) -> dict | None:
         """Stop a job: drop it from the queue, or kill the worker running it.
@@ -674,7 +742,7 @@ class Jobs:
             if job is None:
                 return None
             if job.status in ("done", "error", "cancelled"):
-                return job.snapshot()
+                return self._view(job)
             # A stopped job is not a failed one: an old message would lie.
             job.status, job.error, job.progress = "cancelled", None, None
             self.archive.status(job.id, "cancelled")
@@ -685,7 +753,7 @@ class Jobs:
             self._persist()
         if process is not None and process.poll() is None:
             self._terminate(process)
-        return job.snapshot()
+        return self._view(job)
 
     def delete(self, identity: str | None) -> dict | None:
         """Forget a job and remove what it left: its transcript and its upload."""
@@ -704,7 +772,7 @@ class Jobs:
                 path.unlink()
             except OSError:
                 pass
-        return job.snapshot()
+        return self._view(job)
 
     def queued(self) -> int:
         return self._queue.qsize()
@@ -2378,6 +2446,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/files":
             self._json(200, {"files": self.server.jobs.archive.rows()})
+        elif path == "/archive":
+            self._json(200, self.server.jobs.archive.check())
         elif path == "/hooks":
             self._json(200, {"hooks": hook_view(self.server.hooks, self.server.jobs)})
         elif path.startswith("/hooks/"):
@@ -2561,9 +2631,9 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _summary(job: dict) -> dict:
-        return {key: job[key] for key in ("id", "status", "error", "created",
-                                          "started", "finished", "options", "progress",
-                                          "tracks", "duration", "audio")}
+        return {key: job.get(key) for key in ("id", "status", "error", "created",
+                                              "started", "finished", "options", "progress",
+                                              "tracks", "duration", "audio", "archive")}
 
 class Server(ThreadingHTTPServer):
     def __init__(self, address, jobs: Jobs, hooks: Hooks, token: str,

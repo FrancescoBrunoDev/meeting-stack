@@ -402,6 +402,7 @@ class JobSummaryFields(unittest.TestCase):
         self.assertIn("duration", summary)
         self.assertIn("tracks", summary)
         self.assertIn("audio", summary)  # the retry button is only offered with audio
+        self.assertIn("archive", summary)  # the WebDAV badge reads it
         self.assertNotIn("json", summary)
 
 
@@ -802,21 +803,100 @@ class Archiving(unittest.TestCase):
             dav = meeting_job.WebDAV("https://dav.example/root", "user", "pass",
                                      "meetings")
             url = dav.put("main-a b.mp3", b"audio")
+            # force is what the status probe uses: it must hit the wire even
+            # though the folder was created a moment ago.
+            self.assertEqual(dav.ensure(force=True),
+                             "https://dav.example/root/meetings")
         finally:
             meeting_job.urllib.request.urlopen = original
-        self.assertEqual([call[0] for call in calls], ["MKCOL", "PUT"])
+        self.assertEqual([call[0] for call in calls], ["MKCOL", "PUT", "MKCOL"])
         self.assertEqual(calls[0][1], "https://dav.example/root/meetings")
-        self.assertEqual(calls[-1][1],
+        self.assertEqual(calls[1][1],
                          "https://dav.example/root/meetings/main-a%20b.mp3")
-        self.assertEqual(url, calls[-1][1])
+        self.assertEqual(url, calls[1][1])
         expected = "Basic " + meeting_job.base64.b64encode(b"user:pass").decode()
-        self.assertEqual(calls[-1][2], expected)
+        self.assertEqual(calls[1][2], expected)
 
     def test_without_webdav_the_ledger_still_records_and_keeps(self):
         archive = meeting_job.Archive(self.root / "archive.db")
         archive.received("0123456789abcdef", "main", "meeting.mp3", b"audio")
         self.assertEqual(archive.rows()[0]["status"], "received")
         self.assertTrue(archive.archived("0123456789abcdef"))
+        self.assertEqual(archive.job_state("0123456789abcdef")["state"], "off")
+
+    def test_the_job_state_walks_from_pending_to_archived(self):
+        class StubWebDAV:
+            def put(self, name, data):
+                return f"https://dav.example/meeting-stack/{name}"
+
+            def ensure(self, timeout=None, force=False):
+                return "https://dav.example/meeting-stack"
+
+            def target(self):
+                return "https://dav.example/meeting-stack"
+
+        archive = meeting_job.Archive(self.root / "archive.db", StubWebDAV())
+        identity = "0123456789abcdef"
+        self.assertIsNone(archive.job_state(identity))
+        archive.received(identity, "main", "meeting.mp3", b"audio")
+        self.assertEqual(archive.job_state(identity)["state"], "pending")
+
+        audio = self.root / "inbox" / "meeting.mp3"
+        audio.parent.mkdir()
+        audio.write_bytes(b"audio")
+        job = meeting_job.Job(identity, {})
+        job.tracks, job.status = {"main": audio}, "done"
+        archive.finish(job)
+        state = archive.job_state(identity)
+        self.assertEqual(state["state"], "archived")
+        self.assertEqual(state["url"],
+                         "https://dav.example/meeting-stack/main-meeting.mp3")
+
+    def test_the_probe_cache_skips_a_second_round_trip(self):
+        class CountingWebDAV:
+            calls = 0
+
+            def ensure(self, timeout=None, force=False):
+                self.calls += 1
+                return "https://dav.example/meeting-stack"
+
+            def target(self):
+                return "https://dav.example/meeting-stack"
+
+        dav = CountingWebDAV()
+        archive = meeting_job.Archive(self.root / "cache.db", dav)
+        archive.check()
+        archive.check()
+        self.assertEqual(dav.calls, 1)
+        archive.check(max_age=0)
+        self.assertEqual(dav.calls, 2)
+
+    def test_the_probe_reports_configured_and_unreachable(self):
+        class OkWebDAV:
+            def ensure(self, timeout=None, force=False):
+                return "https://dav.example/meeting-stack"
+
+            def target(self):
+                return "https://dav.example/meeting-stack"
+
+        class BrokenWebDAV:
+            def ensure(self, timeout=None, force=False):
+                raise urllib.error.URLError("dav is down")
+
+            def target(self):
+                return "https://dav.example/meeting-stack"
+
+        off = meeting_job.Archive(self.root / "off.db")
+        self.assertEqual(off.check()["configured"], False)
+        ok = meeting_job.Archive(self.root / "ok.db", OkWebDAV())
+        self.assertEqual(ok.check(), {"configured": True, "reachable": True,
+                                      "error": None,
+                                      "url": "https://dav.example/meeting-stack"})
+        broken = meeting_job.Archive(self.root / "broken.db", BrokenWebDAV())
+        answer = broken.check()
+        self.assertTrue(answer["configured"])
+        self.assertFalse(answer["reachable"])
+        self.assertIn("dav is down", answer["error"])
 
     def test_submit_records_the_upload_before_the_worker_runs(self):
         jobs = meeting_job.Jobs(Path("/bin/true"), self.root, pair_wait=10000)
@@ -827,6 +907,7 @@ class Archiving(unittest.TestCase):
         self.assertEqual(rows[0]["job_id"], job["id"])
         self.assertEqual(rows[0]["filename"], "meeting.mp3")
         self.assertEqual(rows[0]["track"], "main")
+        self.assertEqual(job["archive"]["state"], "off")
 
 class ByteRange(unittest.TestCase):
     """`GET /jobs/<id>/audio` must answer 206 to a player that seeks."""

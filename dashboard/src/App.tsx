@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertCircle,
   Check,
+  CloudAlert,
+  CloudCheck,
+  CloudOff,
+  CloudUpload,
   Copy,
   Download,
   FileAudio,
@@ -54,6 +58,20 @@ import {
 import { cn } from "@/lib/utils"
 import Live from "@/Live"
 
+type ArchiveState = {
+  state: "off" | "pending" | "archived" | "failed"
+  url: string | null
+  error: string | null
+  files?: number
+}
+
+type ArchiveStatus = {
+  configured: boolean
+  reachable: boolean | null
+  error: string | null
+  url: string | null
+}
+
 type JobSummary = {
   id: string
   status: "waiting" | "queued" | "running" | "done" | "error" | "cancelled"
@@ -66,6 +84,7 @@ type JobSummary = {
   tracks?: string[]
   duration?: number | null
   audio?: boolean
+  archive?: ArchiveState | null
 }
 
 type Turn = { speaker: number; start: number; end: number; text: string; name?: string }
@@ -201,6 +220,100 @@ function StatusBadge({ status }: { status: JobSummary["status"] }) {
   )
 }
 
+function WebDAVBadge({ status }: { status: ArchiveStatus | null }) {
+  if (!status) return null
+  if (!status.configured)
+    return (
+      <Badge
+        variant="outline"
+        className="text-muted-foreground"
+        title="Set WEBDAV_URL to archive the files the service receives"
+      >
+        <CloudOff className="size-3" />
+        WebDAV off
+      </Badge>
+    )
+  if (status.reachable)
+    return (
+      <Badge
+        variant="outline"
+        className="border-emerald-600/40 text-emerald-700 dark:text-emerald-400"
+        title={status.url ?? "The archive folder is reachable"}
+      >
+        <CloudCheck className="size-3" />
+        WebDAV ok
+      </Badge>
+    )
+  return (
+    <Badge variant="destructive" title={status.error ?? "WebDAV is unreachable"}>
+      <CloudAlert className="size-3" />
+      WebDAV error
+    </Badge>
+  )
+}
+
+function ArchiveBadge({ archive }: { archive?: ArchiveState | null }) {
+  if (archive?.state === "archived")
+    return (
+      <Badge variant="secondary" title={archive.url ?? "Archived on WebDAV"}>
+        <CloudCheck className="size-3" />
+        saved
+      </Badge>
+    )
+  if (archive?.state === "failed")
+    return (
+      <Badge variant="destructive" title={archive.error ?? "WebDAV archive failed"}>
+        <CloudAlert className="size-3" />
+        failed
+      </Badge>
+    )
+  return <span className="text-xs text-muted-foreground">—</span>
+}
+
+function ArchiveDetail({ archive }: { archive: ArchiveState }) {
+  if (archive.state === "archived")
+    return (
+      <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+        <CloudCheck className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+        <span className="shrink-0">Archived on WebDAV</span>
+        {archive.url && (
+          <a
+            href={archive.url}
+            target="_blank"
+            rel="noreferrer"
+            title={archive.url}
+            className="truncate font-mono text-primary underline-offset-2 hover:underline"
+          >
+            {archive.url.split("/").pop()}
+          </a>
+        )}
+      </div>
+    )
+  if (archive.state === "failed")
+    return (
+      <p
+        className="flex min-w-0 items-center gap-1.5 text-xs text-destructive"
+        title={archive.error ?? undefined}
+      >
+        <CloudAlert className="size-3.5 shrink-0" />
+        <span className="truncate">WebDAV archive failed: {archive.error}</span>
+      </p>
+    )
+  if (archive.state === "off")
+    return (
+      <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <CloudOff className="size-3.5" />
+        WebDAV is off: the file is only in the local ledger.
+      </p>
+    )
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      <CloudUpload className="size-3.5" />
+      Archive pending.
+    </p>
+  )
+}
+
 export default function App() {
   // Two views, two pages, one bundle: a full page load between them keeps the
   // state honest (a live session must not survive a trip to the job list).
@@ -239,6 +352,7 @@ function TopBar({ live }: { live: boolean }) {
 function Jobs() {
   const [token, setToken] = useState(() => localStorage.getItem("meeting-token") ?? "")
   const [jobs, setJobs] = useState<JobSummary[]>([])
+  const [archive, setArchive] = useState<ArchiveStatus | null>(null)
   const [now, setNow] = useState(Date.now())
   const [loading, setLoading] = useState(false)
   const [authError, setAuthError] = useState<string | null>(null)
@@ -266,8 +380,9 @@ function Jobs() {
   const refresh = useCallback(async () => {
     setLoading(true)
     try {
-      const { jobs } = await api("/jobs")
+      const [{ jobs }, archiveStatus] = await Promise.all([api("/jobs"), api("/archive")])
       setJobs(jobs)
+      setArchive(archiveStatus)
       setAuthError(null)
       // Keep an open transcript live: progress lines and the final markdown.
       if (selectedId) setSelected(await api(`/jobs/${selectedId}`))
@@ -515,13 +630,24 @@ function Jobs() {
       <Card className="py-0">
         <CardHeader className="flex flex-row items-center justify-between space-y-0 border-b py-4">
           <div className="space-y-1">
-            <CardTitle className="flex items-center gap-2">
+            <CardTitle className="flex flex-wrap items-center gap-2">
               Jobs
               <Badge variant="outline" className="font-mono">
                 {jobs.length}
               </Badge>
+              <WebDAVBadge status={archive} />
             </CardTitle>
-            <CardDescription>Updated every 5 s.</CardDescription>
+            <CardDescription>
+              Updated every 5 s.
+              {archive?.configured && archive.reachable === false && archive.error && (
+                <span
+                  className="block max-w-md truncate text-destructive"
+                  title={archive.error}
+                >
+                  {archive.error}
+                </span>
+              )}
+            </CardDescription>
           </div>
           <Button variant="ghost" size="icon" onClick={refresh} disabled={loading} title="Refresh">
             <RefreshCw className={cn(loading && "animate-spin")} />
@@ -533,6 +659,7 @@ function Jobs() {
               <TableRow>
                 <TableHead className="pl-6">Created</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead>Archive</TableHead>
                 <TableHead>Length</TableHead>
                 <TableHead>Job</TableHead>
                 <TableHead className="pr-6">Progress</TableHead>
@@ -541,7 +668,7 @@ function Jobs() {
             <TableBody>
               {jobs.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5} className="h-32 text-center text-muted-foreground">
+                  <TableCell colSpan={6} className="h-32 text-center text-muted-foreground">
                     No jobs yet.
                   </TableCell>
                 </TableRow>
@@ -560,6 +687,9 @@ function Jobs() {
                       </TableCell>
                       <TableCell>
                         <StatusBadge status={job.status} />
+                      </TableCell>
+                      <TableCell>
+                        <ArchiveBadge archive={job.archive} />
                       </TableCell>
                       <TableCell className="font-mono text-xs tabular-nums">
                         {job.duration ? length(job.duration) : "—"}
@@ -773,6 +903,12 @@ function TranscriptDialog({
             {turns.length ? ` · ${turns.length} turns` : ""}
           </DialogDescription>
         </DialogHeader>
+
+        {job?.archive && (
+          <div className="border-b px-6 py-2">
+            <ArchiveDetail archive={job.archive} />
+          </div>
+        )}
 
         {job?.status === "done" && (
           <div className="border-b px-6 py-3">
