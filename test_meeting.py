@@ -864,6 +864,100 @@ class ByteRange(unittest.TestCase):
         self.assertIsNone(self.range("bytes=a-b", 100))
 
 
+class ArchivedAudio(unittest.TestCase):
+    """A recording purged from the inbox still plays: the route proxies WebDAV."""
+
+    BODY = bytes(range(256)) * 8
+    IDENTITY = "0123456789abcdef"
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+        self.requests = []
+        body, requests = self.BODY, self.requests
+
+        class StubResponse:
+            def __init__(self, status, headers, body):
+                self.status, self.headers, self._body = status, headers, body
+                self._offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, size=-1):
+                end = len(self._body) if size < 0 else self._offset + size
+                chunk = self._body[self._offset:end]
+                self._offset += len(chunk)
+                return chunk
+
+        class StubWebDAV:
+            def put(self, name, data, folder=None):
+                return f"https://dav.example/meeting-stack/{folder}/{name}"
+
+            def folder_url(self, folder):
+                return f"https://dav.example/meeting-stack/{folder}"
+
+            def get(self, name, folder=None, range_header=None):
+                requests.append((name, folder, range_header))
+                first, _, last = (range_header or "bytes=0-")[len("bytes="):].partition("-")
+                start = int(first)
+                span = body[start:int(last) + 1] if last else body[start:]
+                headers = {"Content-Type": "audio/mpeg"}
+                if range_header:
+                    headers["Content-Range"] = \
+                        f"bytes {start}-{start + len(span) - 1}/{len(body)}"
+                return StubResponse(206 if range_header else 200, headers, span)
+
+        self.jobs = meeting_job.Jobs(Path("/bin/true"), self.root, webdav=StubWebDAV())
+        self.addCleanup(self.jobs.stop)
+        self.server = meeting_job.Server(
+            ("127.0.0.1", 0), self.jobs,
+            meeting_job.Hooks(self.root / "hooks.json"), "", 10 * 1024 * 1024)
+        self.addCleanup(self.server.server_close)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+        audio = self.root / "inbox" / "meeting.mp3"
+        audio.write_bytes(body)
+        self.jobs.archive.received(self.IDENTITY, "audio", "meeting.mp3", body)
+        job = meeting_job.Job(self.IDENTITY, {})
+        job.tracks, job.status = {"main": audio}, "done"
+        self.jobs.archive.finish(job)  # the PUT that makes the copy
+        audio.unlink()  # what --no-keep-audio does
+        self.jobs._jobs[job.id] = job
+
+    def call(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=10) as response:
+            return json.loads(response.read())
+
+    def test_the_summary_still_says_the_recording_is_playable(self):
+        job = self.call("/jobs")["jobs"][0]
+        self.assertTrue(job["audio"])
+        self.assertEqual(job["archive"]["state"], "archived")
+
+    def test_a_range_request_is_forwarded_to_webdav_and_answered_206(self):
+        request = urllib.request.Request(self.base + f"/jobs/{self.IDENTITY}/audio",
+                                         headers={"Range": "bytes=10-19"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.read(), self.BODY[10:20])
+            self.assertTrue(response.headers["Content-Range"].startswith("bytes 10-19/"))
+        self.assertEqual(self.requests,
+                         [("audio-meeting.mp3", self.IDENTITY, "bytes=10-19")])
+
+    def test_no_local_and_no_copy_is_still_404(self):
+        job = meeting_job.Job("fedcba9876543210", {})
+        job.status = "done"
+        self.jobs._jobs[job.id] = job
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(self.base + f"/jobs/{job.id}/audio", timeout=10)
+        self.assertEqual(caught.exception.code, 404)
+
+
 class BatchProviders(unittest.TestCase):
     """The batch providers: Mistral uploads and the Unsloth workflow."""
 

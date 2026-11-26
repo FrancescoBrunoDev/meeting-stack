@@ -152,15 +152,27 @@ class WebDAV:
             if error.code != 405:  # 405: the collection is already there
                 raise
 
-    def _request(self, method: str, url: str, data: bytes | None = None,
-                 timeout: float | None = None) -> None:
+    def get(self, name: str, folder: str | None = None,
+            range_header: str | None = None):
+        """Open one archived file; the caller streams it and closes the handle."""
+        url = self._url(self._parts() + ([folder] if folder else []) + [name])
+        return self._open("GET", url, headers={"Range": range_header} if range_header else None)
+
+    def _open(self, method: str, url: str, data: bytes | None = None,
+              timeout: float | None = None, headers: dict | None = None):
         request = urllib.request.Request(url, data=data, method=method)
         if self.user or self.password:
             token = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
             request.add_header("Authorization", f"Basic {token}")
         if data is not None:
             request.add_header("Content-Type", "application/octet-stream")
-        with urllib.request.urlopen(request, timeout=timeout or self.timeout):
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
+        return urllib.request.urlopen(request, timeout=timeout or self.timeout)
+
+    def _request(self, method: str, url: str, data: bytes | None = None,
+                 timeout: float | None = None) -> None:
+        with self._open(method, url, data, timeout):
             pass
 
 
@@ -269,6 +281,16 @@ class Archive:
                         " WHERE job_id=? AND track=?",
                         (time.time(), url, job_id, track))
 
+    def audio_name(self, job_id: str) -> str | None:
+        """The name the recording has on WebDAV, once its copy is there."""
+        if self._conn is None or self.webdav is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT filename FROM files WHERE job_id=? AND track='audio'"
+                " AND archived_at IS NOT NULL", (job_id,)).fetchone()
+        return f"audio-{Path(row['filename']).name}" if row else None
+
     def archived(self, job_id: str) -> bool:
         """True when every file has its WebDAV copy, or WebDAV is not configured."""
         if self._conn is None or self.webdav is None:
@@ -285,7 +307,7 @@ class Archive:
             return None
         with self._lock:
             rows = self._conn.execute(
-                "SELECT archived_at, webdav_url, archive_error FROM files"
+                "SELECT track, archived_at, webdav_url, archive_error FROM files"
                 " WHERE job_id=? ORDER BY track", (job_id,)).fetchall()
         if not rows:
             return None
@@ -301,7 +323,9 @@ class Archive:
                 "url": next((row["webdav_url"] for row in rows if row["webdav_url"]), None),
                 "folder": self.webdav.folder_url(job_id) if self.webdav else None,
                 "error": next((row["archive_error"] for row in rows if row["archive_error"]), None),
-                "files": len(rows)}
+                "files": len(rows),
+                # The player can stream the copy even after the local upload is gone.
+                "audio": any(row["track"] == "audio" and row["archived_at"] for row in rows)}
 
     def check(self, max_age: float = 30) -> dict:
         """Probe WebDAV (MKCOL the folder) at most once per max_age seconds."""
@@ -496,7 +520,8 @@ class Job:
                 "tracks": sorted(self.tracks),
                 # Length of the recording, not how long the job took.
                 "duration": self.duration,
-                # False once the audio is gone (deleted after a job, or --keep-audio off)
+                # True while a local file is there; Jobs._view also counts the
+                # WebDAV copy, which is what the player needs.
                 "audio": bool(audio and audio.is_file())}
 
 class Jobs:
@@ -655,6 +680,8 @@ class Jobs:
     def _view(self, job: Job) -> dict:
         view = job.snapshot()
         view["archive"] = self.archive.job_state(job.id)
+        # Playable: the kept file, or the WebDAV copy the archive already holds.
+        view["audio"] = view["audio"] or bool(view["archive"] and view["archive"]["audio"])
         return view
 
     def get(self, identity: str | None) -> dict | None:
@@ -1052,7 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
         """The uploaded recording, seekable: players ask for byte ranges."""
         audio = self.server.jobs.audio_path(identity)
         if audio is None:
-            self._json(404, {"error": "no audio kept for this job"})
+            self._send_archived_audio(identity)
             return
         size = audio.stat().st_size
         span = byte_range(self.headers.get("Range"), size)
@@ -1077,6 +1104,50 @@ class Handler(BaseHTTPRequestHandler):
                     left -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass  # the player seeked elsewhere; the response is already abandoned
+
+    def _send_archived_audio(self, identity: str) -> None:
+        """Stream the WebDAV copy when the inbox file was purged after the job.
+
+        The range is forwarded, not re-implemented: the archive already knows how
+        to answer it, and a server that ignores it returns 200, which players take.
+        """
+        archive = self.server.jobs.archive
+        name = archive.audio_name(identity)
+        if name is None:
+            self._json(404, {"error": "no audio kept for this job"})
+            return
+        try:
+            remote = archive.webdav.get(name, folder=identity,
+                                        range_header=self.headers.get("Range"))
+        except Exception as error:  # an unreachable archive must answer, not hang
+            self._json(502, {"error": f"WebDAV GET failed: {type(error).__name__}: "
+                                      f"{error}"[:300]})
+            return
+        with remote:
+            self.send_response(remote.status)
+            self.send_header("Content-Type",
+                             remote.headers.get("Content-Type")
+                             or mimetypes.guess_type(name)[0] or "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            length = remote.headers.get("Content-Length")
+            if length:
+                self.send_header("Content-Length", length)
+            else:
+                # HTTP/1.1 needs a length; without one the body ends at the close.
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            content_range = remote.headers.get("Content-Range")
+            if content_range:
+                self.send_header("Content-Range", content_range)
+            self.end_headers()
+            try:
+                while True:
+                    chunk = remote.read(262144)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the player seeked elsewhere
 
     def do_POST(self) -> None:
         if not self._authorized():

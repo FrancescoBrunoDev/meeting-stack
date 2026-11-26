@@ -144,7 +144,9 @@ curl -H "Authorization: Bearer $TOKEN" http://box:8099/jobs/<id>/audio    # the 
 dashboard passes the token in the query (`?token=…`) because an `<audio src>`
 cannot send headers, and only that route accepts it there. The recording is kept
 by default (`--no-keep-audio` deletes) and pruned after `--retain-audio-days`
-(default 30; `0` keeps it forever). Audio of a job
+(default 30; `0` keeps it forever). When the local copy is gone but the WebDAV
+archive has one, the route streams it from WebDAV (range forwarded), so the
+player in the dashboard keeps working. Audio of a job
 that is still queued or running is never touched, and the job list itself is
 saved in `jobs.json` under `--dir`: restarting the service keeps the list and
 the finished transcripts, and marks a job that was mid-run as an error with its
@@ -160,7 +162,9 @@ URL once copied. When `WEBDAV_URL` is set, the job folder
 `audio-<name>`, plus `transcript.md` and `transcript.json`. A WebDAV failure is
 recorded on the row and does not fail the job: the local copy stays (even with
 `--no-keep-audio`), and `POST /jobs/<id>/retry` re-runs the job and retries the
-archive.
+archive. A recording whose local copy is gone still plays in the dashboard:
+`GET /jobs/<id>/audio` streams the archived `audio-<name>` from WebDAV, ranges
+included, so the purge costs space but not playback.
 
 | variable / flag | meaning |
 |---|---|

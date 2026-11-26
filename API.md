@@ -57,9 +57,14 @@ The body is one already-mixed recording; there is no second input.
 ```sh
 curl http://host:8099/jobs/<id>          # full job: status, progress, result
 curl http://host:8099/jobs               # every job, summaries only
-curl http://host:8099/jobs/<id>/audio    # the kept upload, range requests work
+curl http://host:8099/jobs/<id>/audio    # the upload, range requests work
 curl -X POST http://host:8099/jobs/<id>/retry
 ```
+
+`GET /jobs/<id>/audio` serves the local upload when it is still there, and
+otherwise streams the archived `audio-<name>` from WebDAV, forwarding the
+client's `Range`. The job summary's `audio` flag says the route can answer
+(either copy), so the dashboard keeps the player after `--no-keep-audio`.
 
 `status` is `queued`, `running`, `done`, `error` or `cancelled`; `progress` is
 a human line, not a percentage. When `done`, the job carries `json` and `markdown`:
@@ -131,7 +136,9 @@ audio row has `track=audio`; a finished job also has `transcript.md` and
 `<dir>/archive.db`); when `WEBDAV_URL` is set the job folder
 `<WEBDAV_DIR>/<job_id>/` is created and the audio (`audio-<name>`) and both
 transcripts are PUT there as the job ends. An archive failure is recorded on the
-row without failing the transcription.
+row without failing the transcription. `GET /jobs/<id>` reports it as
+`archive.state` = `off`/`pending`/`archived`/`failed`, plus `archive.audio`:
+true when the audio copy on WebDAV can be played back.
 
 ## Not part of this service
 

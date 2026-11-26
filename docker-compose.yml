@@ -33,7 +33,9 @@
 #   WEBDAV_URL the ledger still records the files, no copy is made.
 #
 #   --keep-audio is the service default; add --no-keep-audio in `command`
-#   to delete the upload once the job is archived.
+#   to delete the upload once the job is archived. The dashboard's player keeps
+#   working: GET /jobs/<id>/audio streams the WebDAV copy when the local file is
+#   gone.
 services:
   meeting-job:
     build:

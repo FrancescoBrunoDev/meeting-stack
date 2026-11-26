@@ -93,7 +93,10 @@ and call out over HTTP only. Consequences that bite:
   hourly and at startup; a queued or running job's audio is never pruned.
   `GET /jobs/<id>/audio` serves them with ranges (206) and accepts the
   bearer token in the query string, because `<audio src>` cannot send headers —
-  only that route checks the query.
+  only that route checks the query. When the local file is gone (purged, or
+  `--no-keep-audio`) and WebDAV holds the copy, the route streams it from there
+  with the `Range` forwarded, and the job summary's `audio` flag stays true
+  (`Archive.audio_name` + `job_state["audio"]`, hoisted into `Jobs._view`).
 - Archive: every upload is a row in `<dir>/archive.db` (`Archive`, stdlib
   `sqlite3`), written in `submit()` before the queue sees it. When `WEBDAV_URL`
   is set, `_run`'s `finally` PUTs the audio (`audio-<name>`) and both
